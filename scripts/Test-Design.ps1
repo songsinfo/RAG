@@ -9,7 +9,7 @@ $ragRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $designRoot = Join-Path $ragRoot 'docs/design'
 $prdRoot = Join-Path $ragRoot 'docs/prd'
 $issues = [System.Collections.Generic.List[string]]::new()
-$markdownFiles = @(Get-ChildItem -LiteralPath $ragRoot -Recurse -File -Filter '*.md')
+$markdownFiles = @(Get-ChildItem -LiteralPath $ragRoot -Recurse -File -Filter '*.md' | Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.runtime|\.git|\.worktrees)[\\/]' })
 $linkCount = 0
 foreach ($file in $markdownFiles) {
     $content = Get-Content -LiteralPath $file.FullName -Raw -Encoding utf8

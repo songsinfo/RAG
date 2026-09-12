@@ -11,7 +11,7 @@ public class Db {
  public Optional<Map<String,Object>> optional(String sql,Map<String,?> params){var rows=list(sql,params);return rows.isEmpty()?Optional.empty():Optional.of(rows.getFirst());}
  public int exec(String sql,Map<String,?> params){return jdbc.update(sql,params);}
  public void insert(String table,Map<String,?> values){
-  if(!table.matches("[a-z_]+")||values.keySet().stream().anyMatch(k->!k.matches("[a-z_]+")))throw new IllegalArgumentException("Unsafe SQL identifier");
+  if(!table.matches("[a-z0-9_]+")||values.keySet().stream().anyMatch(k->!k.matches("[a-z0-9_]+")))throw new IllegalArgumentException("Unsafe SQL identifier");
   jdbc.update("INSERT INTO "+table+" ("+String.join(",",values.keySet())+") VALUES ("+String.join(",",values.keySet().stream().map(k->":"+k).toList())+")",values);
  }
  public static Map<String,Object> params(Object...pairs){Map<String,Object> p=new LinkedHashMap<>();for(int i=0;i<pairs.length;i+=2)p.put((String)pairs[i],pairs[i+1]);return p;}

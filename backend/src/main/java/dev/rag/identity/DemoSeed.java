@@ -9,6 +9,7 @@ import java.util.*;
 
 /** Explicit opt-in. Existing accounts are never reset by restarting. */
 @Component
+@org.springframework.context.annotation.DependsOn("flyway")
 public class DemoSeed implements ApplicationRunner {
  private final Db db;private final TransactionTemplate tx;private final String password,environment;
  public DemoSeed(Db db,TransactionTemplate tx,@Value("${RAG_SEED_PASSWORD:}")String password,@Value("${rag.environment:demo}")String environment){this.db=db;this.tx=tx;this.password=password;this.environment=environment;}
