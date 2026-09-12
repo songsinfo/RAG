@@ -23,3 +23,7 @@ test('terminal business failures stop polling, independent of successful HTTP st
   assert.equal(client.terminal('RUNNING'), false)
   for (const state of ['FAILED', 'VERIFICATION_FAILED', 'CANCELLED', 'BUDGET_EXCEEDED', 'COMPLETED']) assert.equal(client.terminal(state), true)
 })
+test('an HTML error page with HTTP 200 cannot masquerade as successful JSON', async () => {
+  globalThis.fetch = async () => new Response('<html>proxy page</html>')
+  await assert.rejects(client.api('/me'), error => error.code === 'INVALID_RESPONSE')
+})

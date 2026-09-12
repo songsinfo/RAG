@@ -21,7 +21,7 @@ export async function api(path: string, method = 'GET', body?: unknown): Promise
   const response = await fetch('/api/v1' + path, { method, credentials: 'include', cache: 'no-store', headers, body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body) })
   const text = await response.text()
   let data: any
-  try { data = text ? JSON.parse(text) : {} } catch { data = { message: '后端返回了无法解析的响应' } }
+  try { data = text ? JSON.parse(text) : {} } catch { throw new ApiError(response.status, 'INVALID_RESPONSE', '后端返回了无法解析的响应') }
   if (!response.ok) {
     if (response.status === 401) window.dispatchEvent(new Event('auth-expired'))
     throw new ApiError(response.status, data.code || 'HTTP_' + response.status, data.message || response.statusText)
@@ -30,5 +30,5 @@ export async function api(path: string, method = 'GET', body?: unknown): Promise
 }
 export const rows = (value: any): Row[] => Array.isArray(value) ? value : value?.items || value?.content || value?.results || []
 export const pretty = (value: unknown) => JSON.stringify(value, null, 2)
-export const keyOf = (row: Row) => row.id || row.documentId || row.runId || row.jobId || row.datasetId || row.versionId
+export const keyOf = (row: Row) => row.id || row.documentId || row.runId || row.jobId || row.datasetId || row.versionId || row.conversationId || row.snapshotId || row.configId || row.caseId || row.resultId
 export const terminal = (status: string) => !['QUEUED', 'RUNNING', 'PENDING'].includes(status)
