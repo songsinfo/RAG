@@ -1,0 +1,37 @@
+server:
+  port: ${PORT:8080}
+  servlet:
+    session:
+      cookie:
+        http-only: true
+spring:
+  application:
+    name: enterprise-knowledge-base
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3307/rag_demo?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}
+    username: ${DB_USER:rag}
+    password: ${DB_PASSWORD:}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 250MB
+rag:
+  environment: ${RAG_ENVIRONMENT:demo}
+  artifact-root: ${RAG_ARTIFACT_ROOT:./.runtime/artifacts}
+  import-root: ${RAG_IMPORT_ROOT:./.runtime/import}
+  elasticsearch-url: ${ELASTICSEARCH_URL:http://localhost:9200}
+  index-prefix: ${RAG_INDEX_PREFIX:rag_demo}
+  docling-url: ${DOCLING_URL:http://localhost:5001}
+  model:
+    base-url: ${MODEL_BASE_URL:}
+    api-key: ${MODEL_API_KEY:}
+    chat: ${CHAT_MODEL:}
+    embedding: ${EMBEDDING_MODEL:}
+    embedding-dimensions: ${EMBEDDING_DIMENSIONS:1024}
+    rerank: ${RERANK_MODEL:}
+    vision: ${VISION_MODEL:}
+    judge: ${JUDGE_MODEL:}
+
