@@ -25,6 +25,9 @@ public class BudgetService {
    String month=YearMonth.now(ZoneOffset.UTC).toString();
    db.exec("INSERT IGNORE INTO tenant_budget(tenant_id,id,period_month,currency,limit_amount) VALUES(:t,:id,:m,'CNY',100)",params("t",actor.tenantId(),"id",Json.id(),"m",month));
    var budget=db.one("SELECT * FROM tenant_budget WHERE tenant_id=:t AND period_month=:m FOR UPDATE",params("t",actor.tenantId(),"m",month));
+   var repeated=db.optional("SELECT * FROM budget_reservation WHERE tenant_id=:t AND caller_environment=:e AND caller_call_id=:c",params("t",actor.tenantId(),"e",environment,"c",callId));
+   if(repeated.isPresent()){if(new BigDecimal(repeated.get().get("reserved_amount").toString()).compareTo(amount)!=0)throw new ApiException(409,"IDEMPOTENCY_CONFLICT","预留参数发生变化");return repeated.get();}
+   int inFlight=((Number)db.one("SELECT COUNT(*) AS n FROM budget_reservation WHERE tenant_id=:t AND status='RESERVED' AND expires_at>CURRENT_TIMESTAMP",params("t",actor.tenantId())).get("n")).intValue();if(inFlight>=3)throw new ApiException(429,"RATE_LIMITED","共用模型在途并发已满");
    var limit=new BigDecimal(budget.get("limit_amount").toString());var total=new BigDecimal(budget.get("reserved_amount").toString()).add(new BigDecimal(budget.get("settled_amount").toString())).add(amount);
    if(total.compareTo(limit)>0)throw new ApiException(429,"BUDGET_RESERVATION_DENIED","月度预算不足");
    String id=Json.id();db.exec("UPDATE tenant_budget SET reserved_amount=reserved_amount+:a WHERE tenant_id=:t AND id=:id",params("t",actor.tenantId(),"id",budget.get("id"),"a",amount));
