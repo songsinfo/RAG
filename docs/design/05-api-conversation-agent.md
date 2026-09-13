@@ -129,15 +129,17 @@ additionalProperties=false；tenant/user/权限/tokenBudget/URL/任意文件路�
 
 循环：
 1. 建立一次全局 RunBudget 和 EvidenceRegistry。
-2. 通过 ModelGateway 调模型，保存可观察的工具请求；不保存/展示模型隐藏思考链。
+2. 通过 ModelGateway 调用 Spring AI `OpenAiChatModel`，将两个只读工具的 JSON Schema 转成 `ToolCallback`，保存模型返回的可观察工具请求；不保存/展示模型隐藏思考链。
 3. 验证工具名/参数，按 tool_call_id 回传结果。一个响应多个工具按顺序执行，逐个检查取消/权限/预算。
-4. 下一轮带 assistant tool_calls + 对应 tool 结果，不丢失调用关联。
+4. 下一轮把 assistant tool_calls 和对应 tool 结果转换为 Spring AI `AssistantMessage`/`ToolResponseMessage`，按 tool_call_id 保持调用关联。
 5. 最终结构化 claims 进入普通问答相同的验证与提交路径。
 6. 达到终止条件不再调用模型“做个总结”；只有已有并通过校验的内容可作为明确标记的部分结果。
 
 初始主模型最多 6 轮、工具 8 次、全局模型调用最多 12 次、60 秒 deadline；token 上限由配置统一计算。相同规范化工具名+参数在同 run 第三次提出时终止 REPEATED_CALLS，前两次允许重试/确认。工具内 Rewrite/HyDE/Embedding/Rerank 计入同一父预算，不可 reset。
 
 模型请求未知工具不执行并返回参数错误；权限失败不能让模型修改身份恢复。版本变化终止 SOURCE_CHANGED，重新发起新问答，不在一个答案里混合不同版本。
+
+这里有意使用低层 `ChatModel.call(Prompt)`，不让 `ChatClient` 自动执行工具。Spring AI 负责 OpenAI-compatible 消息、Media、工具定义和响应的序列化/解析；`QaService` 负责工具白名单、参数校验、执行顺序、终止条件及证据链，因此模型不能绕过业务闸门直接运行工具。Spring AI 的自动与用户控制两种执行方式见[官方 Tool Calling 文档](https://docs.spring.io/spring-ai/reference/api/tools.html)。
 
 ## 7. 最小页面
 

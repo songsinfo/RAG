@@ -8,8 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $seededPersonas = @('admin', 'ops', 'product', 'engineer')
-$input = (Resolve-Path -LiteralPath $InputPath).Path
-$lines = @(Get-Content -LiteralPath $input)
+$resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
+$lines = @(Get-Content -LiteralPath $resolvedInput)
 if ($lines.Count -eq 0) { throw 'Evaluation dataset is empty.' }
 
 if (-not (Test-Path -LiteralPath $BindingPath -PathType Leaf)) {

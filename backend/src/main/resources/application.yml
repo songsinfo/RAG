@@ -25,6 +25,7 @@ rag:
   elasticsearch-url: ${ELASTICSEARCH_URL:http://localhost:9200}
   index-prefix: ${RAG_INDEX_PREFIX:rag_demo}
   docling-url: ${DOCLING_URL:http://localhost:5001}
+  # ModelGateway 将这些配置映射到 Spring AI；空配置允许应用启动，实际调用时失败关闭。
   model:
     base-url: ${MODEL_BASE_URL:}
     api-key: ${MODEL_API_KEY:}
@@ -34,4 +35,3 @@ rag:
     rerank: ${RERANK_MODEL:}
     vision: ${VISION_MODEL:}
     judge: ${JUDGE_MODEL:}
-

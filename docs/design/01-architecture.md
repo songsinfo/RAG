@@ -34,7 +34,7 @@ flowchart LR
 |---|---|---|
 | 业务语言 | Java 21 LTS | 用户主要学习业务调用链，无需手写 Python 解析逻辑 |
 | Web | Spring Boot 4.0.x、MVC、Validation、Spring Security | 同源 API、服务端登录态、参数校验；不是全响应式架构 |
-| 模型调用 | Spring AI 2.0.x，供应商能力通过薄适配层接入 | 使用聊天和 Embedding 客户端；权限、检索融合、Agent 循环自己实现 |
+| 模型调用 | Spring AI 2.0.1 `spring-ai-openai`，供应商能力通过 ModelGateway 接入 | Chat、Embedding、Vision、Judge 使用 Spring AI；Reranker 使用供应商扩展端点；权限、检索融合、Agent 循环自己实现 |
 | 持久化 | MySQL 8.4、Spring JDBC、Flyway | 显式 SQL 便于解释 ACL、行锁和发布事务；不叠加 ORM |
 | 搜索 | Elasticsearch 9.x 对应稳定补丁 | Java REST 客户端与服务端锁定同一兼容系列；原文与向量双索引 |
 | 解析 | Docling Serve 固定 CPU 镜像摘要 | HTTP 异步解析 DOCX/PDF/HTML，扫描 OCR、表格、图片资产；Java 处理业务协议 |
@@ -42,13 +42,17 @@ flowchart LR
 | 前端 | Vue 3 + TypeScript + Vite + Element Plus | 登录、资料管理、问答、评估、运行详情；不做复杂视觉设计 |
 | 测试 | JUnit、Spring API 集成测试、Testcontainers，少量浏览器流程 | 模型使用可控替身验证工程行为，真实模型使用冻结评测验证质量 |
 
-Spring AI 当前官方说明 2.0.x 与 Boot 4.0.x/4.1.x 兼容，故不混搭旧 Boot 系列。此处只确认兼容系列，尚未完成依赖解析与本机运行。[官方兼容说明](https://docs.spring.io/spring-ai/reference/getting-started.html)
+Spring AI 2.0.1 通过官方 BOM 锁版，并已与本项目 Spring Boot 4.0.3、JDK 21 完成依赖解析、编译和模型网关契约测试。Spring AI 官方兼容说明列出 2.0.x 对 Boot 4.0.x/4.1.x 的支持。[官方兼容说明](https://docs.spring.io/spring-ai/reference/getting-started.html)
 
 C1 必须生成锁版清单：JDK 发行版/版本、Maven Wrapper、Boot/AI/客户端/数据库/ES 版本、Docling 镜像 digest 与 OpenAPI hash、前端 lockfile。禁止以 latest 标签完成交付；解析 SDK 字段以该镜像真实 OpenAPI 为准。
 
 ## 3. 模型配置
 
 配置为 CHAT、EMBEDDING、RERANK、VISION、JUDGE 五种用途，可共用已验证服务，不能假设所有 OpenAI-compatible 端点都支持重排或图片。每项保存 endpoint 标识、准确 model ID/revision、上下文上限、token 计数方式、超时、价格版本；密钥只从环境变量读取。
+
+当前实现直接依赖 `spring-ai-openai`，由 `ModelGateway` 根据 `MODEL_BASE_URL`、`MODEL_API_KEY` 和各用途 model ID 构造 `OpenAiChatModel`/`OpenAiEmbeddingModel`。没有启用 starter 自动配置，因此缺少密钥时应用仍可启动，真正发起模型调用才返回 `MODEL_NOT_CONFIGURED`。Spring AI 内部重试设为 0，429/5xx 的三次有限重试、调用 deadline、并发槽位、来源权限复核和预算预留/结算继续由统一网关负责，避免两层重试导致费用与 attempt 账本失真。客户端能力与配置字段见[官方 OpenAI Chat 文档](https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html)和[官方 OpenAI Embedding 文档](https://docs.spring.io/spring-ai/reference/api/embeddings/openai-embeddings.html)。
+
+Chat、Rewrite、HyDE、Multi-Query、答案生成和 Judge 统一走 `OpenAiChatModel`；图片数据先转换为 Spring AI `Media`；Embedding 走 `OpenAiEmbeddingModel` 并继续执行数量、顺序、维度、有限数值和非零模长校验。Agent 的工具 JSON Schema 转成 Spring AI `ToolCallback` 供模型生成 tool calls，但工具执行仍由 `QaService` 的受控循环完成，以保留逐次权限、取消、预算、重复调用熔断和证据登记。Reranker 的 `/rerank` 不是该 OpenAI Chat/Embedding 客户端的标准能力，保留 `HttpClient` 薄适配并复用同一网关生命周期。
 
 Embedding 的参考候选为 BGE-M3 的 Dense 表示，维度 1024；不使用其 Sparse 头冒充本项目 BM25。模型卡给出 1024 维，本设计的向量 JSON 因此使用 1024 作为样例。实际选用服务仍须验证模型、输入截断、归一化及返回维度，变更模型需要新索引族和重建。[模型卡](https://huggingface.co/BAAI/bge-m3)
 

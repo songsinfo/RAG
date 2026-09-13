@@ -6,7 +6,7 @@
 
 | 范围 | 本次结果 | 证据边界 |
 | --- | --- | --- |
-| Java 后端 | Maven test 成功，60 个测试，0 失败、0 错误、0 跳过 | 覆盖算法、权限、CSRF、解析、删除传播、预算、模型 HTTP 契约、问答生命周期等；未连接真实 MySQL/ES |
+| Java 后端 | Maven test 成功，73 个测试，0 失败、0 错误、0 跳过 | 覆盖算法、权限、CSRF、解析、删除传播、预算、Spring AI 模型 HTTP/工具调用契约、问答生命周期等；未连接真实 MySQL/ES |
 | 前端 | 4 个 API 契约测试通过；vue-tsc --noEmit 通过；Vite 生产构建通过 | 构建产物约 1.04 MB，存在大 chunk 警告，不影响功能验收 |
 | PRD/设计 | 23 份 Markdown、125 个本地链接、81/81 AC 有追踪；DDL 39 张表、99 个外键 | 这是静态一致性检查，不是 81 项运行验收 |
 | 验收脚本 | evaluation 真实无模型 HTTP 集成通过；端到端和消融脚本 SelfTest 通过；300 题结构校验和运行 ID 绑定合成测试通过 | HTTP 实测覆盖登录、入库、BM25、双层 ACL 和撤权；B0-B3 真实模型尚未运行 |
@@ -25,6 +25,7 @@
 - 端到端脚本已移除模型配置写入和“catch 后当成功”的逻辑，只验证无模型入库、BM25、ACL 授予/撤销与 demo 评估隔离。
 - nDCG 已从独立数学函数接入逐题检索指标与宏平均汇总，相关等级取金标准 relevanceGrade，同一事实组只计首次命中。
 - 已增加固定 B0-B3 配置、300 题运行时 ID 绑定和批跑脚本；脚本先估价，失败关闭，并只落盘脱敏逐题结果。
+- 模型协议层已从手写 Chat/Embedding HTTP 请求迁移到 Spring AI 2.0.1：Chat、Embedding、Vision、Judge 使用 `OpenAiChatModel`/`OpenAiEmbeddingModel`，Agent 工具调用保留业务侧受控循环；供应商特有的 `/rerank` 继续使用薄 HTTP 适配。模型网关契约测试已覆盖真实 HTTP、用量结算和 Function Calling，仍未使用付费真实模型验证质量。
 
 ## 当前阻塞
 
