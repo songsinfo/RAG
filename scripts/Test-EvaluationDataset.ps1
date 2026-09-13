@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-$lines = Get-Content -LiteralPath $resolvedPath
+$lines = @(Get-Content -LiteralPath $resolvedPath)
 if ($lines.Count -eq 0) { throw 'Evaluation dataset is empty.' }
 if ($ExpectedCount -gt 0 -and $lines.Count -ne $ExpectedCount) {
     throw "Expected $ExpectedCount cases, got $($lines.Count)."

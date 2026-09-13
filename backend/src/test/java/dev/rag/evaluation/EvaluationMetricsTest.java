@@ -22,8 +22,11 @@ class EvaluationMetricsTest {
   assertNull(EvaluationMetrics.ndcg(List.of(0),List.of(0),1));
   assertThrows(IllegalArgumentException.class,()->EvaluationMetrics.ndcg(List.of(-1),List.of(3),1));
  }
+ @Test void retrievalResultIncludesNdcgForTheSameRankedCandidates(){
+  var m=EvaluationMetrics.retrieval(List.of(Set.of("a"),Set.of("b")),List.of(Set.of("b"),Set.of("a")),List.of(1,3),List.of(3,1),2);
+  assertEquals(1.0,m.get("recall"));assertTrue(m.get("ndcg")<1.0);assertTrue(m.get("ndcg")>0.0);
+ }
  @Test void nearestRankPercentileUsesAllObservedDurations(){
   assertEquals(1000L,EvaluationMetrics.percentile(List.of(1L,2L,3L,1000L),.95));
  }
 }
-

@@ -1,12 +1,13 @@
 [CmdletBinding()]
 param(
     [string]$BaseUrl = 'http://127.0.0.1:8080',
-    [ValidateSet('demo', 'test')]
+    [ValidateSet('demo', 'test', 'evaluation')]
     [string]$Environment = 'demo',
     [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module Microsoft.PowerShell.Utility
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -22,7 +23,7 @@ function Assert-Http {
     )
     Assert-True ($null -ne $Response) "$Context returned no response"
     Assert-True ([int]$Response.Status -eq $Status) "$Context expected HTTP $Status, got $($Response.Status)"
-    if ($null -ne $Code) {
+    if (-not [string]::IsNullOrEmpty($Code)) {
         Assert-True ($null -ne $Response.Body) "$Context returned no JSON error body"
         Assert-True ([string]$Response.Body.code -eq $Code) "$Context expected code $Code, got $($Response.Body.code)"
     }
@@ -141,6 +142,16 @@ $kb = Invoke-Api 'POST' '/api/v1/admin/knowledge-bases' $admin.Session (Write-He
 }
 Assert-Http $kb 200 $null 'create knowledge base'
 $kbId = [string]$kb.Body.id
+$kbAcl = Invoke-Api 'GET' "/api/v1/admin/knowledge-bases/$kbId/acl" $admin.Session
+Assert-Http $kbAcl 200 $null 'read knowledge-base ACL'
+$kbGrant = Invoke-Api 'PUT' "/api/v1/admin/knowledge-bases/$kbId/acl" $admin.Session (Write-Headers $admin) @{
+    expectedVersion = [long]$kbAcl.Body.rowVersion
+    readers = @(
+        @{ type = 'USER'; userId = [string]$adminMe.Body.userId }
+        @{ type = 'USER'; userId = [string]$opsMe.Body.userId }
+    )
+}
+Assert-Http $kbGrant 200 $null 'grant ops knowledge-base access'
 
 $runtimeDir = Join-Path $ragRoot '.runtime'
 $documentPath = Join-Path $runtimeDir "verification-$suffix.md"
@@ -161,6 +172,7 @@ $upload = Invoke-Api 'POST' '/api/v1/admin/documents' $admin.Session (Write-Head
 }
 Assert-Http $upload 202 $null 'upload document'
 $documentId = [string]$upload.Body.documentId
+$versionId = [string]$upload.Body.versionId
 $jobId = [string]$upload.Body.jobId
 
 $job = $null
@@ -189,9 +201,11 @@ Assert-Http $opsSearchDenied 200 $null 'ops search without grant'
 Assert-True (@($opsSearchDenied.Body.evidence).Count -eq 0) 'ops search returned a document without a grant'
 $opsDocumentDenied = Invoke-Api 'GET' "/api/v1/documents/$documentId" $ops.Session
 Assert-Http $opsDocumentDenied 404 'RESOURCE_NOT_FOUND' 'ops document without grant'
+$adminDocument = Invoke-Api 'GET' "/api/v1/documents/$documentId" $admin.Session
+Assert-Http $adminDocument 200 $null 'admin document before grant'
 
 $grant = Invoke-Api 'PUT' "/api/v1/admin/documents/$documentId/acl" $admin.Session (Write-Headers $admin) @{
-    expectedVersion = 0
+    expectedVersion = [long]$adminDocument.Body.rowVersion
     mode = 'RESTRICT'
     readers = @(@{ type = 'USER'; userId = [string]$opsMe.Body.userId })
 }
@@ -221,22 +235,102 @@ if ($Environment -eq 'demo') {
     Assert-Http $isolation 409 'EVALUATION_ENVIRONMENT_REQUIRED' 'evaluation isolation'
 }
 
+$evaluationRunId = $null
+$evaluationMetrics = $null
+if ($Environment -eq 'evaluation') {
+    $dataset = Invoke-Api 'POST' '/api/v1/admin/eval/datasets' $admin.Session (Write-Headers $admin) @{
+        name = "http-verification-$suffix"
+    }
+    Assert-Http $dataset 200 $null 'create evaluation dataset'
+    $datasetVersionId = [string]$dataset.Body.id
+    $saveCase = Invoke-Api 'POST' "/api/v1/admin/eval/dataset-versions/$datasetVersionId/cases" $admin.Session (Write-Headers $admin) @{
+        cases = @(@{
+            caseKey = "HTTP-$suffix"
+            groupKey = "HTTP-$suffix"
+            split = 'TEST'
+            category = 'FACT'
+            question = @{ text = "系统核验标记 $marker 是什么？" }
+            persona = @{ loginName = 'admin' }
+            expected = @{
+                status = 'ANSWER'
+                evidenceGroups = @(@{
+                    fact = '核验标记'
+                    alternatives = @(@{
+                        documentId = $documentId
+                        versionId = $versionId
+                        quote = "系统核验标记为 $marker"
+                        relevanceGrade = 3
+                    })
+                })
+            }
+            annotationStatus = 'AUTO_REVIEWED'
+        })
+    }
+    Assert-Http $saveCase 200 $null 'save evaluation case'
+    $freeze = Invoke-Api 'POST' "/api/v1/admin/eval/dataset-versions/$datasetVersionId/freeze" $admin.Session (Write-Headers $admin) @{}
+    Assert-Http $freeze 200 $null 'freeze evaluation dataset'
+    $snapshot = Invoke-Api 'POST' '/api/v1/admin/eval/snapshots' $admin.Session (Write-Headers $admin) @{
+        name = "http-verification-$suffix"
+        documentIds = @($documentId)
+        approvedSyntheticOrRedacted = $true
+    }
+    Assert-Http $snapshot 200 $null 'create evaluation snapshot'
+    $configs = Invoke-Api 'GET' '/api/v1/admin/configs' $admin.Session
+    Assert-Http $configs 200 $null 'list retrieval configs'
+    $baseline = @($configs.Body | Where-Object { $_.kind -eq 'RETRIEVAL' -and $_.name -eq 'baseline' -and $_.status -eq 'PUBLISHED' } | Select-Object -First 1)
+    Assert-True ($baseline.Count -eq 1) 'published baseline retrieval config was not found'
+    $evaluationRequest = @{
+        datasetVersionId = $datasetVersionId
+        snapshotId = [string]$snapshot.Body.snapshotId
+        configId = [string]$baseline[0].id
+        split = 'TEST'
+        repeats = 1
+        mode = 'RETRIEVAL_ONLY'
+        strict = $false
+    }
+    $estimate = Invoke-Api 'POST' '/api/v1/admin/eval/estimates' $admin.Session (Write-Headers $admin) $evaluationRequest
+    Assert-Http $estimate 200 $null 'estimate retrieval-only evaluation'
+    Assert-True ([double]$estimate.Body.estimatedCostCny -eq 0) 'retrieval-only estimate was not zero'
+    $evaluationRequest.estimateId = [string]$estimate.Body.estimateId
+    $evaluationRequest.maxCostCny = 1
+    $startedEvaluation = Invoke-Api 'POST' '/api/v1/admin/eval/runs' $admin.Session (Write-Headers $admin) $evaluationRequest
+    Assert-Http $startedEvaluation 200 $null 'start retrieval-only evaluation'
+    $evaluationRunId = [string]$startedEvaluation.Body.runId
+    $evaluationRun = $null
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        Start-Sleep -Seconds 1
+        $runResponse = Invoke-Api 'GET' "/api/v1/admin/eval/runs/$evaluationRunId" $admin.Session
+        Assert-Http $runResponse 200 $null 'poll retrieval-only evaluation'
+        $evaluationRun = $runResponse.Body
+        if ($evaluationRun.status -notin @('QUEUED', 'RUNNING')) { break }
+    }
+    Assert-True ($evaluationRun.status -eq 'COMPLETED') "retrieval-only evaluation stopped with status $($evaluationRun.status)"
+    foreach ($metric in @('hitAt5', 'recallAt5', 'mrr', 'ndcgAt5')) {
+        Assert-True ([double]$evaluationRun.metrics.$metric -eq 1) "$metric expected 1, got $($evaluationRun.metrics.$metric)"
+    }
+    Assert-True ([int]$evaluationRun.metrics.retrievalDenominator -eq 1) 'retrieval denominator expected 1'
+    Assert-True ([int]$evaluationRun.metrics.ndcgDenominator -eq 1) 'nDCG denominator expected 1'
+    $evaluationMetrics = $evaluationRun.metrics
+}
+
 $reportDir = Join-Path $runtimeDir 'reports'
 if (-not (Test-Path -LiteralPath $reportDir)) { $null = New-Item -ItemType Directory -Path $reportDir }
 $reportPath = Join-Path $reportDir 'http-integration.json'
+$checks = @(
+    'admin and ops authentication'
+    'model-free markdown ingestion'
+    'BM25 positive retrieval'
+    'document read denial before grant'
+    'document ACL grant'
+    'document ACL revocation'
+)
+if ($Environment -eq 'demo') { $checks += 'evaluation isolation in demo' }
+if ($Environment -eq 'evaluation') { $checks += 'frozen one-case retrieval evaluation with Hit, Recall, MRR and nDCG' }
 $report = [ordered]@{
     generatedAt = [DateTimeOffset]::UtcNow.ToString('O')
     environment = $Environment
     scope = 'No-model HTTP integration'
-    checks = @(
-        'admin and ops authentication'
-        'model-free markdown ingestion'
-        'BM25 positive retrieval'
-        'document read denial before grant'
-        'document ACL grant'
-        'document ACL revocation'
-        'evaluation isolation in demo'
-    )
+    checks = $checks
     modelCalls = 0
     notTested = @(
         'generated answers'
@@ -246,6 +340,8 @@ $report = [ordered]@{
     )
     documentId = $documentId
     jobId = $jobId
+    evaluationRunId = $evaluationRunId
+    evaluationMetrics = $evaluationMetrics
 }
 $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath -Encoding utf8
 Write-Output "No-model HTTP integration passed. Report: $reportPath"

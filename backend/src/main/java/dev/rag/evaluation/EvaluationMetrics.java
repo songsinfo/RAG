@@ -16,6 +16,9 @@ public final class EvaluationMetrics {
   }
   result.put("hit",found.isEmpty()?0.0:1.0);result.put("recall",(double)found.size()/groups.size());result.put("mrr",first==0?0.0:1.0/first);return result;
  }
+ public static Map<String,Double> retrieval(List<Set<String>> groups,List<Set<String>> ranked,List<Integer>rankedGrades,List<Integer>idealGrades,int k){
+  var result=new LinkedHashMap<>(retrieval(groups,ranked,k));result.put("ndcg",ndcg(rankedGrades,idealGrades,k));return result;
+ }
  public static Double ndcg(List<Integer> ranked,List<Integer> ideal,int k){
   if(k<1)throw new IllegalArgumentException("k must be positive");
   if(ranked.stream().anyMatch(g->g<0||g>3)||ideal.stream().anyMatch(g->g<0||g>3))throw new IllegalArgumentException("Grade must be 0..3; unjudged is not zero");
@@ -27,4 +30,3 @@ public final class EvaluationMetrics {
   if(values.isEmpty())return null;var sorted=values.stream().sorted().toList();return sorted.get((int)Math.ceil(sorted.size()*quantile)-1);
  }
 }
-

@@ -65,4 +65,21 @@ class EvaluationRunnerTest {
   assertTrue(EvaluationCatalog.maps(null).isEmpty());
   assertThrows(ApiException.class, () -> EvaluationCatalog.maps("not-a-list"));
  }
+
+ @Test
+ void nDcgCountsAnEvidenceFactGroupOnlyOnce() {
+  var seen = new HashSet<Integer>();
+  var grades = Map.of("primary", 3, "alternative", 2);
+  var groups = Map.of("primary", 0, "alternative", 0);
+  assertEquals(3, EvaluationRunner.gradedRelevance(Set.of("primary"), grades, groups, seen));
+  assertEquals(0, EvaluationRunner.gradedRelevance(Set.of("alternative"), grades, groups, seen));
+ }
+
+ @Test
+ void retrievalMetricsPreferThePostRerankerOrder() {
+  var fused = List.of(Map.of("id", "before"));
+  var reranked = List.of(Map.of("id", "after"));
+  assertSame(reranked, EvaluationRunner.finalRanking(Map.of("fused", fused, "reranked", reranked)));
+  assertSame(fused, EvaluationRunner.finalRanking(Map.of("fused", fused)));
+ }
 }
