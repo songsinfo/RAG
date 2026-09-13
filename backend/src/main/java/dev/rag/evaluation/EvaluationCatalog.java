@@ -43,7 +43,7 @@ public class EvaluationCatalog {
    db.insert("eval_case",params("tenant_id",a.tenantId(),"id",id,"dataset_version_id",version,"case_key",key,"split",split,"group_key",need(b,"groupKey"),"category",need(b,"category"),"question_json",Json.write(question),"persona_json",Json.write(persona),"expected_json",Json.write(expected),"annotation_status",annotation));
    for(var group:maps(expected.get("evidenceGroups"))){int alternative=0;String fact=need(group,"fact");for(var anchor:maps(group.get("alternatives"))){
     String doc=need(anchor,"documentId"),v=need(anchor,"versionId");need(anchor,"quote");var source=db.one("SELECT source_hash FROM document_version WHERE tenant_id=:t AND document_id=:d AND id=:v",params("t",a.tenantId(),"d",doc,"v",v));int grade=Json.integer(anchor,"relevanceGrade",3);if(grade<0||grade>3)throw new ApiException(400,"INVALID_INPUT","相关等级必须0..3");
-    db.insert("eval_gold",params("tenant_id",a.tenantId(),"id",Json.id(),"case_id",id,"fact_group",fact,"alternative_no",alternative++,"origin_system","LOCAL_SYNTHETIC","origin_tenant_id",a.tenantId(),"origin_document_id",doc,"version_hash",source.get("source_hash"),"anchor_json",Json.write(anchor),"relevance_grade",grade));
+    db.insert("eval_gold",params("tenant_id",a.tenantId(),"id",Json.id(),"case_id",id,"fact_group",fact,"alternative_no",alternative++,"origin_system",environment,"origin_tenant_id",a.tenantId(),"origin_document_id",doc,"version_hash",source.get("source_hash"),"anchor_json",Json.write(anchor),"relevance_grade",grade));
    }}
   }return Map.of("count",inputs.size(),"datasetVersionId",version);
  });}
@@ -67,7 +67,7 @@ public class EvaluationCatalog {
    String id=Json.id();List<Map<String,Object>> docs=new ArrayList<>();for(String doc:ids){var d=db.one("SELECT d.id,d.active_build_id,b.version_id,b.config_id,v.source_hash FROM document d JOIN index_build b ON b.tenant_id=d.tenant_id AND b.id=d.active_build_id JOIN document_version v ON v.tenant_id=b.tenant_id AND v.id=b.version_id WHERE d.tenant_id=:t AND d.id=:d AND d.status='LIVE'",params("t",a.tenantId(),"d",doc));docs.add(params("documentId",doc,"buildId",d.get("active_build_id"),"versionId",d.get("version_id"),"sourceHash",HexFormat.of().formatHex((byte[])d.get("source_hash")),"buildConfigId",d.get("config_id")));}
    var manifest=params("documents",docs,"environment",environment,"securityEpoch",db.one("SELECT security_epoch FROM tenant WHERE id=:t",params("t",a.tenantId())).get("security_epoch"));
    db.insert("eval_snapshot",params("tenant_id",a.tenantId(),"id",id,"name",name,"manifest_hash",hash(manifest),"manifest_json",Json.write(manifest),"status","READY","environment_id",environment));
-   for(var d:docs)db.insert("eval_snapshot_document",params("tenant_id",a.tenantId(),"id",Json.id(),"snapshot_id",id,"document_id",d.get("documentId"),"version_id",d.get("versionId"),"origin_system","LOCAL_SYNTHETIC","origin_tenant_id",a.tenantId(),"origin_document_id",d.get("documentId"),"origin_version_hash",HexFormat.of().parseHex(d.get("sourceHash").toString())));
+   for(var d:docs)db.insert("eval_snapshot_document",params("tenant_id",a.tenantId(),"id",Json.id(),"snapshot_id",id,"document_id",d.get("documentId"),"version_id",d.get("versionId"),"origin_system",environment,"origin_tenant_id",a.tenantId(),"origin_document_id",d.get("documentId"),"origin_version_hash",HexFormat.of().parseHex(d.get("sourceHash").toString())));
    return Map.of("id",id,"snapshotId",id,"manifest",manifest);
   }));
  }
