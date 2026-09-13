@@ -107,7 +107,7 @@ public class EvaluationRunner {
   }
   if(result.get("qa_run_id")==null||Json.bool(checkpoint,"startNext",false)){
    var request=params("question",need(turns.get(turn),"text"),"segmentId",checkpoint.get("segmentId"),"mode",manifest.get("mode"),"strict",manifest.get("strict"));
-   var started=qa.submitEvaluation(persona,checkpoint.get("conversationId").toString(),request,"eval:"+id+":"+turn,run.get("config_id").toString());checkpoint.put("startNext",false);
+   var started=qa.submitEvaluation(persona,checkpoint.get("conversationId").toString(),request,"eval:"+id+":"+turn,run.get("config_id").toString(),job.get("id").toString());checkpoint.put("startNext",false);
    db.exec("UPDATE eval_result SET qa_run_id=:q,status='RUNNING',metrics_json=:m WHERE tenant_id=:t AND id=:id AND status IN ('PENDING','RUNNING')",params("t",admin.tenantId(),"id",id,"q",started.get("runId"),"m",Json.write(checkpoint)));return;
   }
   String qaId=result.get("qa_run_id").toString();var output=qa.get(persona,qaId);String status=Json.str(output,"status");if(Set.of("QUEUED","RUNNING").contains(status))return;

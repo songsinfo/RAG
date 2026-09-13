@@ -25,4 +25,14 @@ class ModelGatewayHttpTest {
  @Test void missingUsageIsNotFree(){response="{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}";gateway("test-only").embed(actor,"JOB","job",List.of("甲"));verify(authority).settle(eq(actor),any(),eq("UNKNOWN"),isNull(),isNull());}
  @Test void malformedDimensionsAreRejected(){response="{\"data\":[{\"index\":0,\"embedding\":[1]}]}";assertEquals("INVALID_MODEL_RESPONSE",assertThrows(ApiException.class,()->gateway("test-only").embed(actor,"JOB","job",List.of("甲"))).code);}
  @Test void cancelledJobNeverContactsProvider(){when(db.one(contains("SELECT * FROM job"),anyMap())).thenReturn(Map.of("status","CANCELLED"));assertEquals("CANCELLED",assertThrows(ApiException.class,()->gateway("test-only").embed(actor,"JOB","job",List.of("甲"))).code);assertNull(received);verifyNoInteractions(authority);}
+ @Test void remoteReservationAmountIsCheckedBeforeSending(){
+  doThrow(new ApiException(429,"BUDGET_EXCEEDED","cap")).when(budgets).recordBatchCall(eq(actor),eq("job"),argThat(c->new BigDecimal(c.get("reserved_amount").toString()).compareTo(BigDecimal.ONE)==0));
+  assertEquals("BUDGET_EXCEEDED",assertThrows(ApiException.class,()->gateway("test-only").embed(actor,"JOB","job",List.of("甲"))).code);assertNull(received);verify(authority).settle(eq(actor),any(),eq("NOT_SENT"),isNull(),isNull());
+ }
+ @Test void nestedRunCallUsesDurableEvaluationJobBeforeProviderRequest(){
+  when(db.one(contains("SELECT * FROM qa_run"),anyMap())).thenReturn(Map.of("status","RUNNING","mode","AGENT","budget_json","{\"evaluationJobId\":\"batch\"}"));
+  when(db.one(contains("input_total"),anyMap())).thenReturn(Map.of("calls",0,"input_total",0,"output_total",0));
+  doThrow(new ApiException(429,"BUDGET_EXCEEDED","cap")).when(budgets).recordBatchCall(eq(actor),eq("batch"),anyMap());
+  assertEquals("BUDGET_EXCEEDED",assertThrows(ApiException.class,()->gateway("test-only").embed(actor,"RUN","qa",List.of("甲"))).code);assertNull(received);verify(budgets).requireBatchRunning(actor,"batch");
+ }
 }

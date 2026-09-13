@@ -18,6 +18,26 @@ public class BudgetService {
  }
  private static BigDecimal price(Map<String,Object>p,String key){try{var n=new BigDecimal(p.get(key).toString());if(n.signum()<0)throw new NumberFormatException();return n;}catch(Exception e){throw new ApiException(409,"MODEL_PRICING_NOT_CONFIGURED","缺少明确模型单价或上界");}}
  public static BigDecimal estimate(Map<String,Object>p,long input,long output){return price(p,"inputPricePerMillion").multiply(BigDecimal.valueOf(input)).add(price(p,"outputPricePerMillion").multiply(BigDecimal.valueOf(output))).divide(BigDecimal.valueOf(1_000_000),6,RoundingMode.CEILING);}
+ public void requireBatchRunning(Actor actor,String jobId){
+  var job=db.one("SELECT status,cancel_requested_at FROM job WHERE tenant_id=:t AND id=:id",params("t",actor.tenantId(),"id",jobId));
+  if(!"RUNNING".equals(job.get("status"))||job.get("cancel_requested_at")!=null)throw new ApiException(409,"CANCELLED","所属后台批次已停止");
+ }
+ /** Serialize the local attempt ledger with the batch cap, after shared-account reservation. */
+ public void recordBatchCall(Actor actor,String jobId,Map<String,Object>call){
+  tx.executeWithoutResult(s->{
+   var job=db.one("SELECT * FROM job WHERE tenant_id=:t AND id=:id FOR UPDATE",params("t",actor.tenantId(),"id",jobId));
+   if(!"RUNNING".equals(job.get("status"))||job.get("cancel_requested_at")!=null)throw new ApiException(409,"CANCELLED","所属后台批次已停止");
+   var checkpoint=job.get("checkpoint")==null?Map.<String,Object>of():Json.object(job.get("checkpoint").toString());
+   BigDecimal limit=new BigDecimal(checkpoint.getOrDefault("maxCostCny",checkpoint.getOrDefault("maxCost","10")).toString());
+   int maxCalls=Json.integer(checkpoint,"maxModelCalls",1000);
+   if(limit.signum()<=0||limit.compareTo(BigDecimal.TEN)>0||maxCalls<1)throw new ApiException(429,"BUDGET_EXCEEDED","后台批量预算上限无效");
+   // Link every turn before its worker starts; eval_result.qa_run_id only retains the latest turn.
+   var usage=db.one("SELECT COUNT(*) AS calls,COALESCE(SUM(COALESCE(settled_amount,reserved_amount)),0) AS amount FROM model_call WHERE tenant_id=:t AND (job_id=:j OR run_id IN (SELECT id FROM qa_run WHERE tenant_id=:t AND JSON_UNQUOTE(JSON_EXTRACT(budget_json,'$.evaluationJobId'))=:j))",params("t",actor.tenantId(),"j",jobId));
+   BigDecimal next=new BigDecimal(usage.get("amount").toString()).add(new BigDecimal(call.get("reserved_amount").toString()));
+   if(((Number)usage.get("calls")).intValue()>=maxCalls||next.compareTo(limit)>0)throw new ApiException(429,"BUDGET_EXCEEDED","后台批次调用或费用上限已达到");
+   db.insert("model_call",call);
+  });
+ }
  public Map<String,Object> reserve(Actor actor,String environment,String callId,BigDecimal amount){
   if(amount.signum()<0)throw new ApiException(400,"INVALID_INPUT","预算不能为负");return tx.execute(s->{
    var existing=db.optional("SELECT * FROM budget_reservation WHERE tenant_id=:t AND caller_environment=:e AND caller_call_id=:c",params("t",actor.tenantId(),"e",environment,"c",callId));
