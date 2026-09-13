@@ -1,6 +1,6 @@
 # 企业内部知识库项目
 
-当前阶段：F0-F4 模块已基本完成（后端 34 个核心类及 25 个单元测试全绿；前端页面组件已编写；初始 30 题基准数据集已落盘）。当前正推进 F5 系统集成与端到端运行验收。
+当前阶段：F0-F4 主体代码已完成，F5 工程验收进行中。已验证后端 57 个自动化测试、前端 4 个 API 契约测试与生产构建、81 项验收标准的静态追踪；真实 MySQL/Elasticsearch/Docling HTTP 联调仍需本机 Docker 恢复后执行。证据与边界见[当前进度审计](docs/delivery/2026-09-13-progress-audit.md)。
 
 Java 主业务、Docling 独立解析服务，面向运营、产品和技术共用的内部知识库。前端简洁，重点是权限、文档生命周期、完整检索策略、可追溯回答、评估和运行恢复。
 
@@ -30,11 +30,11 @@ Java 主业务、Docling 独立解析服务，面向运营、产品和技术共�
 
 从[技术设计入口](docs/design/README.md)开始，依次阅读架构、数据库与权限、入库状态机、检索与证据、API/会话/Agent、评估和实施验收。附件含 MySQL DDL 和 Elasticsearch 映射；[验收追踪表](docs/design/08-traceability.md)逐条对应 81 项 PRD 验收。
 
-下一步进入 F5：依赖容器启动联调（MySQL 3307、Elasticsearch 9200、Docling 5001）、端到端问答与评估链路验证、以及按照 81 项 PRD 验收追踪表进行运行验收。
+下一步继续 F5：恢复 Docker 后运行无模型 HTTP 集成，随后在独立 evaluation 环境绑定题集来源并做 RETRIEVAL_ONLY 评估；真实模型配置按需最后接入。不要把 81 项静态追踪写成 81 项运行验收通过。
 
 ## 资料组织
 
-当前已有 README、范围文档、prd 和 design 文档。代码与其他资料后续按阶段创建：
+当前已有 README、范围文档、PRD、技术设计、后端、前端、部署脚本和评测框架：
 
 - docs/design：详细技术设计。
 - docs/decisions：取舍与技术决策。

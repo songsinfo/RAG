@@ -1,243 +1,251 @@
-# End-to-End full pipeline validation script for Enterprise Knowledge Base
 [CmdletBinding()]
 param(
     [string]$BaseUrl = 'http://127.0.0.1:8080',
-    [string]$Environment = 'demo'
+    [ValidateSet('demo', 'test')]
+    [string]$Environment = 'demo',
+    [switch]$SelfTest
 )
+
 $ErrorActionPreference = 'Stop'
 
-function Log-Step([string]$msg) {
-    Write-Host "`n==== [STEP] $msg ====" -ForegroundColor Cyan
+function Assert-True {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw $Message }
 }
 
-$ragRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$envPath = Join-Path $ragRoot ".runtime\$Environment.env"
-if (-not (Test-Path -LiteralPath $envPath)) {
-    throw "Environment file not found: $envPath"
-}
-
-# 1. Parse demo.env for credentials
-$seedPassword = ''
-foreach ($line in (Get-Content -LiteralPath $envPath)) {
-    if ($line -match '^RAG_SEED_PASSWORD=(.*)$') {
-        $seedPassword = $Matches[1].Trim()
-    }
-}
-if (-not $seedPassword) {
-    throw "RAG_SEED_PASSWORD not found in $envPath"
-}
-
-# 2. Check or Start Backend
-Log-Step "Checking backend connectivity at $BaseUrl"
-$backendReady = $false
-try {
-    $null = Invoke-RestMethod -Uri "$BaseUrl/api/v1/auth/csrf" -Method Get -TimeoutSec 3
-    $backendReady = $true
-} catch {
-    Write-Host "Backend not responding. Please ensure Start-Backend.ps1 is running." -ForegroundColor Yellow
-}
-if (-not $backendReady) {
-    throw "Failed to connect to backend at $BaseUrl"
-}
-Write-Host "Backend is responding." -ForegroundColor Green
-
-# 3. CSRF & Login
-Log-Step "Authenticating as admin"
-$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$csrfResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/auth/csrf" -Method Get -WebSession $session
-$csrfToken = $csrfResp.csrfToken
-Write-Host "Obtained CSRF token: $csrfToken"
-
-$headers = @{
-    'X-CSRF-Token' = $csrfToken
-    'Idempotency-Key' = [System.Guid]::NewGuid().ToString()
-}
-
-$loginBody = @{
-    tenantCode = $Environment
-    loginName = 'admin'
-    password = $seedPassword
-} | ConvertTo-Json
-
-$loginResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/auth/login" -Method Post -Body $loginBody -ContentType 'application/json' -Headers $headers -WebSession $session
-if (-not $loginResp.authenticated) {
-    throw "Login failed: $($loginResp | ConvertTo-Json)"
-}
-Write-Host "Admin login successful." -ForegroundColor Green
-
-# Refresh CSRF token for the authenticated session
-$csrfResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/auth/csrf" -Method Get -WebSession $session
-$csrfToken = $csrfResp.csrfToken
-$headers['X-CSRF-Token'] = $csrfToken
-Write-Host "Refreshed session CSRF token: $csrfToken"
-
-# 4. Verify Identity /me
-$me = Invoke-RestMethod -Uri "$BaseUrl/api/v1/me" -Method Get -WebSession $session
-Write-Host "Current identity: $($me.loginName), Admin: $($me.admin), Tenant: $($me.tenantId)"
-if (-not $me.admin) {
-    throw "Expected admin privilege for account 'admin'"
-}
-
-# 5. Ensure Published Model Pricing
-Log-Step "Ensuring Model Pricing Configuration"
-$headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-$modelConfigBody = @{
-    kind = "MODEL"
-    name = "deepseek-pricing"
-    payload = @{
-        currency = "CNY"
-        inputPricePerMillion = 1
-        outputPricePerMillion = 2
-    }
-} | ConvertTo-Json -Depth 5
-
-try {
-    $cfgResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/configs" -Method Post -Body $modelConfigBody -ContentType 'application/json' -Headers $headers -WebSession $session
-    $cfgId = $cfgResp.id
-    $headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-    $pubResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/configs/$cfgId/publish" -Method Post -Headers $headers -WebSession $session
-    Write-Host "Published model pricing config ID: $cfgId (Status: $($pubResp.status))" -ForegroundColor Green
-} catch {
-    Write-Host "Model pricing config ready in tenant." -ForegroundColor Cyan
-}
-
-# 6. Create Knowledge Base
-Log-Step "Creating Knowledge Base"
-$headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-$kbBody = @{
-    name = "E2E-自动化运维知识库"
-    readers = @(
-        @{ type = "ALL" }
+function Assert-Http {
+    param(
+        [object]$Response,
+        [int]$Status,
+        [AllowNull()][string]$Code,
+        [string]$Context
     )
-} | ConvertTo-Json
+    Assert-True ($null -ne $Response) "$Context returned no response"
+    Assert-True ([int]$Response.Status -eq $Status) "$Context expected HTTP $Status, got $($Response.Status)"
+    if ($null -ne $Code) {
+        Assert-True ($null -ne $Response.Body) "$Context returned no JSON error body"
+        Assert-True ([string]$Response.Body.code -eq $Code) "$Context expected code $Code, got $($Response.Body.code)"
+    }
+}
 
-$kbResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/knowledge-bases" -Method Post -Body $kbBody -ContentType 'application/json' -Headers $headers -WebSession $session
-$kbId = $kbResp.id
-Write-Host "Created Knowledge Base ID: $kbId (Name: $($kbResp.name))" -ForegroundColor Green
+if ($SelfTest) {
+    $ok = [pscustomobject]@{ Status = 409; Body = [pscustomobject]@{ code = 'EXPECTED' } }
+    Assert-Http $ok 409 'EXPECTED' 'valid error'
+    foreach ($bad in @(
+        [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ code = 'EXPECTED' } },
+        [pscustomobject]@{ Status = 500; Body = [pscustomobject]@{ code = 'EXPECTED' } },
+        [pscustomobject]@{ Status = 409; Body = [pscustomobject]@{ code = 'WRONG' } }
+    )) {
+        $rejected = $false
+        try { Assert-Http $bad 409 'EXPECTED' 'negative case' } catch { $rejected = $true }
+        Assert-True $rejected 'Assert-Http accepted an invalid response'
+    }
+    $rejected = $false
+    try { Assert-True $false 'search result did not contain the marker' } catch { $rejected = $true }
+    Assert-True $rejected 'search assertion accepted an empty result'
+    Write-Output 'Self-test passed: five false-positive paths were rejected.'
+    return
+}
 
-# 7. Upload Document & Ingestion Pipeline
-Log-Step "Uploading Markdown Document for Ingestion"
-$tempDoc = Join-Path $ragRoot '.runtime\e2e_sample_spec.md'
-$docContent = @"
-# 企业运维规范与系统架构
-## 核心端口规范
-Elasticsearch 运行在 9200 端口，MySQL 运行在 3307 端口，Docling 运行在 5001 端口。
-## 异步任务租约与防并发
-系统采用租约机制防止并发冲突，未完成的任务将会在租约过期后由备份工作节点重新认领。
-## 评估费用控制
-单批次评估执行的硬性费用上限为 10 元人民币，超过限制将强制中断并置为 BUDGET_EXCEEDED 状态。
-"@
-[System.IO.File]::WriteAllText($tempDoc, $docContent, [System.Text.UTF8Encoding]::new($false))
+function Invoke-Api {
+    param(
+        [ValidateSet('GET', 'POST', 'PUT', 'PATCH', 'DELETE')]
+        [string]$Method,
+        [string]$Path,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [hashtable]$Headers = @{},
+        [AllowNull()][object]$Body = $null,
+        [AllowNull()][hashtable]$Form = $null
+    )
+    $invokeArgs = @{
+        Uri = "$BaseUrl$Path"
+        Method = $Method
+        WebSession = $Session
+        Headers = $Headers
+        SkipHttpErrorCheck = $true
+        TimeoutSec = 30
+    }
+    if ($null -ne $Form) {
+        $invokeArgs.Form = $Form
+    } elseif ($null -ne $Body) {
+        $invokeArgs.Body = ($Body | ConvertTo-Json -Depth 30 -Compress)
+        $invokeArgs.ContentType = 'application/json'
+    }
+    $response = Invoke-WebRequest @invokeArgs
+    $parsed = $null
+    if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
+        try {
+            $parsed = $response.Content | ConvertFrom-Json -Depth 50
+        } catch {
+            throw "$Method $Path returned non-JSON content with HTTP $([int]$response.StatusCode)"
+        }
+    }
+    [pscustomobject]@{ Status = [int]$response.StatusCode; Body = $parsed }
+}
 
-$headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-$form = @{
-    file = Get-Item -LiteralPath $tempDoc
+function New-AuthenticatedSession {
+    param([string]$LoginName, [string]$Password)
+    $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+    $csrf = Invoke-Api 'GET' '/api/v1/auth/csrf' $session
+    Assert-Http $csrf 200 $null "CSRF for $LoginName"
+    $headers = @{ 'X-CSRF-Token' = [string]$csrf.Body.csrfToken }
+    $login = Invoke-Api 'POST' '/api/v1/auth/login' $session $headers @{
+        tenantCode = $Environment
+        loginName = $LoginName
+        password = $Password
+    }
+    Assert-Http $login 200 $null "login $LoginName"
+    Assert-True ([bool]$login.Body.authenticated) "login $LoginName was not authenticated"
+    $fresh = Invoke-Api 'GET' '/api/v1/auth/csrf' $session
+    Assert-Http $fresh 200 $null "authenticated CSRF for $LoginName"
+    [pscustomobject]@{
+        Session = $session
+        Headers = @{ 'X-CSRF-Token' = [string]$fresh.Body.csrfToken }
+    }
+}
+
+function Write-Headers {
+    param([object]$Authentication)
+    @{
+        'X-CSRF-Token' = [string]$Authentication.Headers['X-CSRF-Token']
+        'Idempotency-Key' = [guid]::NewGuid().ToString()
+    }
+}
+
+$ragRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$envPath = Join-Path $ragRoot ".runtime\$Environment.env"
+if (-not (Test-Path -LiteralPath $envPath)) { throw "Environment file not found: $envPath" }
+$seedPassword = ''
+foreach ($line in Get-Content -LiteralPath $envPath) {
+    if ($line -match '^RAG_SEED_PASSWORD=(.*)$') { $seedPassword = $Matches[1].Trim() }
+}
+Assert-True (-not [string]::IsNullOrWhiteSpace($seedPassword)) "RAG_SEED_PASSWORD is missing from $envPath"
+
+$probeSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+$probe = Invoke-Api 'GET' '/api/v1/auth/csrf' $probeSession
+Assert-Http $probe 200 $null 'backend readiness'
+
+$admin = New-AuthenticatedSession 'admin' $seedPassword
+$ops = New-AuthenticatedSession 'ops' $seedPassword
+$adminMe = Invoke-Api 'GET' '/api/v1/me' $admin.Session
+$opsMe = Invoke-Api 'GET' '/api/v1/me' $ops.Session
+Assert-Http $adminMe 200 $null 'admin identity'
+Assert-Http $opsMe 200 $null 'ops identity'
+Assert-True ([bool]$adminMe.Body.admin) 'seeded admin account is not an administrator'
+Assert-True (-not [bool]$opsMe.Body.admin) 'seeded ops account unexpectedly has administrator rights'
+
+$suffix = [guid]::NewGuid().ToString('N').Substring(0, 10)
+$kb = Invoke-Api 'POST' '/api/v1/admin/knowledge-bases' $admin.Session (Write-Headers $admin) @{
+    name = "verification-$suffix"
+    readers = @(@{ type = 'USER'; userId = [string]$adminMe.Body.userId })
+}
+Assert-Http $kb 200 $null 'create knowledge base'
+$kbId = [string]$kb.Body.id
+
+$runtimeDir = Join-Path $ragRoot '.runtime'
+$documentPath = Join-Path $runtimeDir "verification-$suffix.md"
+$marker = "KBVERIFY$suffix"
+$newline = [Environment]::NewLine
+$documentText = '# 验收资料' + $newline + $newline + "系统核验标记为 $marker，端口为 3307。" + $newline
+[IO.File]::WriteAllText($documentPath, $documentText, [Text.UTF8Encoding]::new($false))
+$buildConfig = @{
+    embedding = $false
+    summary = $false
+    questions = $false
+    vision = $false
+} | ConvertTo-Json -Compress
+$upload = Invoke-Api 'POST' '/api/v1/admin/documents' $admin.Session (Write-Headers $admin) $null @{
+    file = Get-Item -LiteralPath $documentPath
     kbId = $kbId
-    buildConfig = '{}'
+    buildConfig = $buildConfig
 }
+Assert-Http $upload 202 $null 'upload document'
+$documentId = [string]$upload.Body.documentId
+$jobId = [string]$upload.Body.jobId
 
-$uploadResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/documents" -Method Post -Form $form -Headers $headers -WebSession $session
-$jobId = $uploadResp.jobId
-$docId = $uploadResp.documentId
-Write-Host "Uploaded Document ID: $docId, Ingestion Job ID: $jobId" -ForegroundColor Green
-
-# Poll Ingestion Job
-Log-Step "Polling Ingestion Job until COMPLETED"
-$jobFinished = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 1
-    $jobStatus = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/jobs/$jobId" -Method Get -WebSession $session
-    Write-Host "Job status: $($jobStatus.status), stage: $($jobStatus.stage)"
-    if ($jobStatus.status -eq 'COMPLETED') {
-        $jobFinished = $true
-        break
-    }
-    if ($jobStatus.status -eq 'FAILED') {
-        throw "Ingestion Job failed: $($jobStatus | ConvertTo-Json)"
-    }
-}
-if (-not $jobFinished) {
-    throw "Ingestion Job timed out after 30 seconds"
-}
-Write-Host "Document ingestion & ES indexing completed successfully!" -ForegroundColor Green
-
-# 8. Search Verification
-Log-Step "Testing Search Service (BM25 Query)"
-$searchResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/search?query=MySQL运行在什么端口&kbIds=$kbId" -Method Get -WebSession $session
-$evidence = $searchResp.evidence
-Write-Host "Search returned $($evidence.Count) evidence items."
-$foundKeyword = $false
-foreach ($item in $evidence) {
-    Write-Host "Evidence [ID: $($item.evidenceId), MatchedChunk: $($item.matchedChunkId)]: $($item.text)"
-    if ($item.text -match '3307') {
-        $foundKeyword = $true
-    }
-}
-if ($foundKeyword) {
-    Write-Host "BM25 retrieval verified! Successfully matched indexed document chunks." -ForegroundColor Green
-} else {
-    Write-Host "Evidence retrieved successfully." -ForegroundColor Cyan
-}
-
-# 9. QA Conversation & Evidence Verification
-Log-Step "Creating Conversation and Submitting QA Request"
-$headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-$convBody = @{
-    title = "E2E端口规范咨询"
-    scope = @{
-        mode = "SELECTED"
-        kbIds = @($kbId)
-    }
-} | ConvertTo-Json
-
-$convResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/conversations" -Method Post -Body $convBody -ContentType 'application/json' -Headers $headers -WebSession $session
-$convId = $convResp.id
-$segId = $convResp.currentSegmentId
-Write-Host "Created Conversation ID: $convId, Segment ID: $segId" -ForegroundColor Green
-
-$headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-$qaBody = @{
-    question = "MySQL和Elasticsearch分别监听在哪个端口？"
-    segmentId = $segId
-    mode = "RAG"
-    strict = $false
-} | ConvertTo-Json
-
-$qaResp = Invoke-RestMethod -Uri "$BaseUrl/api/v1/conversations/$convId/runs" -Method Post -Body $qaBody -ContentType 'application/json' -Headers $headers -WebSession $session
-$qaRunId = $qaResp.runId
-Write-Host "Submitted QA Run ID: $qaRunId, polling for completion..." -ForegroundColor Green
-
-$qaFinished = $false
-for ($i = 0; $i -lt 30; $i++) {
+$job = $null
+for ($attempt = 0; $attempt -lt 30; $attempt++) {
     Start-Sleep -Seconds 2
-    $runStatus = Invoke-RestMethod -Uri "$BaseUrl/api/v1/runs/$qaRunId" -Method Get -WebSession $session
-    Write-Host "QA Run status: $($runStatus.status), stage: $($runStatus.stage)"
-    if ($runStatus.status -in @('COMPLETED', 'FAILED', 'VERIFICATION_FAILED', 'CANCELLED', 'BUDGET_EXCEEDED')) {
-        $qaFinished = $true
-        Write-Host "QA Finished with status: $($runStatus.status)" -ForegroundColor Cyan
-        if ($runStatus.answer) {
-            Write-Host "Generated Answer: $($runStatus.answer)" -ForegroundColor Green
-        }
-        if ($runStatus.evidence) {
-            Write-Host "Evidence count: $($runStatus.evidence.Count)" -ForegroundColor Green
-        }
-        if ($runStatus.terminalReason) {
-            Write-Host "Terminal Reason: $($runStatus.terminalReason)" -ForegroundColor Yellow
-        }
-        break
+    $jobResponse = Invoke-Api 'GET' "/api/v1/admin/jobs/$jobId" $admin.Session
+    Assert-Http $jobResponse 200 $null 'poll ingestion job'
+    $job = $jobResponse.Body
+    if ($job.status -eq 'COMPLETED') { break }
+    if ($job.status -in @('FAILED', 'CANCELLED', 'NEEDS_REVIEW')) {
+        throw "ingestion stopped with status $($job.status), code $($job.errorCode)"
     }
 }
+Assert-True ($null -ne $job -and $job.status -eq 'COMPLETED') 'ingestion did not complete within 60 seconds'
 
-# 10. Evaluation Isolation Guard (AC-06-08)
-Log-Step "Testing Evaluation Environment Isolation Guard (AC-06-08)"
-try {
-    $headers['Idempotency-Key'] = [System.Guid]::NewGuid().ToString()
-    $null = Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/eval/datasets" -Method Post -Body (@{ name = "非法测试集" } | ConvertTo-Json) -ContentType 'application/json' -Headers $headers -WebSession $session
-    throw "Security Failure: Expected EVALUATION_ENVIRONMENT_REQUIRED on demo environment"
-} catch {
-    Write-Host "AC-06-08 PASS: Evaluation correctly blocked on demo environment (EVALUATION_ENVIRONMENT_REQUIRED)." -ForegroundColor Green
+$encodedMarker = [uri]::EscapeDataString($marker)
+$adminSearch = Invoke-Api 'GET' "/api/v1/search?query=$encodedMarker&kbIds=$kbId" $admin.Session
+Assert-Http $adminSearch 200 $null 'admin BM25 search'
+$adminMatches = @($adminSearch.Body.evidence | Where-Object {
+    $_.documentId -eq $documentId -and $_.text -like "*$marker*"
+})
+Assert-True ($adminMatches.Count -gt 0) 'admin BM25 search did not return the uploaded marker'
+
+$opsSearchDenied = Invoke-Api 'GET' "/api/v1/search?query=$encodedMarker&kbIds=$kbId" $ops.Session
+Assert-Http $opsSearchDenied 200 $null 'ops search without grant'
+Assert-True (@($opsSearchDenied.Body.evidence).Count -eq 0) 'ops search returned a document without a grant'
+$opsDocumentDenied = Invoke-Api 'GET' "/api/v1/documents/$documentId" $ops.Session
+Assert-Http $opsDocumentDenied 404 'RESOURCE_NOT_FOUND' 'ops document without grant'
+
+$grant = Invoke-Api 'PUT' "/api/v1/admin/documents/$documentId/acl" $admin.Session (Write-Headers $admin) @{
+    expectedVersion = 0
+    mode = 'RESTRICT'
+    readers = @(@{ type = 'USER'; userId = [string]$opsMe.Body.userId })
+}
+Assert-Http $grant 200 $null 'grant ops document access'
+$opsDocumentGranted = Invoke-Api 'GET' "/api/v1/documents/$documentId" $ops.Session
+Assert-Http $opsDocumentGranted 200 $null 'ops document after grant'
+$opsSearchGranted = Invoke-Api 'GET' "/api/v1/search?query=$encodedMarker&kbIds=$kbId" $ops.Session
+Assert-Http $opsSearchGranted 200 $null 'ops search after grant'
+Assert-True (@($opsSearchGranted.Body.evidence | Where-Object { $_.documentId -eq $documentId }).Count -gt 0) 'ops could not retrieve the granted document'
+
+$revoke = Invoke-Api 'PUT' "/api/v1/admin/documents/$documentId/acl" $admin.Session (Write-Headers $admin) @{
+    expectedVersion = [long]$grant.Body.rowVersion
+    mode = 'RESTRICT'
+    readers = @(@{ type = 'USER'; userId = [string]$adminMe.Body.userId })
+}
+Assert-Http $revoke 200 $null 'revoke ops document access'
+$opsSearchRevoked = Invoke-Api 'GET' "/api/v1/search?query=$encodedMarker&kbIds=$kbId" $ops.Session
+Assert-Http $opsSearchRevoked 200 $null 'ops search after revoke'
+Assert-True (@($opsSearchRevoked.Body.evidence).Count -eq 0) 'ops search still returned the document after revocation'
+$opsDocumentRevoked = Invoke-Api 'GET' "/api/v1/documents/$documentId" $ops.Session
+Assert-Http $opsDocumentRevoked 404 'RESOURCE_NOT_FOUND' 'ops document after revoke'
+
+if ($Environment -eq 'demo') {
+    $isolation = Invoke-Api 'POST' '/api/v1/admin/eval/datasets' $admin.Session (Write-Headers $admin) @{
+        name = "must-be-rejected-$suffix"
+    }
+    Assert-Http $isolation 409 'EVALUATION_ENVIRONMENT_REQUIRED' 'evaluation isolation'
 }
 
-Write-Host "`n========================================================" -ForegroundColor Green
-Write-Host " ALL END-TO-END PIPELINE CHECKS PASSED SUCCESSFULLY! " -ForegroundColor Green
-Write-Host "========================================================`n" -ForegroundColor Green
+$reportDir = Join-Path $runtimeDir 'reports'
+if (-not (Test-Path -LiteralPath $reportDir)) { $null = New-Item -ItemType Directory -Path $reportDir }
+$reportPath = Join-Path $reportDir 'http-integration.json'
+$report = [ordered]@{
+    generatedAt = [DateTimeOffset]::UtcNow.ToString('O')
+    environment = $Environment
+    scope = 'No-model HTTP integration'
+    checks = @(
+        'admin and ops authentication'
+        'model-free markdown ingestion'
+        'BM25 positive retrieval'
+        'document read denial before grant'
+        'document ACL grant'
+        'document ACL revocation'
+        'evaluation isolation in demo'
+    )
+    modelCalls = 0
+    notTested = @(
+        'generated answers'
+        'real-model quality'
+        'Docling PDF or DOCX parsing'
+        'complete acceptance-criteria matrix'
+    )
+    documentId = $documentId
+    jobId = $jobId
+}
+$report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath -Encoding utf8
+Write-Output "No-model HTTP integration passed. Report: $reportPath"

@@ -8,10 +8,28 @@ $envPath=Join-Path $runtime "$Environment.env"
 if(Test-Path -LiteralPath $envPath){ Write-Output "Already initialized: $envPath"; return }
 function New-Secret { [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)).ToLowerInvariant() }
 $content=Get-Content -LiteralPath (Join-Path $ragRoot '.env.example') -Raw
-$values=@{RAG_ENVIRONMENT=$Environment;DB_PASSWORD=(New-Secret);MYSQL_ROOT_PASSWORD=(New-Secret);RAG_SEED_PASSWORD=(New-Secret);RAG_CSRF_SECRET=(New-Secret);DOCLING_API_KEY=(New-Secret);RAG_INDEX_PREFIX="rag_$Environment"}
+$offset=@{demo=0;evaluation=1;test=2}[$Environment]
+$dbPort=3307+$offset
+$esPort=9200+$offset
+$doclingPort=5001+$offset
+$values=@{
+ RAG_ENVIRONMENT=$Environment
+ COMPOSE_PROJECT_NAME="rag-$Environment"
+ DB_NAME="rag_$Environment"
+ DB_PORT=$dbPort
+ ES_PORT=$esPort
+ DOCLING_PORT=$doclingPort
+ DB_URL=('jdbc:mysql://localhost:{0}/rag_{1}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true' -f $dbPort,$Environment)
+ ELASTICSEARCH_URL="http://localhost:$esPort"
+ DOCLING_URL="http://localhost:$doclingPort"
+ DB_PASSWORD=(New-Secret)
+ MYSQL_ROOT_PASSWORD=(New-Secret)
+ RAG_SEED_PASSWORD=(New-Secret)
+ RAG_CSRF_SECRET=(New-Secret)
+ DOCLING_API_KEY=(New-Secret)
+ RAG_INDEX_PREFIX="rag_$Environment"
+}
 foreach($key in $values.Keys){ $content=[regex]::Replace($content,"(?m)^$key=.*$", "$key=$($values[$key])") }
-$content=$content.Replace('/rag_demo?',"/rag_$Environment?")
 [System.IO.File]::WriteAllText($envPath,$content,[System.Text.UTF8Encoding]::new($false))
 Write-Output "Created private configuration: $envPath"
-Write-Output 'Demo account password is RAG_SEED_PASSWORD in that file; no credentials were printed.'
-
+Write-Output 'Seed account password is RAG_SEED_PASSWORD in that file; no credentials were printed.'

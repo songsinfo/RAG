@@ -7,6 +7,12 @@
 backend/target/
 frontend/node_modules/
 frontend/dist/
+.idea/
+__pycache__/
+datasets/eval_accelerator_300.jsonl
+datasets/eval_mall_300.jsonl
+scripts/build_eval_accelerator_300.py
+scripts/build_eval_mall_300.py
+scripts/eval_gen/
 *.log
 *.pid
-
