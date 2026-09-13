@@ -12,6 +12,7 @@ import java.util.*;
 
 @Component
 public class DoclingClient {
+ private static final String RESERVED_FALLBACK="UNSTRUCTURED";
  private final HttpClient client=HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();private final String url,key;
  public DoclingClient(@Value("${rag.docling-url}")String url,@Value("${DOCLING_API_KEY:}")String key){this.url=url;this.key=key;}
  public String submit(byte[] file,String extension){String boundary="rag"+Json.id();try{var out=new ByteArrayOutputStream();for(var e:Map.of("to_formats","json","image_export_mode","embedded","do_ocr","true","do_table_structure","true","include_images","true","do_picture_description","false","abort_on_error","false","document_timeout","180").entrySet()){out.write(("--"+boundary+"\r\nContent-Disposition: form-data; name=\""+e.getKey()+"\"\r\n\r\n"+e.getValue()+"\r\n").getBytes(StandardCharsets.UTF_8));}out.write(("--"+boundary+"\r\nContent-Disposition: form-data; name=\"files\"; filename=\"document."+extension+"\"\r\nContent-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8));out.write(file);out.write(("\r\n--"+boundary+"--\r\n").getBytes(StandardCharsets.UTF_8));return request("/v1/convert/file/async","POST",out.toByteArray(),"multipart/form-data; boundary="+boundary).path("task_id").asText();}catch(IOException e){throw unavailable();}}
@@ -26,5 +27,5 @@ public class DoclingClient {
   else if(label.equals("section_header")||label.equals("title"))kind="HEADING";else if(label.equals("code"))kind="CODE";
   if(!text.isBlank()||kind.equals("IMAGE"))units.add(new StructuredParser.Unit(self,kind,text,location,machine,image));for(JsonNode child:node.path("children"))walk(doc,child,units,warnings,pdf,visited,depth+1);
  }
- private ApiException unavailable(){return new ApiException(503,"PARSER_UNAVAILABLE","解析服务不可用");}
+ private ApiException unavailable(){return new ApiException(503,"PARSER_UNAVAILABLE","Docling 解析服务不可用；已预留 "+RESERVED_FALLBACK+" 降级点但当前未配置");}
 }

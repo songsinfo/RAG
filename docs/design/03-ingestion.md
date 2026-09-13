@@ -16,7 +16,7 @@ Docling 异步文件转换入口是 POST /v1/convert/file/async；Java 保存 ex
 
 服务仅内网可达，启用认证，Java 不使用任意 URL 转换入口。Docling 默认本地执行引擎足够，Java 的 MySQL 任务记录才是持久业务真相；服务丢失任务时用同一输入重新提交。必须显式配置文件大小和页数，不能依赖未设限的默认值。[配置说明](https://github.com/docling-project/docling-serve/blob/main/docs/configuration.md)
 
-Unstructured 只是备选：若锁版 Docling 的特定格式契约测试失败，先记录失败样本，再通过新设计决策更换该解析路径。首版不双写两个解析器。
+Unstructured 只是备选：若锁版 Docling 的特定格式契约测试失败，先记录失败样本，再通过新设计决策更换该解析路径。代码把 `UNSTRUCTURED` 记录为 Docling 不可用时的预留降级点，但首版没有 Unstructured 客户端、不会自动调用，也不双写两个解析器；运行时继续返回明确的 `PARSER_UNAVAILABLE`。
 
 ## 2. 输入保护与初始配额
 

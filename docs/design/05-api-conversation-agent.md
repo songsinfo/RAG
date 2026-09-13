@@ -65,6 +65,10 @@ GET /auth/csrf 获取签名双提交 CSRF token：登录前绑定短期 nonce Co
 
 ## 3. 问答请求与返回
 
+提交前执行高置信度输入安全检查：拦截私钥/凭据、手机号/身份证号和以命令形式出现的系统提示词绕过请求，且在写入 `qa_run` 前结束。规则只覆盖高置信度模式，不能替代公司 DLP。问题路由采用保守规则：完整问候进入 `SMALL_TALK`，明确的通用助手请求进入 `UNSUPPORTED`，其余全部进入 `KNOWLEDGE_QA`。FAQ 仍作为知识内容参与检索；路由器不能授予权限或判断某篇受限文档是否存在。
+
+生成后检查最终展示文本中的高置信度凭据和个人敏感信息；命中时不提交答案正文，运行以 `SENSITIVE_OUTPUT_BLOCKED` 失败。检索证据仍由 ACL 决定，安全检查不能代替文档授权。
+
 提交示例（结构契约，ID 使用占位符）：
 
 ```json
@@ -91,11 +95,11 @@ GET 任务资源 HTTP 200 只表示成功读取状态，不能据此把 status=F
 
 | HTTP | code 示例 | 客户端行为 |
 |---|---|---|
-| 400 | INVALID_INPUT、INVALID_CONFIG | 修正字段，不自动重试 |
+| 400 | INVALID_INPUT、INVALID_CONFIG、PROMPT_INJECTION_BLOCKED、SECRET_INPUT_BLOCKED、PII_INPUT_BLOCKED | 修正字段，不自动重试 |
 | 401 / 403 | AUTH_REQUIRED / OPERATION_FORBIDDEN | 重新登录/显示无资格 |
 | 404 | RESOURCE_NOT_FOUND | 不区分受限与不存在 |
 | 409 | ACTIVE_RUN_EXISTS、VERSION_CONFLICT、IDEMPOTENCY_CONFLICT、INDEX_CAPABILITY_MISSING | 查看原任务或调整版本/配置 |
-| 413 / 422 | INPUT_TOO_LARGE / PARSE_UNSUPPORTED、QUALITY_REVIEW_REQUIRED | 拆分或人工处理 |
+| 413 / 422 | INPUT_TOO_LARGE / PARSE_UNSUPPORTED、QUALITY_REVIEW_REQUIRED、SENSITIVE_OUTPUT_BLOCKED | 拆分或人工处理；敏感输出不展示正文 |
 | 429 | RATE_LIMITED、BUDGET_RESERVATION_DENIED | 显示限额及可安全公开的重试时间 |
 | 503 | AUTHORITY_UNAVAILABLE、DEPENDENCY_UNAVAILABLE | 不自动放宽权限；按有限策略重试 |
 
