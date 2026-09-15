@@ -73,6 +73,8 @@ from app.identity.router import router as auth_router
 from app.knowledge.router import router as knowledge_router
 from app.retrieval.router import router as retrieval_router
 from app.qa.router import router as qa_router
+from app.admin.config_router import router as config_router
+from app.evaluation.router import router as eval_router
 from app.identity.security import verify_csrf_token
 
 # Include routers
@@ -80,6 +82,8 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")
 app.include_router(retrieval_router, prefix="/api/v1")
 app.include_router(qa_router, prefix="/api/v1")
+app.include_router(config_router, prefix="/api/v1")
+app.include_router(eval_router, prefix="/api/v1")
 
 
 @app.get("/api/v1/me")

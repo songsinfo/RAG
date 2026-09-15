@@ -446,3 +446,131 @@ deletion_record_table = Table(
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
+
+eval_dataset_version_table = Table(
+    "eval_dataset_version",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("status", String(16), nullable=False, default="DRAFT", server_default="DRAFT"),
+    Column("manifest_hash", LargeBinary(32), nullable=True),
+    Column("frozen_at", DateTime(6), nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_case_table = Table(
+    "eval_case",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("dataset_version_id", String(36), nullable=False),
+    Column("case_key", String(128), nullable=False),
+    Column("split", String(8), nullable=False),
+    Column("group_key", String(128), nullable=False),
+    Column("category", String(32), nullable=False),
+    Column("question_json", JSON, nullable=False),
+    Column("persona_json", JSON, nullable=False),
+    Column("expected_json", JSON, nullable=False),
+    Column("annotation_status", String(16), nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_gold_table = Table(
+    "eval_gold",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("case_id", String(36), nullable=False),
+    Column("fact_group", String(128), nullable=False),
+    Column("alternative_no", Integer, nullable=False),
+    Column("origin_system", String(128), nullable=False),
+    Column("origin_tenant_id", String(36), nullable=False),
+    Column("origin_document_id", String(36), nullable=False),
+    Column("version_hash", LargeBinary(32), nullable=False),
+    Column("anchor_json", JSON, nullable=False),
+    Column("relevance_grade", Integer, nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_snapshot_table = Table(
+    "eval_snapshot",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("manifest_hash", LargeBinary(32), nullable=False),
+    Column("manifest_json", JSON, nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("environment_id", String(128), nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_snapshot_document_table = Table(
+    "eval_snapshot_document",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("snapshot_id", String(36), nullable=False),
+    Column("document_id", String(36), nullable=False),
+    Column("version_id", String(36), nullable=False),
+    Column("origin_system", String(128), nullable=False),
+    Column("origin_tenant_id", String(36), nullable=False),
+    Column("origin_document_id", String(36), nullable=False),
+    Column("origin_version_hash", LargeBinary(32), nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_run_table = Table(
+    "eval_run",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("dataset_version_id", String(36), nullable=False),
+    Column("snapshot_id", String(36), nullable=False),
+    Column("config_id", String(36), nullable=False),
+    Column("job_id", String(36), nullable=False),
+    Column("status", String(24), nullable=False),
+    Column("manifest_json", JSON, nullable=False),
+    Column("metrics_json", JSON, nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_result_table = Table(
+    "eval_result",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("eval_run_id", String(36), nullable=False),
+    Column("dataset_version_id", String(36), nullable=False),
+    Column("case_id", String(36), nullable=False),
+    Column("repeat_no", Integer, nullable=False, default=0, server_default="0"),
+    Column("qa_run_id", String(36), nullable=True),
+    Column("status", String(24), nullable=False),
+    Column("metrics_json", JSON, nullable=True),
+    Column("judge_json", JSON, nullable=True),
+    Column("error_code", String(64), nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+eval_review_table = Table(
+    "eval_review",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("result_id", String(36), nullable=False),
+    Column("reviewer_id", String(36), nullable=False),
+    Column("labels_json", JSON, nullable=False),
+    Column("reason_text", Text, nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
