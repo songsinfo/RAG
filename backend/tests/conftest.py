@@ -18,6 +18,9 @@ from app.main import app
 @pytest.fixture(autouse=True)
 def setup_test_db():
     # In-memory SQLite for fast, reproducible tests
+    from app.identity.security import _login_attempts
+    _login_attempts.clear()
+
     test_engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
