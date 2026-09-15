@@ -1,0 +1,398 @@
+{
+  "timestamp": "2026-09-15T03:51:38Z",
+  "backendType": "java-spring-boot-elasticsearch",
+  "environment": "demo",
+  "datasetSummary": {
+    "totalCases": 41,
+    "smokeQaCases": 30,
+    "exactRetrievalCases": 11
+  },
+  "configuration": {
+    "retrievalMode": "HYBRID",
+    "perRouteK": 50,
+    "rrfK": 60,
+    "embeddingDimensions": 1024,
+    "sparseIndexer": "Elasticsearch BM25",
+    "denseIndexer": "Elasticsearch kNN HNSW"
+  },
+  "metrics": {
+    "recallAt5": 0.9,
+    "recallAt10": 0.95,
+    "citationHitRate": 0.92,
+    "answerSuccessRate": 0.93,
+    "p50LatencyMs": 295.0,
+    "p90LatencyMs": 580.0,
+    "exactMatchRetrievalRate": 1.0
+  },
+  "cases": [
+    {
+      "caseKey": "fact-01",
+      "category": "FACT",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "fact-02",
+      "category": "FACT",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "fact-03",
+      "category": "FACT",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "fact-04",
+      "category": "FACT",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "fact-05",
+      "category": "FACT",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "fact-06",
+      "category": "FACT",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "para-01",
+      "category": "PARAPHRASE",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "para-02",
+      "category": "PARAPHRASE",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "para-03",
+      "category": "PARAPHRASE",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "para-04",
+      "category": "PARAPHRASE",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "cond-01",
+      "category": "CONDITIONAL",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "cond-02",
+      "category": "CONDITIONAL",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "cond-03",
+      "category": "CONDITIONAL",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "cond-04",
+      "category": "CONDITIONAL",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "multi-01",
+      "category": "MULTI_HOP",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "multi-02",
+      "category": "MULTI_HOP",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "multi-03",
+      "category": "MULTI_HOP",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "follow-01",
+      "category": "FOLLOW_UP",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "follow-02",
+      "category": "FOLLOW_UP",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "follow-03",
+      "category": "FOLLOW_UP",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "unans-01",
+      "category": "UNANSWERABLE",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "unans-02",
+      "category": "UNANSWERABLE",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "unans-03",
+      "category": "UNANSWERABLE",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "conf-01",
+      "category": "CONFLICT",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "conf-02",
+      "category": "CONFLICT",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "sec-01",
+      "category": "SECURITY",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "sec-02",
+      "category": "SECURITY",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "sec-03",
+      "category": "SECURITY",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "struct-01",
+      "category": "STRUCTURED",
+      "split": "DEV",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "struct-02",
+      "category": "STRUCTURED",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 320
+    },
+    {
+      "caseKey": "exact-zh-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-code-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-code-02",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-path-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-path-02",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-snake-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-snake-02",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-camel-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-camel-02",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-class-01",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    },
+    {
+      "caseKey": "exact-class-02",
+      "category": "EXACT_MATCH",
+      "split": "TEST",
+      "recalled": true,
+      "citationHit": true,
+      "success": true,
+      "latencyMs": 110
+    }
+  ]
+}
