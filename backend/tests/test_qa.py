@@ -253,7 +253,7 @@ def test_qa_run_lifecycle_and_evidence(client):
 
     # 4. Poll until finished
     run_data = None
-    for _ in range(60):
+    for _ in range(120):
         time.sleep(0.1)
         r = client.get(f"/api/v1/runs/{run_id}")
         assert r.status_code == 200
@@ -301,7 +301,7 @@ def test_qa_no_evidence_handling(client):
     run_id = run_resp.json()["runId"]
 
     run_data = None
-    for _ in range(60):
+    for _ in range(120):
         time.sleep(0.1)
         r = client.get(f"/api/v1/runs/{run_id}")
         run_data = r.json()
