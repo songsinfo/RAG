@@ -66,11 +66,13 @@ async def csrf_middleware(request: Request, call_next):
 
 from app.identity.router import router as auth_router
 from app.knowledge.router import router as knowledge_router
+from app.retrieval.router import router as retrieval_router
 from app.identity.security import verify_csrf_token
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")
+app.include_router(retrieval_router, prefix="/api/v1")
 
 
 @app.get("/api/v1/me")
