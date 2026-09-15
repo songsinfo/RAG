@@ -1,8 +1,6 @@
 # 企业内部知识库项目
 
-当前阶段：F0-F4 主体代码已完成，F5 工程验收进行中。已验证后端 73 个自动化测试、前端 4 个 API 契约测试与生产构建、81 项验收标准的静态追踪；evaluation 的 MySQL/Elasticsearch、Flyway 迁移、无模型入库/检索/ACL 和一题评估链路已真实通过，Docling 与真实模型消融仍待完成。证据与边界见[当前进度审计](docs/delivery/2026-09-13-progress-audit.md)。
-
-Java 主业务、Spring AI 模型客户端、Docling 独立解析服务，面向运营、产品和技术共用的内部知识库。前端简洁，重点是权限、文档生命周期、完整检索策略、可追溯回答、评估和运行恢复。
+Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（供应商 API 密钥由网关独立持有）、Docling 独立解析服务，面向运营、产品和技术共用的企业级内部知识库。前端简洁，重点是细粒度权限控制、文档全生命周期、混合检索策略、可追溯事实断言回答、自动化评测与故障恢复。旧 Java/Spring Boot/Elasticsearch 基线可通过 Git 历史标签或提交记录定位。
 
 ## 阅读顺序
 
@@ -29,7 +27,7 @@ Java 主业务、Spring AI 模型客户端、Docling 独立解析服务，面向
 
 ## 详细技术设计
 
-从[技术设计入口](docs/design/README.md)开始，依次阅读架构、数据库与权限、入库状态机、检索与证据、API/会话/Agent、评估和实施验收。附件含 MySQL DDL 和 Elasticsearch 映射；[验收追踪表](docs/design/08-traceability.md)逐条对应 81 项 PRD 验收。
+从[技术设计入口](docs/design/README.md)开始，依次阅读架构、数据库与权限、入库状态机、检索与证据、API/会话/Agent、评估和实施验收。附件含 MySQL DDL 和 Milvus 集合映射；[验收追踪表](docs/design/08-traceability.md)逐条对应 81 项 PRD 验收。
 
 下一步继续 F5：恢复 Docker 后运行无模型 HTTP 集成，随后在独立 evaluation 环境绑定题集来源，并按固定 B0-B3 配置完成真实模型消融评估。不要把 81 项静态追踪写成 81 项运行验收通过。
 
@@ -41,7 +39,7 @@ Java 主业务、Spring AI 模型客户端、Docling 独立解析服务，面向
 - docs/decisions：取舍与技术决策。
 - docs/learning/sources、concepts、practice：来源笔记、概念笔记、实际问题与验证。
 - docs/delivery：部署、验收、演示和真实项目成果。
-- backend、frontend：Java 后端和功能页面。
+- backend、frontend：Python FastAPI 后端和功能页面。
 - datasets、experiments：授权样本、题集、策略配置和脱敏报告。
 - deploy：部署与初始化资料。
 

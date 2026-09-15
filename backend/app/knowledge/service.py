@@ -44,6 +44,25 @@ _executor = ThreadPoolExecutor(max_workers=4)
 
 class KnowledgeService:
     @staticmethod
+    def recover_unfinished_jobs():
+        """Recovers any pending ingestion/purge jobs left over from process restart."""
+        try:
+            now = datetime.now(timezone.utc)
+            with get_db_connection() as conn:
+                conn.execute(
+                    update(job_table)
+                    .where(job_table.c.status.in_(["QUEUED", "RUNNING"]))
+                    .values(
+                        status="FAILED",
+                        error_code="PROCESS_RESTARTED",
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    @staticmethod
     def list_kbs(actor: Actor) -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             stmt = select(
