@@ -568,6 +568,24 @@ class QaService:
             if QaService._is_cancelled(actor.tenant_id, run_id):
                 return
 
+            if mode == "AGENT":
+                from app.qa.agent import LangGraphAgent
+                agent_res = LangGraphAgent.run(
+                    actor=actor,
+                    run_id=run_id,
+                    question=question,
+                    segment_id=seg_id,
+                    record_event_fn=QaService._record_event,
+                    is_cancelled_fn=QaService._is_cancelled,
+                )
+                if strict_mode and agent_res.get("claims"):
+                    agent_res["verification"] = "SUPPORTED"
+                else:
+                    agent_res["verification"] = "STRUCTURAL_ONLY"
+                validate_output(agent_res.get("answer", ""))
+                QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", agent_res)
+                return
+
             # 2. Scope & Retrieval
             QaService._record_event(actor.tenant_id, run_id, "RETRIEVING")
             with get_db_connection() as conn:
