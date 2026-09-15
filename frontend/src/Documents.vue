@@ -5,7 +5,7 @@ import { api, rows, keyOf, pretty, type Row } from './api'
 import JsonView from './JsonView.vue'
 defineProps<{ admin: boolean }>()
 const kbs = ref<Row[]>([]), docs = ref<Row[]>([]), kbId = ref(''), trash = ref(false), error = ref(''), busy = ref(false), detail = ref<any>(null), dialog = ref(false)
-const acl = ref(''), aclTarget = ref(''), aclOpen = ref(false), files = ref<File[]>([]), nextCursor = ref(''), searchQuery = ref(''), buildConfig = ref('{}')
+const acl = ref(''), aclTarget = ref(''), aclOpen = ref(false), files = ref<File[]>([]), nextCursor = ref(''), searchQuery = ref(''), buildConfig = ref('{"embedding": true}')
 async function act(fn: () => Promise<void>) { error.value = ''; busy.value = true; try { await fn() } catch (e) { error.value = String(e) } finally { busy.value = false } }
 async function load(append = false) { const path = trash.value ? '/admin/documents?status=TRASHED' : '/documents?kbId=' + encodeURIComponent(kbId.value); const result = await api(path + (append && nextCursor.value ? '&cursor=' + encodeURIComponent(nextCursor.value) : '')); docs.value = append ? [...docs.value, ...rows(result)] : rows(result); nextCursor.value = result.nextCursor || '' }
 onMounted(() => act(async () => { kbs.value = rows(await api('/knowledge-bases')); kbId.value = keyOf(kbs.value[0] || {}) || ''; await load() }))

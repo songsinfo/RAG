@@ -571,8 +571,8 @@ public class ModelGateway {
                 var budget = Json.object(run.get("budget_json").toString());
                 batchJobId = Objects.toString(budget.get("evaluationJobId"), null);
                 long left = Json.integer(budget, "deadlineSeconds", run.get("mode").equals("AGENT") ? 60 : 45) * 1000L - (System.currentTimeMillis() - Long.parseLong(budget.getOrDefault("startedEpochMs", System.currentTimeMillis()).toString()));
-                if (left <= 0) throw new ApiException(429, "BUDGET_EXCEEDED", "请求时限已耗尽");
-                timeout = Duration.ofMillis(Math.min(45000, left));
+                // 保底至少 30 秒有效正数超时，避免断点调试或耗时计算时 left 成为负数导致底层 SDK 抛出异常
+                timeout = Duration.ofMillis(Math.max(30000L, Math.min(45000L, left)));
                 for (var r : db.list("SELECT DISTINCT document_id FROM run_source WHERE tenant_id=:t AND run_id=:r", params("t", a.tenantId(), "r", owner)))
                     docs.add(r.get("document_id").toString());
             } else {

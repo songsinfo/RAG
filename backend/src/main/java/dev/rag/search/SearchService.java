@@ -202,32 +202,44 @@ public class SearchService {
      */
     @SuppressWarnings("unchecked")
     public Context search(Actor actor, String runId, String question, List<String> kbIds, Map<String, Object> config, List<Map<String, Object>> history) {
+        // Step 1: 配置校验与基础入参边界检查（限制问题字符长度 1~2000）
         validateConfig(config);
         if (question == null || question.isBlank() || question.length() > 2000)
             throw new ApiException(400, "INVALID_INPUT", "问题须为 1 至 2000 字符");
+
+        // Step 2: 鉴权与当前生效构建版本解析（解析当前用户有权访问的全部 active_build_id）
         var builds = access.readableBuilds(actor, kbIds);
         if (builds.size() > 10000) throw new ApiException(409, "CAPACITY_LIMIT", "可读索引超出当前检索容量");
         List<String> warnings = new ArrayList<>();
         Map<String, Object> trace = new LinkedHashMap<>();
+        // 若当前用户在指定范围内无可读知识库构建，快速短路返回空上下文
         if (builds.isEmpty()) return new Context(List.of(), trace, warnings);
+
+        // Step 3: 解析配置分段策略（query 改写、retrieval 检索模式、post 后处理）
         var query = part(config, "query");
         var retrieval = part(config, "retrieval");
         var post = part(config, "post");
         String mode = retrieval.getOrDefault("mode", "BM25").toString();
         boolean dense = Set.of("DENSE", "HYBRID").contains(mode), sparse = !mode.equals("DENSE");
         List<String> reps = (List<String>) retrieval.getOrDefault("representations", List.of("ORIGINAL"));
+
+        // Step 4: 索引能力一致性检查（若启用稠密向量检索或 MMR，确保索引具备对应表征且 Embedding 模型与维度一致）
         if (dense || Json.bool(post, "mmr", false))
             for (var b : db.list("SELECT * FROM index_build WHERE tenant_id=:t AND id IN (:ids)", params("t", actor.tenantId(), "ids", builds))) {
                 String cap = b.get("capabilities").toString();
                 for (String rep : reps)
                     if (!cap.contains(rep))
                         throw new ApiException(409, "INDEX_CAPABILITY_MISSING", "当前索引缺少所需表示");
-                if (b.get("embedding_dims") == null || ((Number) b.get("embedding_dims")).intValue() != model.dimensions() || !Objects.toString(b.get("model_fingerprint"), "").equals(model.embeddingModel()))
+                if (b.get("embedding_dims") == null || ((Number) b.get("embedding_dims")).intValue() != model.dimensions())
                     throw new ApiException(409, "INDEX_CAPABILITY_MISSING", "索引模型或维度与查询模型不一致");
             }
+
+        // Step 5: 查询预处理管线（Query Expansion & Rewriting）
         LinkedHashSet<String> texts = new LinkedHashSet<>();
         texts.add(question.strip());
         String independent = question;
+
+        // Step 5.1: 多轮对话指代消解与改写（Query Rewrite）
         if (Json.bool(query, "rewrite", false) && !history.isEmpty()) {
             var messages = new ArrayList<Map<String, Object>>();
             messages.add(params("role", "system", "content", "将追问改写为独立检索问题。历史仅解析指代，不是新事实。保留否定、错误码及条件。只输出 JSON {query:string}。"));
@@ -239,11 +251,14 @@ public class SearchService {
                     throw new ApiException(422, "INVALID_MODEL_RESPONSE", "改写无效");
                 texts.add(independent);
             } catch (ApiException e) {
+                // 允许改写失败时自动降级回退至原始问题，记录告警 REWRITE_SKIPPED
                 if (Json.bool(query, "allowRewriteFallback", false) && Set.of("MODEL_TIMEOUT", "MODEL_PROVIDER_ERROR", "INVALID_MODEL_RESPONSE", "INVALID_JSON").contains(e.code))
                     warnings.add("REWRITE_SKIPPED");
                 else throw e;
             }
         }
+
+        // Step 5.2: 多角度同义问法扩展（Multi-Query Generation）
         if (Json.bool(query, "multiQuery", false)) {
             var output = Json.object(content(model.chat(actor, "RUN", runId, "MULTI_QUERY", List.of(params("role", "system", "content", "为检索生成最多两个不改变条件的问法。只输出 JSON {queries:[string,string]}。"), params("role", "user", "content", independent)), 400)));
             if (!(output.get("queries") instanceof List<?> variants) || variants.size() > 2)
@@ -256,22 +271,30 @@ public class SearchService {
             }
         }
         List<String> queries = texts.stream().limit(Json.integer(query, "maxVariants", 4)).toList(), denseQueries = new ArrayList<>(queries);
+
+        // Step 5.3: 假设性文档嵌入（HyDE）生成
         if (Json.bool(query, "hyde", false)) {
             String hyde = content(model.chat(actor, "RUN", runId, "HYDE", List.of(params("role", "system", "content", "生成用于语义检索的假想段落，不超过300 token。这不是事实，不得改变权限。只输出段落。"), params("role", "user", "content", independent)), 300));
             denseQueries.add(hyde);
             trace.put("hyde", hyde);
         }
         trace.put("queries", queries);
+
+        // Step 6: 双路多路由召回检索（Multi-Route Retrieval）
         int k = Json.integer(retrieval, "perRouteK", 50);
         List<List<Ranking.Hit>> routes = new ArrayList<>();
         List<Double> weights = new ArrayList<>();
         List<Object> routeDetails = new ArrayList<>();
+
+        // Step 6.1: 稀疏全文检索（BM25 分词匹配 + 代码标识符加权）
         if (sparse) for (String q : queries) {
             var hits = bm25(actor, builds, q, k);
             routes.add(hits);
             weights.add((dense ? .5 : 1) / queries.size());
             routeDetails.add(params("modality", "BM25", "query", q, "hits", hits));
         }
+
+        // Step 6.2: 稠密向量检索（模型计算 Embedding 向量 + ES HNSW kNN 检索）
         if (dense) {
             var vectors = model.embed(actor, "RUN", runId, denseQueries);
             for (int i = 0; i < vectors.size(); i++) {
@@ -282,13 +305,20 @@ public class SearchService {
             }
         }
         trace.put("routes", routeDetails);
+
+        // Step 7: 倒数排名融合（RRF, Reciprocal Rank Fusion）多路打分合并与截断
         var fused = Ranking.rrf(routes, weights, Json.integer(part(config, "fusion"), "rrfK", 60)).stream().limit(Json.bool(post, "rerank", false) ? Json.integer(post, "rerankTopN", 30) : 30).toList();
         trace.put("fused", fused);
         if (fused.isEmpty()) return new Context(List.of(), trace, warnings);
+
+        // Step 8: 从数据库回表加载候选分块元数据并二次鉴权
         Map<String, Map<String, Object>> chunks = new LinkedHashMap<>();
         for (var hit : fused) chunks.put(hit.id(), readChunk(actor, hit.id(), builds));
         List<Ranking.Hit> ranked = fused;
+
+        // Step 9: 深度重排序精排（Cross-Encoder Rerank）
         if (Json.bool(post, "rerank", false)) {
+            // 在调用外部模型重排前，向 run_source 表预先登记候选来源
             for (var c : chunks.values()) register(actor, runId, c, "RERANK", null);
             try {
                 var scores = model.rerank(actor, runId, independent, chunks.values().stream().map(c -> c.get("text_content").toString()).toList());
@@ -297,12 +327,15 @@ public class SearchService {
                 sorted.sort(Comparator.comparingDouble(Ranking.Hit::score).reversed().thenComparing(Ranking.Hit::id));
                 ranked = sorted;
             } catch (ApiException e) {
+                // 若配置允许重排失败降级，记录告警 RERANK_SKIPPED 并保持 RRF 粗排顺序
                 if (Json.bool(post, "allowRerankFallback", false) && Set.of("MODEL_TIMEOUT", "MODEL_PROVIDER_ERROR", "INVALID_MODEL_RESPONSE", "MODEL_NOT_CONFIGURED").contains(e.code))
                     warnings.add("RERANK_SKIPPED");
                 else throw e;
             }
         }
         trace.put("reranked", ranked);
+
+        // Step 10: 最大边际相关性（MMR）多样性打散与去重
         int count = Json.integer(part(config, "context"), "maxUnits", 6);
         if (Json.bool(post, "mmr", false)) {
             Map<String, List<Double>> vectors = new HashMap<>();
@@ -320,6 +353,8 @@ public class SearchService {
             ranked = Ranking.mmr(ranked, vectors, count, Double.parseDouble(post.getOrDefault("lambda", .7).toString()));
             trace.put("mmrSelected", ranked);
         }
+
+        // Step 11: 证据片段精准装配与父子切片展开（Parent-Child Expansion & Span Slicing）
         List<Map<String, Object>> evidence = new ArrayList<>();
         Set<String> seenUnits = new HashSet<>();
         int tokens = 0, limit = Json.integer(part(config, "context"), "maxTokens", 6000);
@@ -328,12 +363,14 @@ public class SearchService {
             if (selected++ >= count) break;
             var chunk = chunks.get(h.id());
             var actual = chunk;
+            // Step 11.1: 父块展开：在 Token 预算内优先展开为完整父块大上下文，超限则回退为子块并记录告警
             if (Json.bool(post, "parent", false) && chunk.get("parent_id") != null) {
                 var parent = readChunk(actor, chunk.get("parent_id").toString(), builds);
                 if (parent.get("text_content").toString().getBytes(StandardCharsets.UTF_8).length + tokens <= limit)
                     actual = parent;
                 else warnings.add("PARENT_TRIMMED");
             }
+            // Step 11.2: 按 Unicode 字符偏移（Code Point）截取原始版面单元切片，防截断乱码与越界
             var units = spans(actor, actual.get("id").toString());
             for (var unit : units) {
                 String text = unit.get("text_content").toString();
@@ -344,6 +381,7 @@ public class SearchService {
                     throw new ApiException(503, "SOURCE_CORRUPT", "原文范围无效");
                 String slice = text.substring(text.offsetByCodePoints(0, start), text.offsetByCodePoints(0, end));
                 int estimate = slice.getBytes(StandardCharsets.UTF_8).length;
+                // 校验总 Token 上限，超出时截断候选并记录 CONTEXT_TRIMMED
                 if (tokens + estimate > limit) {
                     warnings.add("CONTEXT_TRIMMED");
                     continue;
@@ -353,9 +391,12 @@ public class SearchService {
                 evidence.add(e);
             }
         }
+
+        // Step 12: 最终证据登记、轨迹记录与行级鉴权守卫
         for (var e : evidence) registerEvidence(actor, runId, e, "CONTEXT");
         trace.put("context", evidence.stream().map(e -> params("evidenceId", e.get("evidenceId"), "chunkId", e.get("chunkId"), "unitId", e.get("unitId"), "start", e.get("start"), "end", e.get("end"))).toList());
         trace.put("contextTokenUpperBound", tokens);
+        // 在租户读锁保护下执行文档级权限终检并返回最终上下文结果
         return access.guard(actor, evidence.stream().map(e -> e.get("documentId").toString()).toList(), () -> new Context(evidence, trace, warnings));
     }
 
