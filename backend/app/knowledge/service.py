@@ -830,6 +830,88 @@ class KnowledgeService:
             }
 
     @staticmethod
+    def list_jobs(actor: Actor, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+        with get_db_connection() as conn:
+            stmt = select(
+                job_table.c.id,
+                job_table.c.kind,
+                job_table.c.target_id.label("targetId"),
+                job_table.c.status,
+                job_table.c.stage,
+                job_table.c.attempt,
+                job_table.c.error_code.label("errorCode"),
+                job_table.c.lease_epoch.label("leaseEpoch"),
+            ).where(job_table.c.tenant_id == actor.tenant_id)
+            if job_id:
+                stmt = stmt.where(job_table.c.id == job_id)
+            stmt = stmt.order_by(job_table.c.created_at.desc()).limit(100)
+            rows = conn.execute(stmt).fetchall()
+            return [
+                {
+                    "id": str(r.id),
+                    "kind": str(r.kind),
+                    "targetId": str(r.targetId) if r.targetId else None,
+                    "status": str(r.status),
+                    "stage": str(r.stage),
+                    "attempt": int(r.attempt),
+                    "errorCode": r.errorCode,
+                    "leaseEpoch": int(r.leaseEpoch) if r.leaseEpoch is not None else 0,
+                }
+                for r in rows
+            ]
+
+    @staticmethod
+    def control_job(actor: Actor, job_id: str, cancel: bool) -> List[Dict[str, Any]]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            job = conn.execute(
+                select(job_table).where(
+                    and_(
+                        job_table.c.tenant_id == actor.tenant_id,
+                        job_table.c.id == job_id,
+                    )
+                )
+            ).first()
+            if not job:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "任务不存在")
+            state = str(job.status)
+            if cancel:
+                if state not in ("COMPLETED", "FAILED", "CANCELLED"):
+                    conn.execute(
+                        update(job_table)
+                        .where(and_(job_table.c.tenant_id == actor.tenant_id, job_table.c.id == job_id))
+                        .values(
+                            status="CANCELLED",
+                            cancel_requested_at=now,
+                            lease_epoch=job_table.c.lease_epoch + 1,
+                            updated_at=now,
+                        )
+                    )
+                    conn.commit()
+            else:
+                if state not in ("FAILED", "CANCELLED"):
+                    raise ApiException(409, "INVALID_STATE", "任务当前不可重试")
+                conn.execute(
+                    update(job_table)
+                    .where(and_(job_table.c.tenant_id == actor.tenant_id, job_table.c.id == job_id))
+                    .values(
+                        status="QUEUED",
+                        cancel_requested_at=None,
+                        error_code=None,
+                        attempt=0,
+                        available_at=now,
+                        lease_epoch=job_table.c.lease_epoch + 1,
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+            return KnowledgeService.list_jobs(actor, job_id)
+
+    @staticmethod
     def get_preview(actor: Actor, doc_id: str, version_id: str) -> Dict[str, Any]:
         with get_db_connection() as conn:
             build = conn.execute(

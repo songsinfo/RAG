@@ -76,7 +76,7 @@ async def upload_document(
     file: UploadFile = File(...),
     kbId: str = Form(...),
     buildConfig: str = Form(default="{}"),
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
     content = await file.read()
@@ -90,7 +90,7 @@ async def upload_document(
         document_id=None,
         filename=file.filename or "uploaded.txt",
         file_bytes=content,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
         build_config=cfg,
     )
 
@@ -100,7 +100,7 @@ async def upload_document_version(
     doc_id: str,
     file: UploadFile = File(...),
     buildConfig: str = Form(default="{}"),
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
     doc = KnowledgeService.get_document(actor, doc_id)
@@ -115,15 +115,30 @@ async def upload_document_version(
         document_id=doc_id,
         filename=file.filename or "uploaded.txt",
         file_bytes=content,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
         build_config=cfg,
     )
 
 
 # Job polling endpoints
+@router.get("/admin/jobs")
+def list_jobs(actor: Actor = Depends(require_admin)):
+    return KnowledgeService.list_jobs(actor)
+
+
 @router.get("/admin/jobs/{job_id}")
 def get_job(job_id: str, actor: Actor = Depends(require_admin)):
     return KnowledgeService.get_job(actor, job_id)
+
+
+@router.post("/admin/jobs/{job_id}/retry")
+def retry_job(job_id: str, actor: Actor = Depends(require_admin)):
+    return KnowledgeService.control_job(actor, job_id, cancel=False)
+
+
+@router.post("/admin/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, actor: Actor = Depends(require_admin)):
+    return KnowledgeService.control_job(actor, job_id, cancel=True)
 
 
 # Preview endpoint

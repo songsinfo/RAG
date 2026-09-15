@@ -70,6 +70,7 @@ async def csrf_middleware(request: Request, call_next):
 
 
 from app.identity.router import router as auth_router
+from app.identity.admin_router import router as identity_admin_router
 from app.knowledge.router import router as knowledge_router
 from app.retrieval.router import router as retrieval_router
 from app.qa.router import router as qa_router
@@ -79,11 +80,22 @@ from app.identity.security import verify_csrf_token
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(identity_admin_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")
 app.include_router(retrieval_router, prefix="/api/v1")
 app.include_router(qa_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(eval_router, prefix="/api/v1")
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    import logging
+    logging.getLogger("uvicorn.error").error(f"Unhandled exception: {exc.__class__.__name__}")
+    return JSONResponse(
+        status_code=500,
+        content={"code": "INTERNAL_ERROR", "message": "服务器内部错误，请稍后重试"},
+    )
 
 
 @app.get("/api/v1/me")
@@ -99,10 +111,13 @@ def me(actor: Actor = Depends(get_current_actor)):
         if not user:
             raise ApiException(401, "AUTH_REQUIRED", "用户不存在")
 
-        epoch_stmt = select(tenant_table.c.security_epoch).where(
-            tenant_table.c.id == actor.tenant_id
-        )
-        epoch = conn.execute(epoch_stmt).scalar() or 0
+        tenant_row = conn.execute(
+            select(tenant_table.c.code, tenant_table.c.security_epoch).where(
+                tenant_table.c.id == actor.tenant_id
+            )
+        ).first()
+        epoch = int(tenant_row.security_epoch) if tenant_row else 0
+        tenant_code = str(tenant_row.code) if tenant_row else ""
 
         groups_stmt = (
             select(user_group_table.c.id, user_group_table.c.name)
@@ -125,10 +140,13 @@ def me(actor: Actor = Depends(get_current_actor)):
         groups = conn.execute(groups_stmt).fetchall()
 
         return {
+            "id": actor.user_id,
             "userId": actor.user_id,
             "tenantId": actor.tenant_id,
+            "tenantCode": tenant_code,
             "loginName": user.login_name,
             "admin": actor.admin,
+            "isAdmin": actor.admin,
             "securityEpoch": epoch,
             "groups": [{"id": str(g.id), "name": str(g.name)} for g in groups],
         }
