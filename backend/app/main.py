@@ -25,6 +25,11 @@ async def lifespan(app: FastAPI):
         QaService.recover_unfinished_runs()
     except Exception as e:
         print(f"Warning: Unfinished run recovery check: {e}")
+    try:
+        from app.knowledge.service import KnowledgeService
+        KnowledgeService.recover_unfinished_jobs()
+    except Exception as e:
+        print(f"Warning: Unfinished job recovery check: {e}")
     yield
 
 

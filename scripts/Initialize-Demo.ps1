@@ -10,17 +10,17 @@ function New-Secret { [Convert]::ToHexString([Security.Cryptography.RandomNumber
 $content=Get-Content -LiteralPath (Join-Path $ragRoot '.env.example') -Raw
 $offset=@{demo=0;evaluation=1;test=2}[$Environment]
 $dbPort=3307+$offset
-$esPort=9200+$offset
+$milvusPort=19530+$offset
 $doclingPort=5001+$offset
 $values=@{
  RAG_ENVIRONMENT=$Environment
  COMPOSE_PROJECT_NAME="rag-$Environment"
  DB_NAME="rag_$Environment"
  DB_PORT=$dbPort
- ES_PORT=$esPort
+ MILVUS_PORT=$milvusPort
  DOCLING_PORT=$doclingPort
  DB_URL=('jdbc:mysql://localhost:{0}/rag_{1}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true' -f $dbPort,$Environment)
- ELASTICSEARCH_URL="http://localhost:$esPort"
+ MILVUS_HOST="127.0.0.1"
  DOCLING_URL="http://localhost:$doclingPort"
  DB_PASSWORD=(New-Secret)
  MYSQL_ROOT_PASSWORD=(New-Secret)
