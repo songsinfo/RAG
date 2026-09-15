@@ -63,3 +63,131 @@ def require_admin(actor: Actor = Depends(get_current_actor)) -> Actor:
     if not actor.admin:
         raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
     return actor
+
+
+def principal_matches(grant_table, actor: Actor):
+    from sqlalchemy import or_, exists
+    from app.models import group_member_table
+
+    return or_(
+        grant_table.c.principal_type == "ALL",
+        grant_table.c.user_id == actor.user_id,
+        exists().where(
+            and_(
+                group_member_table.c.tenant_id == actor.tenant_id,
+                group_member_table.c.user_id == actor.user_id,
+                group_member_table.c.group_id == grant_table.c.group_id,
+            )
+        ),
+    )
+
+
+def can_read_document(conn, actor: Actor, doc_id: str) -> bool:
+    from sqlalchemy import or_, exists
+    from app.models import (
+        document_table,
+        knowledge_base_table,
+        kb_grant_table,
+        document_grant_table,
+    )
+
+    user_active = exists().where(
+        and_(
+            app_user_table.c.tenant_id == actor.tenant_id,
+            app_user_table.c.id == actor.user_id,
+            app_user_table.c.status == "ACTIVE",
+        )
+    )
+    kb_accessible = exists().where(
+        and_(
+            knowledge_base_table.c.tenant_id == actor.tenant_id,
+            knowledge_base_table.c.id == document_table.c.kb_id,
+            knowledge_base_table.c.status == "LIVE",
+            exists().where(
+                and_(
+                    kb_grant_table.c.tenant_id == actor.tenant_id,
+                    kb_grant_table.c.kb_id == knowledge_base_table.c.id,
+                    principal_matches(kb_grant_table, actor),
+                )
+            ),
+        )
+    )
+    doc_acl_ok = or_(
+        document_table.c.acl_mode == "INHERIT",
+        exists().where(
+            and_(
+                document_grant_table.c.tenant_id == actor.tenant_id,
+                document_grant_table.c.document_id == document_table.c.id,
+                principal_matches(document_grant_table, actor),
+            )
+        ),
+    )
+    stmt = select(document_table.c.id).where(
+        and_(
+            document_table.c.tenant_id == actor.tenant_id,
+            document_table.c.id == doc_id,
+            document_table.c.status == "LIVE",
+            user_active,
+            kb_accessible,
+            doc_acl_ok,
+        )
+    )
+    return conn.execute(stmt).first() is not None
+
+
+def get_readable_builds(conn, actor: Actor, kb_ids=None) -> list:
+    from sqlalchemy import or_, exists
+    from app.models import (
+        document_table,
+        knowledge_base_table,
+        kb_grant_table,
+        document_grant_table,
+    )
+
+    user_active = exists().where(
+        and_(
+            app_user_table.c.tenant_id == actor.tenant_id,
+            app_user_table.c.id == actor.user_id,
+            app_user_table.c.status == "ACTIVE",
+        )
+    )
+    kb_accessible = exists().where(
+        and_(
+            knowledge_base_table.c.tenant_id == actor.tenant_id,
+            knowledge_base_table.c.id == document_table.c.kb_id,
+            knowledge_base_table.c.status == "LIVE",
+            exists().where(
+                and_(
+                    kb_grant_table.c.tenant_id == actor.tenant_id,
+                    kb_grant_table.c.kb_id == knowledge_base_table.c.id,
+                    principal_matches(kb_grant_table, actor),
+                )
+            ),
+        )
+    )
+    doc_acl_ok = or_(
+        document_table.c.acl_mode == "INHERIT",
+        exists().where(
+            and_(
+                document_grant_table.c.tenant_id == actor.tenant_id,
+                document_grant_table.c.document_id == document_table.c.id,
+                principal_matches(document_grant_table, actor),
+            )
+        ),
+    )
+    stmt = select(document_table.c.active_build_id).where(
+        and_(
+            document_table.c.tenant_id == actor.tenant_id,
+            document_table.c.status == "LIVE",
+            document_table.c.active_build_id.isnot(None),
+            user_active,
+            kb_accessible,
+            doc_acl_ok,
+        )
+    )
+    if kb_ids:
+        stmt = stmt.where(document_table.c.kb_id.in_(kb_ids))
+
+    return [str(r.active_build_id) for r in conn.execute(stmt).fetchall()]
+
+

@@ -181,6 +181,8 @@ index_build_table = Table(
     Column("manifest_hash", LargeBinary(32), nullable=True),
     Column("fence", BigInteger, nullable=False, default=0, server_default="0"),
     Column("published_at", DateTime(6), nullable=True),
+    Column("quality_warnings", JSON, nullable=True),
+    Column("review_reason", String(2000), nullable=True),
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
@@ -410,6 +412,37 @@ feedback_table = Table(
     Column("comment_text", Text, nullable=True),
     Column("status", String(16), nullable=False, default="OPEN", server_default="OPEN"),
     Column("resolution_text", Text, nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+audit_event_table = Table(
+    "audit_event",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("actor_id", String(36), nullable=True),
+    Column("action", String(64), nullable=False),
+    Column("object_type", String(32), nullable=False),
+    Column("object_id", String(36), nullable=False),
+    Column("outcome", String(16), nullable=False, default="SUCCESS", server_default="SUCCESS"),
+    Column("metadata_json", JSON, nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+deletion_record_table = Table(
+    "deletion_record",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("document_id", String(36), nullable=False),
+    Column("origin_system", String(128), nullable=False, default="local", server_default="local"),
+    Column("requested_by", String(36), nullable=False),
+    Column("status", String(24), nullable=False, default="PENDING", server_default="PENDING"),
+    Column("domains_json", JSON, nullable=False),
+    Column("backup_expiry_at", DateTime(6), nullable=False),
+    Column("completed_at", DateTime(6), nullable=True),
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )

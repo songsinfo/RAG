@@ -99,3 +99,37 @@ def get_trace(
     actor: Actor = Depends(get_current_actor),
 ):
     return QaService.get_trace(actor, run_id)
+
+
+@router.put("/runs/{run_id}/feedback")
+def submit_feedback(
+    run_id: str,
+    body: Dict[str, Any],
+    actor: Actor = Depends(get_current_actor),
+):
+    return QaService.submit_feedback(actor, run_id, body)
+
+
+@router.get("/admin/feedback")
+def admin_feedback_list(
+    actor: Actor = Depends(get_current_actor),
+):
+    return QaService.admin_feedback_list(actor)
+
+
+@router.get("/admin/feedback/{feedback_id}")
+def admin_feedback_detail(
+    feedback_id: str,
+    actor: Actor = Depends(get_current_actor),
+):
+    return QaService.admin_feedback_detail(actor, feedback_id)
+
+
+@router.patch("/admin/feedback/{feedback_id}")
+def admin_feedback_update(
+    feedback_id: str,
+    body: Dict[str, Any],
+    actor: Actor = Depends(get_current_actor),
+):
+    return QaService.admin_feedback_update(actor, feedback_id, body)
+

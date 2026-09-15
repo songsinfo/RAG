@@ -8,8 +8,8 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import select, and_, or_, exists, update
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor
-from app.knowledge.artifacts import save_artifact
+from app.identity.deps import Actor, can_read_document
+from app.knowledge.artifacts import save_artifact, read_artifact, delete_artifact
 from app.knowledge.parser import parse_document
 from app.knowledge.chunker import chunk_units
 from app.models import (
@@ -24,10 +24,19 @@ from app.models import (
     source_unit_table,
     chunk_table,
     chunk_span_table,
+    representation_table,
     job_table,
     tenant_table,
     group_member_table,
+    qa_run_table,
+    conversation_table,
+    run_event_table,
+    run_source_table,
+    feedback_table,
+    audit_event_table,
+    deletion_record_table,
 )
+
 
 # Bounded in-process executor for ingestion jobs
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -178,9 +187,185 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
+            # Bump security_epoch
+            conn.execute(
+                update(tenant_table)
+                .where(tenant_table.c.id == actor.tenant_id)
+                .values(security_epoch=tenant_table.c.security_epoch + 1)
+            )
+
+            # Audit event
+            conn.execute(
+                audit_event_table.insert().values(
+                    tenant_id=actor.tenant_id,
+                    id=str(uuid.uuid4()),
+                    actor_id=actor.user_id,
+                    action="ACL_UPDATE",
+                    object_type="KB",
+                    object_id=kb_id,
+                    outcome="SUCCESS",
+                    metadata_json="{}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             conn.commit()
 
-        return {"rowVersion": new_version}
+        return {"id": kb_id, "rowVersion": new_version, "readers": readers}
+
+    @staticmethod
+    def get_document_acl(actor: Actor, doc_id: str) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+
+        with get_db_connection() as conn:
+            doc = conn.execute(
+                select(
+                    document_table.c.id,
+                    document_table.c.row_version,
+                    document_table.c.acl_mode,
+                ).where(
+                    and_(
+                        document_table.c.tenant_id == actor.tenant_id,
+                        document_table.c.id == doc_id,
+                    )
+                )
+            ).first()
+            if not doc:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
+
+            grants = conn.execute(
+                select(
+                    document_grant_table.c.principal_type,
+                    document_grant_table.c.user_id,
+                    document_grant_table.c.group_id,
+                ).where(
+                    and_(
+                        document_grant_table.c.tenant_id == actor.tenant_id,
+                        document_grant_table.c.document_id == doc_id,
+                    )
+                )
+            ).fetchall()
+
+            readers = [
+                {
+                    "type": str(g.principal_type),
+                    "userId": str(g.user_id) if g.user_id else None,
+                    "groupId": str(g.group_id) if g.group_id else None,
+                }
+                for g in grants
+            ]
+            return {
+                "id": str(doc.id),
+                "rowVersion": int(doc.row_version),
+                "mode": str(doc.acl_mode),
+                "readers": readers,
+            }
+
+    @staticmethod
+    def update_document_acl(
+        actor: Actor,
+        doc_id: str,
+        expected_version: int,
+        mode: str,
+        readers: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+
+        if mode not in ("INHERIT", "RESTRICT"):
+            raise ApiException(400, "INVALID_INPUT", "ACL模式无效")
+
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            doc = conn.execute(
+                select(document_table.c.row_version).where(
+                    and_(
+                        document_table.c.tenant_id == actor.tenant_id,
+                        document_table.c.id == doc_id,
+                    )
+                )
+            ).first()
+            if not doc:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
+
+            if int(doc.row_version) != expected_version:
+                raise ApiException(409, "CONCURRENT_CONFLICT", "文档版本冲突")
+
+            new_version = expected_version + 1
+            conn.execute(
+                update(document_table)
+                .where(
+                    and_(
+                        document_table.c.tenant_id == actor.tenant_id,
+                        document_table.c.id == doc_id,
+                        document_table.c.row_version == expected_version,
+                    )
+                )
+                .values(
+                    row_version=new_version,
+                    acl_mode=mode,
+                    updated_at=now,
+                )
+            )
+
+            # Re-create document grants
+            conn.execute(
+                document_grant_table.delete().where(
+                    and_(
+                        document_grant_table.c.tenant_id == actor.tenant_id,
+                        document_grant_table.c.document_id == doc_id,
+                    )
+                )
+            )
+            for r in readers:
+                ptype = (r.get("type") or "USER").upper()
+                if ptype not in ("USER", "GROUP"):
+                    raise ApiException(400, "INVALID_INPUT", "文档授权主体无效")
+                conn.execute(
+                    document_grant_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=str(uuid.uuid4()),
+                        document_id=doc_id,
+                        principal_type=ptype,
+                        user_id=r.get("userId"),
+                        group_id=r.get("groupId"),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            # Bump security_epoch
+            conn.execute(
+                update(tenant_table)
+                .where(tenant_table.c.id == actor.tenant_id)
+                .values(security_epoch=tenant_table.c.security_epoch + 1)
+            )
+
+            # Audit event
+            conn.execute(
+                audit_event_table.insert().values(
+                    tenant_id=actor.tenant_id,
+                    id=str(uuid.uuid4()),
+                    actor_id=actor.user_id,
+                    action="ACL_UPDATE",
+                    object_type="DOCUMENT",
+                    object_id=doc_id,
+                    outcome="SUCCESS",
+                    metadata_json="{}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
+
+        return {
+            "id": doc_id,
+            "rowVersion": new_version,
+            "mode": mode,
+            "readers": readers,
+        }
+
 
     @staticmethod
     def list_documents(actor: Actor, kb_id: Optional[str] = None, admin_mode: bool = False, status: str = "LIVE") -> List[Dict[str, Any]]:
@@ -201,42 +386,20 @@ class KnowledgeService:
             if kb_id:
                 stmt = stmt.where(document_table.c.kb_id == kb_id)
 
-            # Check ACL for non-admin: must have grant on doc or KB
-            if not actor.admin and not admin_mode:
-                stmt = stmt.where(
-                    or_(
-                        exists().where(
-                            and_(
-                                kb_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                kb_grant_table.c.kb_id == document_table.c.kb_id,
-                                or_(
-                                    kb_grant_table.c.principal_type == "ALL",
-                                    kb_grant_table.c.user_id == actor.user_id,
-                                ),
-                            )
-                        ),
-                        exists().where(
-                            and_(
-                                document_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                document_grant_table.c.document_id == document_table.c.id,
-                                document_grant_table.c.user_id == actor.user_id,
-                            )
-                        ),
-                    )
-                )
-
             rows = conn.execute(stmt).fetchall()
-            return [
-                {
+            result = []
+            for r in rows:
+                if not admin_mode and not can_read_document(conn, actor, str(r.id)):
+                    continue
+                result.append({
                     "id": str(r.id),
                     "kbId": str(r.kbId),
                     "title": r.title,
                     "status": str(r.status),
                     "rowVersion": int(r.rowVersion),
                     "activeBuildId": str(r.activeBuildId) if r.activeBuildId else None,
-                }
-                for r in rows
-            ]
+                })
+            return result
 
     @staticmethod
     def get_document(actor: Actor, doc_id: str) -> Dict[str, Any]:
@@ -261,32 +424,8 @@ class KnowledgeService:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
             # ACL check for non-admin
-            if not actor.admin:
-                can_read = conn.execute(
-                    select(
-                        or_(
-                            exists().where(
-                                and_(
-                                    kb_grant_table.c.tenant_id == actor.tenant_id,
-                                    kb_grant_table.c.kb_id == doc.kbId,
-                                    or_(
-                                        kb_grant_table.c.principal_type == "ALL",
-                                        kb_grant_table.c.user_id == actor.user_id,
-                                    ),
-                                )
-                            ),
-                            exists().where(
-                                and_(
-                                    document_grant_table.c.tenant_id == actor.tenant_id,
-                                    document_grant_table.c.document_id == doc.id,
-                                    document_grant_table.c.user_id == actor.user_id,
-                                )
-                            ),
-                        )
-                    )
-                ).scalar()
-                if not can_read:
-                    raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
+            if not actor.admin and not can_read_document(conn, actor, str(doc.id)):
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
             return {
                 "id": str(doc.id),
@@ -730,3 +869,521 @@ class KnowledgeService:
                 "chunks": [{"id": str(c.id), "kind": c.kind, "parentId": str(c.parentId) if c.parentId else None, "ordinal": c.ordinal, "text": c.text} for c in chunks],
                 "warnings": [],
             }
+
+    @staticmethod
+    def document_lifecycle(actor: Actor, doc_id: str, action: str, expected_version: int) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+        if action not in ("trash", "restore", "purge"):
+            raise ApiException(400, "INVALID_INPUT", f"未知操作: {action}")
+
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            doc = conn.execute(
+                select(document_table).where(
+                    and_(
+                        document_table.c.tenant_id == actor.tenant_id,
+                        document_table.c.id == doc_id,
+                    )
+                )
+            ).first()
+            if not doc:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
+
+            if int(doc.row_version) != expected_version:
+                raise ApiException(409, "CONCURRENT_CONFLICT", "文档版本冲突")
+
+            state = str(doc.status)
+            if action == "trash" and state != "LIVE":
+                raise ApiException(409, "INVALID_STATE", "文档状态不允许此操作")
+            if action == "restore" and state != "TRASHED":
+                raise ApiException(409, "INVALID_STATE", "文档状态不允许此操作")
+            if action == "purge" and state != "TRASHED":
+                raise ApiException(409, "INVALID_STATE", "文档状态不允许此操作")
+
+            new_fence = int(doc.lifecycle_epoch or 0) + 1
+            new_row_version = expected_version + 1
+
+            if action == "trash":
+                conn.execute(
+                    update(document_table)
+                    .where(
+                        and_(
+                            document_table.c.tenant_id == actor.tenant_id,
+                            document_table.c.id == doc_id,
+                            document_table.c.row_version == expected_version,
+                        )
+                    )
+                    .values(
+                        status="TRASHED",
+                        lifecycle_epoch=new_fence,
+                        row_version=new_row_version,
+                        deleted_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(tenant_table)
+                    .where(tenant_table.c.id == actor.tenant_id)
+                    .values(security_epoch=tenant_table.c.security_epoch + 1)
+                )
+                conn.execute(
+                    audit_event_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=str(uuid.uuid4()),
+                        actor_id=actor.user_id,
+                        action="DOCUMENT_TRASH",
+                        object_type="DOCUMENT",
+                        object_id=doc_id,
+                        outcome="SUCCESS",
+                        metadata_json="{}",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+                return {"documentId": doc_id, "status": "TRASHED"}
+
+            elif action == "restore":
+                if not doc.active_build_id:
+                    raise ApiException(409, "RESTORE_NOT_READY", "文档没有已发布构建")
+
+                # Verify artifacts
+                artifacts = conn.execute(
+                    select(artifact_table.c.storage_key).where(
+                        and_(
+                            artifact_table.c.tenant_id == actor.tenant_id,
+                            artifact_table.c.document_id == doc_id,
+                            artifact_table.c.status == "READY",
+                        )
+                    )
+                ).fetchall()
+                for art in artifacts:
+                    read_artifact(str(art.storage_key))
+
+                # Restore in Milvus if needed
+                build_id = str(doc.active_build_id)
+                child_chunks = conn.execute(
+                    select(
+                        chunk_table.c.id,
+                        chunk_table.c.text_content,
+                    ).where(
+                        and_(
+                            chunk_table.c.tenant_id == actor.tenant_id,
+                            chunk_table.c.build_id == build_id,
+                            chunk_table.c.kind == "CHILD",
+                        )
+                    )
+                ).fetchall()
+                if child_chunks:
+                    from app.retrieval.milvus_service import MilvusHybridService
+                    chunks_data = [{"id": str(c.id), "text_content": c.text_content} for c in child_chunks]
+                    b_row = conn.execute(
+                        select(index_build_table.c.version_id).where(
+                            and_(
+                                index_build_table.c.tenant_id == actor.tenant_id,
+                                index_build_table.c.id == build_id,
+                            )
+                        )
+                    ).first()
+                    version_id = str(b_row.version_id) if b_row else ""
+                    MilvusHybridService.upsert_chunks(
+                        tenant_id=actor.tenant_id,
+                        build_id=build_id,
+                        chunks=chunks_data,
+                        kb_id=str(doc.kb_id),
+                        doc_id=doc_id,
+                        version_id=version_id,
+                    )
+
+                conn.execute(
+                    update(document_table)
+                    .where(
+                        and_(
+                            document_table.c.tenant_id == actor.tenant_id,
+                            document_table.c.id == doc_id,
+                            document_table.c.status == "TRASHED",
+                        )
+                    )
+                    .values(
+                        status="LIVE",
+                        deleted_at=None,
+                        lifecycle_epoch=new_fence,
+                        row_version=new_row_version,
+                        updated_at=now,
+                    )
+                )
+
+                if not can_read_document(conn, actor, doc_id):
+                    raise ApiException(409, "RESTORE_ACL_INVALID", "恢复前请为维护者配置阅读授权")
+
+                job_id = str(uuid.uuid4())
+                conn.execute(
+                    job_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=job_id,
+                        kind="RESTORE",
+                        target_id=doc_id,
+                        requested_by=actor.user_id,
+                        idempotency_key=str(uuid.uuid4()),
+                        request_hash=hashlib.sha256(f"{doc_id}:{new_fence}".encode("utf-8")).digest(),
+                        status="COMPLETED",
+                        stage="INDEXING",
+                        attempt=0,
+                        fence=new_fence,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(tenant_table)
+                    .where(tenant_table.c.id == actor.tenant_id)
+                    .values(security_epoch=tenant_table.c.security_epoch + 1)
+                )
+                conn.execute(
+                    audit_event_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=str(uuid.uuid4()),
+                        actor_id=actor.user_id,
+                        action="DOCUMENT_RESTORE",
+                        object_type="DOCUMENT",
+                        object_id=doc_id,
+                        outcome="SUCCESS",
+                        metadata_json="{}",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+                return {"documentId": doc_id, "status": "LIVE", "jobId": job_id}
+
+            elif action == "purge":
+                conn.execute(
+                    update(document_table)
+                    .where(
+                        and_(
+                            document_table.c.tenant_id == actor.tenant_id,
+                            document_table.c.id == doc_id,
+                        )
+                    )
+                    .values(
+                        status="PURGE_PENDING",
+                        lifecycle_epoch=new_fence,
+                        row_version=new_row_version,
+                        updated_at=now,
+                    )
+                )
+                del_rec_id = str(uuid.uuid4())
+                conn.execute(
+                    deletion_record_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=del_rec_id,
+                        document_id=doc_id,
+                        origin_system="local",
+                        requested_by=actor.user_id,
+                        status="PENDING",
+                        domains_json={},
+                        backup_expiry_at=datetime.fromtimestamp(now.timestamp() + 7 * 86400, timezone.utc),
+                        completed_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                job_id = str(uuid.uuid4())
+                conn.execute(
+                    job_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=job_id,
+                        kind="PURGE",
+                        target_id=doc_id,
+                        requested_by=actor.user_id,
+                        idempotency_key=str(uuid.uuid4()),
+                        request_hash=hashlib.sha256(f"{doc_id}:{new_fence}".encode("utf-8")).digest(),
+                        status="RUNNING",
+                        stage="PURGE",
+                        attempt=0,
+                        fence=new_fence,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(tenant_table)
+                    .where(tenant_table.c.id == actor.tenant_id)
+                    .values(security_epoch=tenant_table.c.security_epoch + 1)
+                )
+                conn.execute(
+                    audit_event_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=str(uuid.uuid4()),
+                        actor_id=actor.user_id,
+                        action="DOCUMENT_PURGE",
+                        object_type="DOCUMENT",
+                        object_id=doc_id,
+                        outcome="SUCCESS",
+                        metadata_json="{}",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+
+                try:
+                    KnowledgeService._execute_purge(actor.tenant_id, doc_id, job_id, del_rec_id)
+                except Exception:
+                    with get_db_connection() as c:
+                        c.execute(
+                            update(job_table)
+                            .where(job_table.c.id == job_id)
+                            .values(status="FAILED", error_code="PURGE_FAILED", updated_at=datetime.now(timezone.utc))
+                        )
+                        c.execute(
+                            update(deletion_record_table)
+                            .where(deletion_record_table.c.id == del_rec_id)
+                            .values(status="FAILED", updated_at=datetime.now(timezone.utc))
+                        )
+                        c.commit()
+                    raise
+
+                return {"documentId": doc_id, "status": "PURGED", "jobId": job_id}
+
+    @staticmethod
+    def _execute_purge(tenant_id: str, doc_id: str, job_id: str, del_rec_id: str):
+        now = datetime.now(timezone.utc)
+        empty_hash = hashlib.sha256(b"").digest()
+
+        # 1. Delete from Milvus
+        from app.retrieval.milvus_service import MilvusHybridService
+        MilvusHybridService.delete_by_document(tenant_id, doc_id)
+
+        # 2. Delete private artifact files & scrub MySQL
+        with get_db_connection() as conn:
+            artifacts = conn.execute(
+                select(artifact_table.c.storage_key).where(
+                    and_(
+                        artifact_table.c.tenant_id == tenant_id,
+                        artifact_table.c.document_id == doc_id,
+                    )
+                )
+            ).fetchall()
+            for art in artifacts:
+                delete_artifact(str(art.storage_key))
+
+            # 3. Scrub MySQL content
+            affected_runs_stmt = (
+                select(
+                    qa_run_table.c.id,
+                    qa_run_table.c.conversation_id,
+                )
+                .select_from(
+                    qa_run_table.join(
+                        run_source_table,
+                        and_(
+                            run_source_table.c.tenant_id == qa_run_table.c.tenant_id,
+                            run_source_table.c.run_id == qa_run_table.c.id,
+                        ),
+                    )
+                )
+                .where(
+                    and_(
+                        run_source_table.c.tenant_id == tenant_id,
+                        run_source_table.c.document_id == doc_id,
+                    )
+                )
+            )
+            affected_runs = conn.execute(affected_runs_stmt).fetchall()
+            for ar in affected_runs:
+                run_id = str(ar.id)
+                conv_id = str(ar.conversation_id)
+                conn.execute(
+                    update(qa_run_table)
+                    .where(
+                        and_(
+                            qa_run_table.c.tenant_id == tenant_id,
+                            qa_run_table.c.id == run_id,
+                        )
+                    )
+                    .values(
+                        question=None,
+                        result_json=None,
+                        status="CANCELLED",
+                        terminal_reason="SOURCE_PURGED",
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(conversation_table)
+                    .where(
+                        and_(
+                            conversation_table.c.tenant_id == tenant_id,
+                            conversation_table.c.id == conv_id,
+                        )
+                    )
+                    .values(title=None, updated_at=now)
+                )
+                conn.execute(
+                    update(run_event_table)
+                    .where(
+                        and_(
+                            run_event_table.c.tenant_id == tenant_id,
+                            run_event_table.c.run_id == run_id,
+                        )
+                    )
+                    .values(payload=None, updated_at=now)
+                )
+                conn.execute(
+                    update(run_source_table)
+                    .where(
+                        and_(
+                            run_source_table.c.tenant_id == tenant_id,
+                            run_source_table.c.run_id == run_id,
+                        )
+                    )
+                    .values(span_json=None, updated_at=now)
+                )
+                conn.execute(
+                    update(feedback_table)
+                    .where(
+                        and_(
+                            feedback_table.c.tenant_id == tenant_id,
+                            feedback_table.c.run_id == run_id,
+                        )
+                    )
+                    .values(comment_text=None, resolution_text=None, updated_at=now)
+                )
+
+            # Scrub source_units
+            conn.execute(
+                update(source_unit_table)
+                .where(
+                    and_(
+                        source_unit_table.c.tenant_id == tenant_id,
+                        source_unit_table.c.document_id == doc_id,
+                    )
+                )
+                .values(text_content=None, location={}, updated_at=now)
+            )
+
+            # Scrub chunks, spans and representations
+            doc_builds_stmt = select(index_build_table.c.id).where(
+                and_(
+                    index_build_table.c.tenant_id == tenant_id,
+                    index_build_table.c.document_id == doc_id,
+                )
+            )
+            doc_builds = [str(b[0]) for b in conn.execute(doc_builds_stmt).fetchall()]
+            if doc_builds:
+                conn.execute(
+                    update(chunk_table)
+                    .where(
+                        and_(
+                            chunk_table.c.tenant_id == tenant_id,
+                            chunk_table.c.build_id.in_(doc_builds),
+                        )
+                    )
+                    .values(text_content="", content_hash=empty_hash, updated_at=now)
+                )
+                conn.execute(
+                    update(chunk_span_table)
+                    .where(
+                        and_(
+                            chunk_span_table.c.tenant_id == tenant_id,
+                            chunk_span_table.c.build_id.in_(doc_builds),
+                        )
+                    )
+                    .values(location=None, updated_at=now)
+                )
+                conn.execute(
+                    update(representation_table)
+                    .where(
+                        and_(
+                            representation_table.c.tenant_id == tenant_id,
+                            representation_table.c.build_id.in_(doc_builds),
+                        )
+                    )
+                    .values(
+                        text_content="",
+                        vector_bytes=None,
+                        dims=None,
+                        vector_hash=None,
+                        text_hash=empty_hash,
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(index_build_table)
+                    .where(
+                        and_(
+                            index_build_table.c.tenant_id == tenant_id,
+                            index_build_table.c.document_id == doc_id,
+                        )
+                    )
+                    .values(quality_warnings=None, review_reason=None, updated_at=now)
+                )
+
+            # Scrub artifacts & document_versions
+            conn.execute(
+                update(artifact_table)
+                .where(
+                    and_(
+                        artifact_table.c.tenant_id == tenant_id,
+                        artifact_table.c.document_id == doc_id,
+                    )
+                )
+                .values(status="PURGED", updated_at=now)
+            )
+            conn.execute(
+                update(document_version_table)
+                .where(
+                    and_(
+                        document_version_table.c.tenant_id == tenant_id,
+                        document_version_table.c.document_id == doc_id,
+                    )
+                )
+                .values(original_name=None, updated_at=now)
+            )
+
+            # Finalize document & deletion record
+            conn.execute(
+                update(document_table)
+                .where(
+                    and_(
+                        document_table.c.tenant_id == tenant_id,
+                        document_table.c.id == doc_id,
+                    )
+                )
+                .values(
+                    title=None,
+                    active_build_id=None,
+                    status="PURGED",
+                    row_version=document_table.c.row_version + 1,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                update(deletion_record_table)
+                .where(
+                    and_(
+                        deletion_record_table.c.tenant_id == tenant_id,
+                        deletion_record_table.c.id == del_rec_id,
+                    )
+                )
+                .values(
+                    status="COMPLETE",
+                    completed_at=now,
+                    domains_json={"local": "COMPLETE", "backup": "EXPIRES_7_DAYS"},
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                update(job_table)
+                .where(
+                    and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                    )
+                )
+                .values(status="COMPLETED", stage="FINISHED", updated_at=now)
+            )
+            conn.commit()
+

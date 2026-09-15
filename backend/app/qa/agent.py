@@ -333,40 +333,8 @@ class LangGraphAgent:
                 ).fetchall()
                 allowed_kbs = [str(r.kb_id) for r in kb_rows]
 
-            stmt = select(document_table.c.active_build_id).where(
-                and_(
-                    document_table.c.tenant_id == actor.tenant_id,
-                    document_table.c.status == "LIVE",
-                    document_table.c.active_build_id.isnot(None),
-                )
-            )
-            if allowed_kbs:
-                stmt = stmt.where(document_table.c.kb_id.in_(allowed_kbs))
-
-            if not actor.admin:
-                stmt = stmt.where(
-                    or_(
-                        exists().where(
-                            and_(
-                                kb_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                kb_grant_table.c.kb_id == document_table.c.kb_id,
-                                or_(
-                                    kb_grant_table.c.principal_type == "ALL",
-                                    kb_grant_table.c.user_id == actor.user_id,
-                                ),
-                            )
-                        ),
-                        exists().where(
-                            and_(
-                                document_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                document_grant_table.c.document_id == document_table.c.id,
-                                document_grant_table.c.user_id == actor.user_id,
-                            )
-                        ),
-                    )
-                )
-            rows = conn.execute(stmt).fetchall()
-            return [str(r.active_build_id) for r in rows]
+            from app.identity.deps import get_readable_builds
+            return get_readable_builds(conn, actor, allowed_kbs)
 
     @classmethod
     def _read_section(
@@ -379,45 +347,9 @@ class LangGraphAgent:
         ev_index: int,
     ) -> Dict[str, Any]:
         with get_db_connection() as conn:
-            # Check document live and permissions
-            doc = conn.execute(
-                select(document_table).where(
-                    and_(
-                        document_table.c.tenant_id == actor.tenant_id,
-                        document_table.c.id == doc_id,
-                        document_table.c.status == "LIVE",
-                    )
-                )
-            ).first()
-            if not doc:
-                raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
-
-            if not actor.admin:
-                has_perm = conn.execute(
-                    select(
-                        or_(
-                            exists().where(
-                                and_(
-                                    kb_grant_table.c.tenant_id == actor.tenant_id,
-                                    kb_grant_table.c.kb_id == doc.kb_id,
-                                    or_(
-                                        kb_grant_table.c.principal_type == "ALL",
-                                        kb_grant_table.c.user_id == actor.user_id,
-                                    ),
-                                )
-                            ),
-                            exists().where(
-                                and_(
-                                    document_grant_table.c.tenant_id == actor.tenant_id,
-                                    document_grant_table.c.document_id == doc_id,
-                                    document_grant_table.c.user_id == actor.user_id,
-                                )
-                            ),
-                        )
-                    )
-                ).scalar()
-                if not has_perm:
-                    raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此文档")
+            from app.identity.deps import can_read_document
+            if not can_read_document(conn, actor, doc_id):
+                raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此文档")
 
             unit = conn.execute(
                 select(source_unit_table).where(

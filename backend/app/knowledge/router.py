@@ -19,6 +19,17 @@ class UpdateKbAclRequest(BaseModel):
     readers: List[Dict[str, Any]] = []
 
 
+class UpdateDocAclRequest(BaseModel):
+    expectedVersion: int
+    mode: str = "RESTRICT"
+    readers: List[Dict[str, Any]] = []
+
+
+class LifecycleActionRequest(BaseModel):
+    expectedVersion: int
+
+
+
 # Knowledge Base endpoints
 @router.get("/knowledge-bases")
 def list_kbs(actor: Actor = Depends(get_current_actor)):
@@ -119,3 +130,21 @@ def get_job(job_id: str, actor: Actor = Depends(require_admin)):
 @router.get("/documents/{doc_id}/versions/{version_id}/preview")
 def get_preview(doc_id: str, version_id: str, actor: Actor = Depends(get_current_actor)):
     return KnowledgeService.get_preview(actor, doc_id, version_id)
+
+
+# Document ACL endpoints
+@router.get("/admin/documents/{doc_id}/acl")
+def get_document_acl(doc_id: str, actor: Actor = Depends(require_admin)):
+    return KnowledgeService.get_document_acl(actor, doc_id)
+
+
+@router.put("/admin/documents/{doc_id}/acl")
+def update_document_acl(doc_id: str, payload: UpdateDocAclRequest, actor: Actor = Depends(require_admin)):
+    return KnowledgeService.update_document_acl(actor, doc_id, payload.expectedVersion, payload.mode, payload.readers)
+
+
+# Document Lifecycle endpoints (trash, restore, purge)
+@router.post("/admin/documents/{doc_id}/{action}")
+def document_lifecycle(doc_id: str, action: str, payload: LifecycleActionRequest, actor: Actor = Depends(require_admin)):
+    return KnowledgeService.document_lifecycle(actor, doc_id, action, payload.expectedVersion)
+

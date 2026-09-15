@@ -7,6 +7,7 @@ from starlette.testclient import TestClient
 
 from app.models import (
     knowledge_base_table,
+    kb_grant_table,
     document_table,
     index_build_table,
     chunk_table,
@@ -51,12 +52,24 @@ def test_agent_single_tool_search_and_answer(client):
     with app_db.engine.begin() as conn:
         conn.execute(knowledge_base_table.insert().values(tenant_id=tenant_id, id=kb_id, name="Agent KB", status="LIVE", row_version=1, created_at=now, updated_at=now))
         conn.execute(
+            kb_grant_table.insert().values(
+                tenant_id=tenant_id,
+                id=str(uuid.uuid4()),
+                kb_id=kb_id,
+                principal_type="USER",
+                user_id="user-admin-1",
+                group_id=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        conn.execute(
             document_table.insert().values(
                 tenant_id=tenant_id,
                 id=doc_id,
                 kb_id=kb_id,
                 title="Agent Architecture",
-                acl_mode="RESTRICT",
+                acl_mode="INHERIT",
                 status="LIVE",
                 active_build_id=build_id,
                 lifecycle_epoch=0,
@@ -145,12 +158,24 @@ def test_agent_read_section_tool(client):
     with app_db.engine.begin() as conn:
         conn.execute(knowledge_base_table.insert().values(tenant_id=tenant_id, id=kb_id, name="Sec KB", status="LIVE", row_version=1, created_at=now, updated_at=now))
         conn.execute(
+            kb_grant_table.insert().values(
+                tenant_id=tenant_id,
+                id=str(uuid.uuid4()),
+                kb_id=kb_id,
+                principal_type="USER",
+                user_id="user-admin-1",
+                group_id=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        conn.execute(
             document_table.insert().values(
                 tenant_id=tenant_id,
                 id=doc_id,
                 kb_id=kb_id,
                 title="Detailed Section Spec",
-                acl_mode="RESTRICT",
+                acl_mode="INHERIT",
                 status="LIVE",
                 active_build_id=build_id,
                 lifecycle_epoch=0,

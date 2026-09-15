@@ -89,6 +89,31 @@ def test_hybrid_search_acl_and_rebuild(client):
                 updated_at=now,
             )
         )
+        # Grant admin access to KB 1 and KB 2
+        conn.execute(
+            kb_grant_table.insert().values(
+                tenant_id=tenant_id,
+                id=str(uuid.uuid4()),
+                kb_id=kb1_id,
+                principal_type="USER",
+                user_id="user-admin-1",
+                group_id=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        conn.execute(
+            kb_grant_table.insert().values(
+                tenant_id=tenant_id,
+                id=str(uuid.uuid4()),
+                kb_id=kb2_id,
+                principal_type="USER",
+                user_id="user-admin-1",
+                group_id=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
         # Doc 1 in KB 1 (accessible to viewer)
         doc1_id = "doc-1"
@@ -99,7 +124,7 @@ def test_hybrid_search_acl_and_rebuild(client):
                 id=doc1_id,
                 kb_id=kb1_id,
                 title="Public Doc in KB1",
-                acl_mode="RESTRICT",
+                acl_mode="INHERIT",
                 status="LIVE",
                 active_build_id=build1_id,
                 lifecycle_epoch=0,
@@ -149,7 +174,7 @@ def test_hybrid_search_acl_and_rebuild(client):
                 id=doc2_id,
                 kb_id=kb2_id,
                 title="Secret Doc in KB2",
-                acl_mode="RESTRICT",
+                acl_mode="INHERIT",
                 status="LIVE",
                 active_build_id=build2_id,
                 lifecycle_epoch=0,

@@ -45,3 +45,18 @@ def read_artifact(storage_key: str) -> bytes:
     if not target.exists():
         raise ApiException(404, "ARTIFACT_NOT_FOUND", "构件不存在")
     return target.read_bytes()
+
+
+def delete_artifact(storage_key: str):
+    root = get_artifact_root()
+    parts = storage_key.split("/")
+    if len(parts) != 3:
+        return
+    tenant_id, sha_hex, filename = parts
+    target = root / tenant_id / sha_hex[:2] / sha_hex / filename
+    if target.exists():
+        try:
+            target.unlink()
+        except OSError:
+            pass
+

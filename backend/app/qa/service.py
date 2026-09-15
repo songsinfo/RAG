@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import select, and_, or_, exists, update
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor
+from app.identity.deps import Actor, can_read_document
 from app.models import (
     conversation_table,
     context_segment_table,
@@ -18,6 +18,7 @@ from app.models import (
     run_source_table,
     run_event_table,
     model_call_table,
+    feedback_table,
     knowledge_base_table,
     document_table,
     kb_grant_table,
@@ -157,14 +158,35 @@ class QaService:
                 .limit(100)
             ).fetchall()
 
-            return [
-                {
-                    "id": str(r.id),
-                    "title": r.title,
+            result = []
+            for r in rows:
+                conv_id = str(r.id)
+                doc_stmt = (
+                    select(run_source_table.c.document_id.distinct())
+                    .select_from(
+                        run_source_table.join(
+                            qa_run_table,
+                            and_(
+                                qa_run_table.c.tenant_id == run_source_table.c.tenant_id,
+                                qa_run_table.c.id == run_source_table.c.run_id,
+                            ),
+                        )
+                    )
+                    .where(
+                        and_(
+                            run_source_table.c.tenant_id == actor.tenant_id,
+                            qa_run_table.c.conversation_id == conv_id,
+                        )
+                    )
+                )
+                doc_rows = conn.execute(doc_stmt).fetchall()
+                all_readable = all(can_read_document(conn, actor, str(d[0])) for d in doc_rows)
+                result.append({
+                    "id": conv_id,
+                    "title": r.title if all_readable else None,
                     "createdAt": r.created_at.isoformat() if r.created_at else None,
-                }
-                for r in rows
-            ]
+                })
+            return result
 
     @staticmethod
     def get_conversation_detail(actor: Actor, conv_id: str) -> Dict[str, Any]:
@@ -218,10 +240,11 @@ class QaService:
             ).fetchall()
 
         runs = [QaService.get_run(actor, str(r.id)) for r in run_rows]
+        any_hidden = any(r.get("visibility") == "HIDDEN" for r in runs)
 
         return {
             "id": conv_id,
-            "title": conv.title,
+            "title": None if any_hidden else conv.title,
             "currentSegmentId": str(latest_seg.id) if latest_seg else None,
             "currentSegment": {
                 "id": str(latest_seg.id) if latest_seg else None,
@@ -232,6 +255,7 @@ class QaService:
             },
             "runs": runs,
         }
+
 
     @staticmethod
     def delete_conversation(actor: Actor, conv_id: str):
@@ -853,6 +877,31 @@ class QaService:
             conn.commit()
 
     @staticmethod
+    @staticmethod
+    def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
+        stmt = (
+            select(run_source_table.c.document_id.distinct())
+            .select_from(
+                run_source_table.join(
+                    qa_run_table,
+                    and_(
+                        qa_run_table.c.tenant_id == run_source_table.c.tenant_id,
+                        qa_run_table.c.id == run_source_table.c.run_id,
+                    ),
+                )
+            )
+            .where(
+                and_(
+                    run_source_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.segment_id == segment_id,
+                    qa_run_table.c.turn_no <= turn_no,
+                )
+            )
+        )
+        rows = conn.execute(stmt).fetchall()
+        return [str(r[0]) for r in rows]
+
+    @staticmethod
     def get_run(actor: Actor, run_id: str) -> Dict[str, Any]:
         with get_db_connection() as conn:
             r = conn.execute(
@@ -870,78 +919,43 @@ class QaService:
             if not actor.admin and r.owner_id != actor.user_id:
                 raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此运行")
 
+            # Check ACL visibility of underlying sources in this segment up to this turn
+            sources = QaService._all_sources(conn, actor.tenant_id, r.segment_id, r.turn_no)
+            for did in sources:
+                if not can_read_document(conn, actor, did):
+                    return {
+                        "runId": str(r.id),
+                        "status": str(r.status),
+                        "visibility": "HIDDEN",
+                        "notice": "来源权限或状态已变化，回答不可显示。",
+                    }
+
             base = {
                 "runId": str(r.id),
                 "status": str(r.status),
                 "stage": str(r.stage),
                 "terminalReason": r.terminal_reason,
                 "question": r.question,
+                "visibility": "VISIBLE",
             }
-
-            # Check ACL visibility of underlying sources
-            sources = conn.execute(
-                select(run_source_table.c.document_id).where(
-                    and_(
-                        run_source_table.c.tenant_id == actor.tenant_id,
-                        run_source_table.c.run_id == run_id,
-                    )
-                )
-            ).fetchall()
-            doc_ids = list(set(str(s.document_id) for s in sources))
-
-            # Verify if user still can read all documents
-            for did in doc_ids:
-                doc_check = conn.execute(
-                    select(document_table.c.id).where(
-                        and_(
-                            document_table.c.tenant_id == actor.tenant_id,
-                            document_table.c.id == did,
-                            document_table.c.status == "LIVE",
-                        )
-                    )
-                ).first()
-                if not doc_check:
-                    base["visibility"] = "HIDDEN"
-                    base["notice"] = "来源权限或状态已变化，回答不可显示。"
-                    return base
-
-                if not actor.admin:
-                    has_perm = conn.execute(
-                        select(
-                            or_(
-                                exists().where(
-                                    and_(
-                                        kb_grant_table.c.tenant_id == actor.tenant_id,
-                                        kb_grant_table.c.kb_id == document_table.c.kb_id,
-                                        or_(
-                                            kb_grant_table.c.principal_type == "ALL",
-                                            kb_grant_table.c.user_id == actor.user_id,
-                                        ),
-                                    )
-                                ),
-                                exists().where(
-                                    and_(
-                                        document_grant_table.c.tenant_id == actor.tenant_id,
-                                        document_grant_table.c.document_id == did,
-                                        document_grant_table.c.user_id == actor.user_id,
-                                    )
-                                ),
-                            )
-                        ).where(
-                            and_(
-                                document_table.c.tenant_id == actor.tenant_id,
-                                document_table.c.id == did,
-                            )
-                        )
-                    ).scalar()
-                    if not has_perm:
-                        base["visibility"] = "HIDDEN"
-                        base["notice"] = "来源权限或状态已变化，回答不可显示。"
-                        return base
 
             if r.result_json:
                 base.update(r.result_json)
-            base["visibility"] = "VISIBLE"
+
+            # Mark old versions
+            if "evidence" in base and isinstance(base["evidence"], list):
+                for ev in base["evidence"]:
+                    doc_id = ev.get("documentId")
+                    if doc_id:
+                        d_row = conn.execute(
+                            select(document_table.c.active_build_id).where(
+                                and_(
+                                    document_table.c.tenant_id == actor.tenant_id,
+                                    document_table.c.id == doc_id,
+                                )
+                            )
+                        ).first()
+                        ev["isCurrent"] = (d_row is not None and d_row.active_build_id == ev.get("buildId"))
 
             # Usage summary
             calls = conn.execute(
@@ -1013,7 +1027,23 @@ class QaService:
 
     @staticmethod
     def get_evidence(actor: Actor, run_id: str, evidence_id: str) -> Dict[str, Any]:
+        with get_db_connection() as conn:
+            rs = conn.execute(
+                select(run_source_table).where(
+                    and_(
+                        run_source_table.c.tenant_id == actor.tenant_id,
+                        run_source_table.c.run_id == run_id,
+                        run_source_table.c.evidence_id == evidence_id,
+                    )
+                )
+            ).first()
+            if rs and not can_read_document(conn, actor, str(rs.document_id)):
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
+
         run_data = QaService.get_run(actor, run_id)
+        if run_data.get("visibility") == "HIDDEN":
+            raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
+
         evidence_list = run_data.get("evidence", [])
         for ev in evidence_list:
             if ev.get("evidenceId") == evidence_id:
@@ -1026,6 +1056,22 @@ class QaService:
             raise ApiException(403, "OPERATION_FORBIDDEN", "需要管理员权限")
 
         with get_db_connection() as conn:
+            r = conn.execute(
+                select(qa_run_table).where(
+                    and_(
+                        qa_run_table.c.tenant_id == actor.tenant_id,
+                        qa_run_table.c.id == run_id,
+                    )
+                )
+            ).first()
+            if not r:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
+
+            sources = QaService._all_sources(conn, actor.tenant_id, r.segment_id, r.turn_no)
+            for did in sources:
+                if not can_read_document(conn, actor, did):
+                    raise ApiException(404, "RESOURCE_NOT_FOUND", "运行来源权限已失效")
+
             events = conn.execute(
                 select(run_event_table).where(
                     and_(
@@ -1037,14 +1083,187 @@ class QaService:
 
             return {
                 "runId": run_id,
+                "configId": r.config_id,
+                "status": r.status,
                 "events": [
                     {
                         "sequenceNo": e.sequence_no,
                         "stage": e.stage,
                         "payload": e.payload,
                         "durationMs": e.duration_ms,
+                        "errorCode": e.error_code,
                         "createdAt": e.created_at.isoformat() if e.created_at else None,
                     }
                     for e in events
                 ],
             }
+
+    @staticmethod
+    def submit_feedback(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        run_data = QaService.get_run(actor, run_id)
+        if run_data.get("visibility") != "VISIBLE" or "answer" not in run_data:
+            raise ApiException(404, "RESOURCE_NOT_FOUND", "运行不存在或不可见")
+
+        rating = body.get("rating") or ""
+        issue_type = body.get("issueType") or ""
+        comment = body.get("comment") or ""
+
+        if rating not in ("USEFUL", "USELESS", ""):
+            raise ApiException(400, "INVALID_INPUT", "反馈参数无效")
+        if issue_type not in ("ANSWER_ERROR", "CITATION_ERROR", "OUTDATED", "MISSING", "PERMISSION", "OTHER", ""):
+            raise ApiException(400, "INVALID_INPUT", "反馈参数无效")
+        if len(comment) > 4000:
+            raise ApiException(400, "INVALID_INPUT", "反馈内容过长")
+
+        rating_val = rating if rating else None
+        issue_val = issue_type if issue_type else None
+        now = datetime.now(timezone.utc)
+
+        with get_db_connection() as conn:
+            existing = conn.execute(
+                select(feedback_table.c.id).where(
+                    and_(
+                        feedback_table.c.tenant_id == actor.tenant_id,
+                        feedback_table.c.run_id == run_id,
+                        feedback_table.c.submitted_by == actor.user_id,
+                    )
+                )
+            ).first()
+
+            if existing:
+                conn.execute(
+                    update(feedback_table)
+                    .where(
+                        and_(
+                            feedback_table.c.tenant_id == actor.tenant_id,
+                            feedback_table.c.id == existing.id,
+                        )
+                    )
+                    .values(
+                        rating=rating_val,
+                        issue_type=issue_val,
+                        comment_text=comment,
+                        status="OPEN",
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    feedback_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        submitted_by=actor.user_id,
+                        rating=rating_val,
+                        issue_type=issue_val,
+                        comment_text=comment,
+                        status="OPEN",
+                        resolution_text=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            conn.commit()
+
+        return {"status": "OPEN"}
+
+    @staticmethod
+    def admin_feedback_list(actor: Actor) -> List[Dict[str, Any]]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(feedback_table)
+                .where(feedback_table.c.tenant_id == actor.tenant_id)
+                .order_by(feedback_table.c.created_at.desc())
+                .limit(100)
+            ).fetchall()
+
+            result = []
+            for row in rows:
+                try:
+                    QaService.get_trace(actor, str(row.run_id))
+                    result.append({
+                        "id": str(row.id),
+                        "runId": str(row.run_id),
+                        "rating": row.rating,
+                        "issueType": row.issue_type,
+                        "comment": row.comment_text,
+                        "status": str(row.status),
+                        "resolution": row.resolution_text,
+                    })
+                except ApiException as e:
+                    if e.status_code == 404:
+                        result.append({
+                            "id": str(row.id),
+                            "status": str(row.status),
+                            "visibility": "HIDDEN",
+                        })
+                    else:
+                        raise
+            return result
+
+    @staticmethod
+    def admin_feedback_detail(actor: Actor, feedback_id: str) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(feedback_table).where(
+                    and_(
+                        feedback_table.c.tenant_id == actor.tenant_id,
+                        feedback_table.c.id == feedback_id,
+                    )
+                )
+            ).first()
+            if not row:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "反馈不存在")
+
+            QaService.get_trace(actor, str(row.run_id))
+            return {
+                "id": str(row.id),
+                "runId": str(row.run_id),
+                "rating": row.rating,
+                "issueType": row.issue_type,
+                "comment": row.comment_text,
+                "status": str(row.status),
+                "resolution": row.resolution_text,
+            }
+
+    @staticmethod
+    def admin_feedback_update(actor: Actor, feedback_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+
+        status_val = body.get("status") or ""
+        resolution_val = body.get("resolution") or ""
+
+        if status_val not in ("OPEN", "IN_PROGRESS", "RESOLVED"):
+            raise ApiException(400, "INVALID_INPUT", "处理参数无效")
+        if len(resolution_val) > 4000:
+            raise ApiException(400, "INVALID_INPUT", "处理参数无效")
+
+        QaService.admin_feedback_detail(actor, feedback_id)
+
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            conn.execute(
+                update(feedback_table)
+                .where(
+                    and_(
+                        feedback_table.c.tenant_id == actor.tenant_id,
+                        feedback_table.c.id == feedback_id,
+                    )
+                )
+                .values(
+                    status=status_val,
+                    resolution_text=resolution_val,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
+
+        return {"status": status_val}
+
