@@ -16,3 +16,9 @@ scripts/build_eval_mall_300.py
 scripts/eval_gen/
 *.log
 *.pid
+.venv/
+backend/.venv/
+*.pyc
+__pycache__/
+*.egg-info/
+.pytest_cache/
