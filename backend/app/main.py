@@ -14,12 +14,17 @@ from app.models import tenant_table, app_user_table, user_group_table, group_mem
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: ensure DB connection is reachable
+    # Startup: ensure DB connection is reachable and recover unfinished runs
     try:
         with get_db_connection() as conn:
             conn.execute(text("SELECT 1"))
     except Exception as e:
         print(f"Warning: Database startup check failed: {e}")
+    try:
+        from app.qa.service import QaService
+        QaService.recover_unfinished_runs()
+    except Exception as e:
+        print(f"Warning: Unfinished run recovery check: {e}")
     yield
 
 
@@ -67,12 +72,14 @@ async def csrf_middleware(request: Request, call_next):
 from app.identity.router import router as auth_router
 from app.knowledge.router import router as knowledge_router
 from app.retrieval.router import router as retrieval_router
+from app.qa.router import router as qa_router
 from app.identity.security import verify_csrf_token
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")
 app.include_router(retrieval_router, prefix="/api/v1")
+app.include_router(qa_router, prefix="/api/v1")
 
 
 @app.get("/api/v1/me")

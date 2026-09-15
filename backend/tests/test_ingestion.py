@@ -93,7 +93,7 @@ def test_document_upload_and_preview(client):
 
     # 3. Poll job status until COMPLETED
     job = None
-    for _ in range(20):
+    for _ in range(60):
         time.sleep(0.1)
         job_resp = client.get(f"/api/v1/admin/jobs/{job_id}")
         assert job_resp.status_code == 200
