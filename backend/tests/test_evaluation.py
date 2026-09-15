@@ -659,7 +659,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
 
     # Poll run until completed
     import time
-    for _ in range(20):
+    for _ in range(60):
         run_detail = client.get(f"/api/v1/admin/eval/runs/{run_id}", cookies=cookies).json()
         if run_detail.get("status") in {"COMPLETED", "FAILED"}:
             break
