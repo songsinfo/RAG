@@ -9,8 +9,6 @@ from app.config import settings
 from app.db import get_db_connection
 from app.errors import ApiException, api_exception_handler
 from app.identity.deps import Actor, get_current_actor
-from app.identity.router import router as auth_router
-from app.identity.security import verify_csrf_token
 from app.models import tenant_table, app_user_table, user_group_table, group_member_table
 
 
@@ -66,8 +64,13 @@ async def csrf_middleware(request: Request, call_next):
     return response
 
 
-# Include auth router
+from app.identity.router import router as auth_router
+from app.knowledge.router import router as knowledge_router
+from app.identity.security import verify_csrf_token
+
+# Include routers
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(knowledge_router, prefix="/api/v1")
 
 
 @app.get("/api/v1/me")
