@@ -618,7 +618,29 @@ class KnowledgeService:
                         )
                     )
 
-                # 3. Publish build as active
+                # 3. Index to Milvus
+                child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
+                if child_chunks:
+                    from app.retrieval.milvus_service import MilvusHybridService
+                    doc_row = conn.execute(
+                        select(document_table.c.kb_id).where(
+                            and_(
+                                document_table.c.tenant_id == tenant_id,
+                                document_table.c.id == doc_id,
+                            )
+                        )
+                    ).first()
+                    kb_id = str(doc_row.kb_id) if doc_row else ""
+                    MilvusHybridService.upsert_chunks(
+                        tenant_id=tenant_id,
+                        build_id=build_id,
+                        chunks=child_chunks,
+                        kb_id=kb_id,
+                        doc_id=doc_id,
+                        version_id=version_id,
+                    )
+
+                # 4. Publish build as active
                 conn.execute(
                     update(index_build_table)
                     .where(index_build_table.c.id == build_id)
