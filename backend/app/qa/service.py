@@ -33,6 +33,7 @@ from app.qa.content_guard import validate_input, validate_output
 from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
+from app.qa.execution import current_qa_execution, qa_execution_scope, qa_lease_is_current
 from app.retrieval.pipeline import RetrievalPipeline
 
 
@@ -51,6 +52,8 @@ class QaService:
                 )
             )
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(and_(
@@ -549,7 +552,12 @@ class QaService:
         }
 
     @staticmethod
-    def execute_queued_run(actor: Actor, run_id: str):
+    def execute_queued_run(
+        actor: Actor,
+        run_id: str,
+        job_id: Optional[str] = None,
+        lease_epoch: Optional[int] = None,
+    ):
         with get_db_connection() as conn:
             row = conn.execute(
                 select(qa_run_table).where(and_(
@@ -612,22 +620,25 @@ class QaService:
             strict_mode = bool(row.strict_mode)
             config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
 
-        QaService._execute_run(
-            actor,
-            run_id,
-            conv_id,
-            seg_id,
-            question,
-            mode,
-            strict_mode,
-            config_id,
-        )
+        with qa_execution_scope(job_id, lease_epoch):
+            QaService._execute_run(
+                actor,
+                run_id,
+                conv_id,
+                seg_id,
+                question,
+                mode,
+                strict_mode,
+                config_id,
+            )
 
     @staticmethod
     def _record_event(tenant_id: str, run_id: str, stage: str, payload: Optional[Dict[str, Any]] = None):
         try:
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, tenant_id, run_id):
+                    return
                 seq = conn.execute(
                     select(run_event_table.c.sequence_no)
                     .where(
@@ -1030,18 +1041,52 @@ class QaService:
             return r and (r.status == "CANCELLED" or r.cancel_requested_at is not None)
 
     @staticmethod
-    def _finalize_run(tenant_id: str, run_id: str, status: str, stage: str, terminal_reason: str, result_json: Dict[str, Any]):
+    def _finalize_run(
+        tenant_id: str,
+        run_id: str,
+        status: str,
+        stage: str,
+        terminal_reason: str,
+        result_json: Dict[str, Any],
+    ) -> bool:
         now = datetime.now(timezone.utc)
+        current = current_qa_execution()
         with get_db_connection() as conn:
+            if current is not None:
+                job_id, lease_epoch = current
+                fenced = conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                        job_table.c.status == "RUNNING",
+                        job_table.c.lease_epoch == lease_epoch,
+                    ))
+                    .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
+                )
+                if fenced.rowcount != 1:
+                    conn.rollback()
+                    return False
+            else:
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                        job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                    ))
+                    .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
+                )
             conn.execute(
                 update(qa_run_table)
-                .where(
-                    and_(
-                        qa_run_table.c.tenant_id == tenant_id,
-                        qa_run_table.c.id == run_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
-                    )
-                )
+                .where(and_(
+                    qa_run_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.id == run_id,
+                    qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                ))
                 .values(
                     status=status,
                     stage=stage,
@@ -1051,31 +1096,61 @@ class QaService:
                     updated_at=now,
                 )
             )
-            conn.execute(
-                update(job_table)
-                .where(and_(
-                    job_table.c.tenant_id == tenant_id,
-                    job_table.c.target_id == run_id,
-                    job_table.c.kind == "QA_RUN",
-                    job_table.c.status.in_(["QUEUED", "RUNNING"]),
-                ))
-                .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
-            )
             conn.commit()
+            return True
 
     @staticmethod
-    def _fail_run(tenant_id: str, run_id: str, error_code: str):
+    def _fail_run(tenant_id: str, run_id: str, error_code: str) -> bool:
         now = datetime.now(timezone.utc)
+        current = current_qa_execution()
         with get_db_connection() as conn:
-            conn.execute(
-                update(qa_run_table)
-                .where(
-                    and_(
-                        qa_run_table.c.tenant_id == tenant_id,
-                        qa_run_table.c.id == run_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+            if current is not None:
+                job_id, lease_epoch = current
+                fenced = conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                        job_table.c.status == "RUNNING",
+                        job_table.c.lease_epoch == lease_epoch,
+                    ))
+                    .values(
+                        status="FAILED",
+                        stage="FINISHED",
+                        lease_until=None,
+                        error_code=error_code,
+                        updated_at=now,
                     )
                 )
+                if fenced.rowcount != 1:
+                    conn.rollback()
+                    return False
+            else:
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                        job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                    ))
+                    .values(
+                        status="FAILED",
+                        stage="FINISHED",
+                        lease_until=None,
+                        error_code=error_code,
+                        updated_at=now,
+                    )
+                )
+            conn.execute(
+                update(qa_run_table)
+                .where(and_(
+                    qa_run_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.id == run_id,
+                    qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                ))
                 .values(
                     status="FAILED",
                     stage="FINISHED",
@@ -1084,19 +1159,9 @@ class QaService:
                     updated_at=now,
                 )
             )
-            conn.execute(
-                update(job_table)
-                .where(and_(
-                    job_table.c.tenant_id == tenant_id,
-                    job_table.c.target_id == run_id,
-                    job_table.c.kind == "QA_RUN",
-                    job_table.c.status.in_(["QUEUED", "RUNNING"]),
-                ))
-                .values(status="FAILED", stage="FINISHED", lease_until=None, error_code=error_code, updated_at=now)
-            )
             conn.commit()
+            return True
 
-    @staticmethod
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
         stmt = (

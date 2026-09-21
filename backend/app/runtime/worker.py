@@ -200,7 +200,12 @@ class DurableJobWorker:
             admin=bool(user.is_admin),
             security_epoch=0,
         )
-        QaService.execute_queued_run(actor, str(job["target_id"]))
+        QaService.execute_queued_run(
+            actor,
+            str(job["target_id"]),
+            job_id=str(job["id"]),
+            lease_epoch=int(job["lease_epoch"]),
+        )
 
     def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
         with get_db_connection() as conn:
