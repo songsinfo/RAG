@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["feat/enterprise-rag-retrieval"]
+    branches: ["feat/enterprise-rag-retrieval", "feat/langchain-v1-performance"]
   pull_request:
     branches: ["feat/python-migration"]
 
