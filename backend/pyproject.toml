@@ -16,6 +16,7 @@ dependencies = [
     "python-multipart>=0.0.19",
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
+    "boto3>=1.35.0",
     "pymilvus>=2.5.0",
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",

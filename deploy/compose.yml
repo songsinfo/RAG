@@ -27,6 +27,18 @@ services:
     ports:
       - "127.0.0.1:${DOCLING_PORT:-5001}:5001"
     mem_limit: 4g
+  artifact-minio:
+    image: quay.io/minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-ragadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+    volumes:
+      - artifact-minio-data:/data
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:${ARTIFACT_S3_PORT:-9001}:9000"
+      - "127.0.0.1:${ARTIFACT_S3_CONSOLE_PORT:-9002}:9001"
+
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     environment:
@@ -35,6 +47,7 @@ services:
       LITELLM_CHAT_TARGET: "openai/${CHAT_MODEL:-deepseek-v4-flash-0731}"
       LITELLM_EMBEDDING_TARGET: "openai/${EMBEDDING_MODEL:-qwen3.7-text-embedding-flash}"
       LITELLM_JUDGE_TARGET: "openai/${JUDGE_MODEL:-kimi-k3}"
+      LITELLM_RERANK_TARGET: "openai/${RERANK_MODEL:-rerank-default}"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-internal-master-key}
       LITELLM_PORT: ${LITELLM_PORT:-4000}
     volumes:
@@ -83,3 +96,4 @@ volumes:
   milvus-etcd-data:
   milvus-minio-data:
   milvus-data:
+  artifact-minio-data:

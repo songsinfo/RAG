@@ -1,7 +1,7 @@
 import hashlib
 import json
+import mimetypes
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -38,23 +38,27 @@ from app.models import (
 )
 
 
-# Bounded in-process executor for ingestion jobs
-_executor = ThreadPoolExecutor(max_workers=4)
-
-
 class KnowledgeService:
     @staticmethod
     def recover_unfinished_jobs():
-        """Recovers any pending ingestion/purge jobs left over from process restart."""
+        """Requeue only expired leased jobs; queued jobs survive process restarts."""
         try:
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
                 conn.execute(
                     update(job_table)
-                    .where(job_table.c.status.in_(["QUEUED", "RUNNING"]))
+                    .where(
+                        and_(
+                            job_table.c.status == "RUNNING",
+                            job_table.c.lease_until.isnot(None),
+                            job_table.c.lease_until < now,
+                        )
+                    )
                     .values(
-                        status="FAILED",
-                        error_code="PROCESS_RESTARTED",
+                        status="QUEUED",
+                        lease_until=None,
+                        error_code="LEASE_EXPIRED",
+                        available_at=now,
                         updated_at=now,
                     )
                 )
@@ -598,7 +602,7 @@ class KnowledgeService:
                     source_artifact_id=art_id,
                     source_hash=sha256_bytes,
                     original_name=filename,
-                    media_type="text/markdown",
+                    media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
                     created_by=actor.user_id,
                     created_at=now,
                     updated_at=now,
@@ -670,17 +674,19 @@ class KnowledgeService:
             )
             conn.commit()
 
-        # Submit background task
-        _executor.submit(
-            KnowledgeService._execute_ingestion_job,
-            actor.tenant_id,
-            job_id,
-            doc_id,
-            version_id,
-            build_id,
-            file_bytes,
-            filename,
-        )
+        # Tests execute synchronously. Non-test environments leave the durable
+        # job queued for the DB-backed worker (embedded or standalone).
+        from app.config import is_test_env
+        if is_test_env():
+            KnowledgeService._execute_ingestion_job(
+                actor.tenant_id,
+                job_id,
+                doc_id,
+                version_id,
+                build_id,
+                file_bytes,
+                filename,
+            )
 
         return {
             "documentId": doc_id,
@@ -814,7 +820,7 @@ class KnowledgeService:
                 conn.execute(
                     update(job_table)
                     .where(job_table.c.id == job_id)
-                    .values(status="COMPLETED", stage="INDEXING", updated_at=now)
+                    .values(status="COMPLETED", stage="INDEXING", lease_until=None, updated_at=now)
                 )
                 conn.commit()
 
@@ -823,7 +829,7 @@ class KnowledgeService:
                 conn.execute(
                     update(job_table)
                     .where(job_table.c.id == job_id)
-                    .values(status="FAILED", error_code="PARSER_FAILED", updated_at=datetime.now(timezone.utc))
+                    .values(status="FAILED", error_code="PARSER_FAILED", lease_until=None, updated_at=datetime.now(timezone.utc))
                 )
                 conn.commit()
 
@@ -1069,6 +1075,7 @@ class KnowledgeService:
                 child_chunks = conn.execute(
                     select(
                         chunk_table.c.id,
+                        chunk_table.c.parent_id,
                         chunk_table.c.text_content,
                     ).where(
                         and_(
@@ -1080,7 +1087,14 @@ class KnowledgeService:
                 ).fetchall()
                 if child_chunks:
                     from app.retrieval.milvus_service import MilvusHybridService
-                    chunks_data = [{"id": str(c.id), "text_content": c.text_content} for c in child_chunks]
+                    chunks_data = [
+                        {
+                            "id": str(c.id),
+                            "parent_id": str(c.parent_id) if c.parent_id else None,
+                            "text_content": c.text_content,
+                        }
+                        for c in child_chunks
+                    ]
                     b_row = conn.execute(
                         select(index_build_table.c.version_id).where(
                             and_(
@@ -1202,10 +1216,13 @@ class KnowledgeService:
                         requested_by=actor.user_id,
                         idempotency_key=str(uuid.uuid4()),
                         request_hash=hashlib.sha256(f"{doc_id}:{new_fence}".encode("utf-8")).digest(),
-                        status="RUNNING",
+                        status="QUEUED",
                         stage="PURGE",
                         attempt=0,
+                        available_at=now,
+                        lease_epoch=0,
                         fence=new_fence,
+                        checkpoint={"deletionRecordId": del_rec_id},
                         created_at=now,
                         updated_at=now,
                     )
@@ -1231,24 +1248,11 @@ class KnowledgeService:
                 )
                 conn.commit()
 
-                try:
+                from app.config import is_test_env
+                if is_test_env():
                     KnowledgeService._execute_purge(actor.tenant_id, doc_id, job_id, del_rec_id)
-                except Exception:
-                    with get_db_connection() as c:
-                        c.execute(
-                            update(job_table)
-                            .where(job_table.c.id == job_id)
-                            .values(status="FAILED", error_code="PURGE_FAILED", updated_at=datetime.now(timezone.utc))
-                        )
-                        c.execute(
-                            update(deletion_record_table)
-                            .where(deletion_record_table.c.id == del_rec_id)
-                            .values(status="FAILED", updated_at=datetime.now(timezone.utc))
-                        )
-                        c.commit()
-                    raise
-
-                return {"documentId": doc_id, "status": "PURGED", "jobId": job_id}
+                    return {"documentId": doc_id, "status": "PURGED", "jobId": job_id}
+                return {"documentId": doc_id, "status": "PURGE_PENDING", "jobId": job_id}
 
     @staticmethod
     def _execute_purge(tenant_id: str, doc_id: str, job_id: str, del_rec_id: str):

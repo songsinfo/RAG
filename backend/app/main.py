@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import threading
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, Depends, Response
 from fastapi.responses import JSONResponse
@@ -40,7 +41,25 @@ async def lifespan(app: FastAPI):
         KnowledgeService.recover_unfinished_jobs()
     except Exception as e:
         print(f"Warning: Unfinished job recovery check: {e}")
+
+    worker = None
+    worker_thread = None
+    if not is_test_env() and settings.RAG_EMBEDDED_WORKER:
+        from app.runtime.worker import DurableJobWorker
+        worker = DurableJobWorker()
+        worker_thread = threading.Thread(
+            target=worker.run_forever,
+            name="rag-durable-worker",
+            daemon=True,
+        )
+        worker_thread.start()
+
     yield
+
+    if worker:
+        worker.stop()
+    if worker_thread:
+        worker_thread.join(timeout=5)
 
 
 app = FastAPI(
