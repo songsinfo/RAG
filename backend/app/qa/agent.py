@@ -16,6 +16,7 @@ from app.identity.deps import Actor, assert_hits_still_readable
 from app.models import context_segment_table, run_source_table, segment_kb_table, source_unit_table
 from app.qa.claim_validator import INSTRUCTION, validate_claims
 from app.qa.model_gateway import ModelGateway
+from app.qa.execution import qa_lease_is_current
 from app.retrieval.pipeline import RetrievalPipeline
 
 AGENT_TOOLS = [
@@ -256,6 +257,8 @@ class LangGraphAgent:
                     now = datetime.now(timezone.utc)
 
                     with get_db_connection() as conn:
+                        if not qa_lease_is_current(conn, actor.tenant_id, ctx.run_id):
+                            raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
                         for hit in retrieval["hits"]:
                             key = cls._hit_key(hit)
                             existing = evidence_by_key.get(key)
@@ -455,6 +458,8 @@ class LangGraphAgent:
         ev_index: int,
     ) -> Dict[str, Any]:
         with get_db_connection() as conn:
+            if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
             from app.identity.deps import can_read_document
             if not can_read_document(conn, actor, doc_id):
                 raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此文档")
