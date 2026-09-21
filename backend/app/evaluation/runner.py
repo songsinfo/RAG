@@ -5,7 +5,6 @@ import math
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 
@@ -39,8 +38,6 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
-
-_eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
@@ -300,9 +297,9 @@ class EvaluationRunner:
 
         if is_test_env():
             EvaluationRunner._execute_run(actor, run_id)
-        else:
-            _eval_executor.submit(EvaluationRunner._execute_run, actor, run_id)
 
+        # Non-test environments leave the durable EVALUATE job queued for
+        # app.runtime.worker, so process restarts do not lose long evaluations.
         return {"runId": run_id, "jobId": job_id, "status": "QUEUED"}
 
     @staticmethod
@@ -624,12 +621,17 @@ class EvaluationRunner:
         ranked_grades: List[int] = []
         seen_groups: Set[int] = set()
 
-        with get_db_connection() as conn:
-            for hit in ranked_hits:
-                chunk_id = str(hit.get("chunkId", hit.get("id", "")))
-                # Fetch chunk text and document/version
-                row = conn.execute(
+        chunk_ids = [
+            str(hit.get("chunkId", hit.get("id", "")))
+            for hit in ranked_hits
+            if hit.get("chunkId", hit.get("id"))
+        ]
+        row_map: Dict[str, Any] = {}
+        if chunk_ids:
+            with get_db_connection() as conn:
+                rows = conn.execute(
                     select(
+                        chunk_table.c.id,
                         chunk_table.c.text_content,
                         index_build_table.c.document_id,
                         index_build_table.c.version_id,
@@ -646,39 +648,40 @@ class EvaluationRunner:
                     .where(
                         and_(
                             chunk_table.c.tenant_id == actor.tenant_id,
-                            chunk_table.c.id == chunk_id,
+                            chunk_table.c.id.in_(chunk_ids),
                         )
                     )
-                ).first()
+                ).fetchall()
+                row_map = {str(row.id): row for row in rows}
 
-                if not row:
-                    text_content = str(hit.get("text", ""))
-                    doc_id = str(hit.get("documentId", ""))
-                    ver_id = str(hit.get("versionId", ""))
-                else:
-                    text_content = row.text_content or ""
-                    doc_id = str(row.document_id)
-                    ver_id = str(row.version_id)
+        for hit in ranked_hits:
+            chunk_id = str(hit.get("chunkId", hit.get("id", "")))
+            row = row_map.get(chunk_id)
 
-                matched_anchors: Set[str] = set()
-                for a_key, a_val in anchors.items():
-                    target_doc = str(a_val.get("documentId", ""))
-                    target_quote = str(a_val.get("quote", ""))
-                    # Document matches and text contains quote
-                    if (not doc_id or doc_id == target_doc) and target_quote and (target_quote in text_content):
-                        matched_anchors.add(a_key)
+            if not row:
+                text_content = str(hit.get("text", ""))
+                doc_id = str(hit.get("documentId", ""))
+            else:
+                text_content = row.text_content or ""
+                doc_id = str(row.document_id)
 
-                ranked.append(matched_anchors)
+            matched_anchors: Set[str] = set()
+            for a_key, a_val in anchors.items():
+                target_doc = str(a_val.get("documentId", ""))
+                target_quote = str(a_val.get("quote", ""))
+                if (not doc_id or doc_id == target_doc) and target_quote and target_quote in text_content:
+                    matched_anchors.add(a_key)
 
-                # Graded relevance (only count once per group)
-                highest_grade = 0
-                for m in matched_anchors:
-                    g_idx = anchor_groups[m]
-                    if g_idx not in seen_groups:
-                        highest_grade = max(highest_grade, anchor_grades[m])
-                for m in matched_anchors:
-                    seen_groups.add(anchor_groups[m])
-                ranked_grades.append(highest_grade)
+            ranked.append(matched_anchors)
+
+            highest_grade = 0
+            for match in matched_anchors:
+                group_index = anchor_groups[match]
+                if group_index not in seen_groups:
+                    highest_grade = max(highest_grade, anchor_grades[match])
+            for match in matched_anchors:
+                seen_groups.add(anchor_groups[match])
+            ranked_grades.append(highest_grade)
 
         res = EvaluationMetrics.retrieval(
             groups=groups,

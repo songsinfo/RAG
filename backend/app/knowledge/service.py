@@ -808,26 +808,27 @@ class KnowledgeService:
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
+                unit_rows = []
                 for u in raw_units:
                     unit_id = str(uuid.uuid4())
                     u["id"] = unit_id
-                    conn.execute(
-                        source_unit_table.insert().values(
-                            tenant_id=tenant_id,
-                            id=unit_id,
-                            build_id=build_id,
-                            document_id=doc_id,
-                            unit_key=u["unit_key"],
-                            kind=u["kind"],
-                            text_content=u["text_content"],
-                            location=u.get("location", {}),
-                            machine_generated=False,
-                            artifact_id=None,
-                            content_hash=u["content_hash"],
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
+                    unit_rows.append({
+                        "tenant_id": tenant_id,
+                        "id": unit_id,
+                        "build_id": build_id,
+                        "document_id": doc_id,
+                        "unit_key": u["unit_key"],
+                        "kind": u["kind"],
+                        "text_content": u["text_content"],
+                        "location": u.get("location", {}),
+                        "machine_generated": False,
+                        "artifact_id": None,
+                        "content_hash": u["content_hash"],
+                        "created_at": now,
+                        "updated_at": now,
+                    })
+                for start in range(0, len(unit_rows), 500):
+                    conn.execute(source_unit_table.insert(), unit_rows[start:start + 500])
                 conn.execute(
                     update(job_table)
                     .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
@@ -841,38 +842,42 @@ class KnowledgeService:
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
-                for c in chunks:
-                    conn.execute(
-                        chunk_table.insert().values(
-                            tenant_id=tenant_id,
-                            id=c["id"],
-                            build_id=build_id,
-                            parent_id=c["parent_id"],
-                            kind=c["kind"],
-                            ordinal=c["ordinal"],
-                            text_content=c["text_content"],
-                            token_count=c["token_count"],
-                            content_hash=c["content_hash"],
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
-                for sp in spans:
-                    conn.execute(
-                        chunk_span_table.insert().values(
-                            tenant_id=tenant_id,
-                            id=sp["id"],
-                            build_id=build_id,
-                            chunk_id=sp["chunk_id"],
-                            unit_id=sp["unit_id"],
-                            ordinal=sp["ordinal"],
-                            start_cp=sp["start_cp"],
-                            end_cp=sp["end_cp"],
-                            location=sp.get("location"),
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
+                chunk_rows = [
+                    {
+                        "tenant_id": tenant_id,
+                        "id": c["id"],
+                        "build_id": build_id,
+                        "parent_id": c["parent_id"],
+                        "kind": c["kind"],
+                        "ordinal": c["ordinal"],
+                        "text_content": c["text_content"],
+                        "token_count": c["token_count"],
+                        "content_hash": c["content_hash"],
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    for c in chunks
+                ]
+                span_rows = [
+                    {
+                        "tenant_id": tenant_id,
+                        "id": sp["id"],
+                        "build_id": build_id,
+                        "chunk_id": sp["chunk_id"],
+                        "unit_id": sp["unit_id"],
+                        "ordinal": sp["ordinal"],
+                        "start_cp": sp["start_cp"],
+                        "end_cp": sp["end_cp"],
+                        "location": sp.get("location"),
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    for sp in spans
+                ]
+                for start in range(0, len(chunk_rows), 500):
+                    conn.execute(chunk_table.insert(), chunk_rows[start:start + 500])
+                for start in range(0, len(span_rows), 1000):
+                    conn.execute(chunk_span_table.insert(), span_rows[start:start + 1000])
                 conn.execute(
                     update(job_table)
                     .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))

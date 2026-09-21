@@ -3,13 +3,12 @@ import json
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-from sqlalchemy import select, and_, or_, exists, update
+from sqlalchemy import select, and_, or_, exists, update, delete
 from app.config import is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
@@ -28,26 +27,37 @@ from app.models import (
     document_table,
     kb_grant_table,
     document_grant_table,
+    job_table,
 )
 from app.qa.content_guard import validate_input, validate_output
 from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
+from app.qa.execution import current_qa_execution, qa_execution_scope, qa_lease_is_current
 from app.retrieval.pipeline import RetrievalPipeline
-
-_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class QaService:
     @staticmethod
     def recover_unfinished_runs():
-        """Recovers any pending runs left over from process restart."""
+        """Keep durable QA_RUN jobs recoverable; fail only legacy orphan runs."""
         try:
             now = datetime.now(timezone.utc)
+            durable_job_exists = exists().where(
+                and_(
+                    job_table.c.tenant_id == qa_run_table.c.tenant_id,
+                    job_table.c.target_id == qa_run_table.c.id,
+                    job_table.c.kind == "QA_RUN",
+                    job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                )
+            )
             with get_db_connection() as conn:
                 conn.execute(
                     update(qa_run_table)
-                    .where(qa_run_table.c.status.in_(["QUEUED", "RUNNING"]))
+                    .where(and_(
+                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                        ~durable_job_exists,
+                    ))
                     .values(
                         status="FAILED",
                         stage="FINISHED",
@@ -58,7 +68,7 @@ class QaService:
                 )
                 conn.commit()
         except Exception:
-            pass
+            logger.exception("Failed to recover unfinished QA runs")
 
     @staticmethod
     def create_conversation(actor: Actor, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -506,13 +516,32 @@ class QaService:
                     updated_at=now,
                 )
             )
+            qa_job_id = str(uuid.uuid4())
+            conn.execute(
+                job_table.insert().values(
+                    tenant_id=actor.tenant_id,
+                    id=qa_job_id,
+                    kind="QA_RUN",
+                    target_id=run_id,
+                    requested_by=actor.user_id,
+                    idempotency_key=f"qa:{run_id}",
+                    request_hash=req_hash,
+                    status="QUEUED",
+                    stage="QA",
+                    attempt=0,
+                    available_at=now,
+                    lease_epoch=0,
+                    checkpoint={"runId": run_id},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             conn.commit()
 
-        run_args = (actor, run_id, conv_id, str(seg.id), question, mode, strict_mode, str(config_id))
         if is_test_env():
-            QaService._execute_run(*run_args)
-        else:
-            _executor.submit(QaService._execute_run, *run_args)
+            QaService.execute_queued_run(actor, run_id)
+
+        # Production execution is claimed by the durable runtime worker.
 
         return {
             "runId": run_id,
@@ -521,10 +550,88 @@ class QaService:
         }
 
     @staticmethod
+    def execute_queued_run(
+        actor: Actor,
+        run_id: str,
+        job_id: Optional[str] = None,
+        lease_epoch: Optional[int] = None,
+    ):
+        # Establish the execution lease before reading or mutating any retry
+        # state. The ownership check locks the job row in this transaction so
+        # a stale worker cannot erase a replacement worker's sources/events.
+        with qa_execution_scope(job_id, lease_epoch):
+            with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
+
+                row = conn.execute(
+                    select(qa_run_table)
+                    .where(and_(
+                        qa_run_table.c.tenant_id == actor.tenant_id,
+                        qa_run_table.c.id == run_id,
+                        qa_run_table.c.owner_id == actor.user_id,
+                    ))
+                    .with_for_update()
+                ).first()
+                if not row:
+                    raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
+                if str(row.status) in {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"}:
+                    return
+
+                # A valid durable retry may reset only its own previous
+                # attempt's derived state while holding the current job lease.
+                if str(row.status) == "RUNNING":
+                    conn.execute(delete(run_source_table).where(and_(
+                        run_source_table.c.tenant_id == actor.tenant_id,
+                        run_source_table.c.run_id == run_id,
+                    )))
+                    conn.execute(delete(run_event_table).where(and_(
+                        run_event_table.c.tenant_id == actor.tenant_id,
+                        run_event_table.c.run_id == run_id,
+                    )))
+                    conn.execute(
+                        update(qa_run_table)
+                        .where(and_(
+                            qa_run_table.c.tenant_id == actor.tenant_id,
+                            qa_run_table.c.id == run_id,
+                        ))
+                        .values(
+                            status="QUEUED",
+                            stage="ROUTING",
+                            result_json=None,
+                            terminal_reason=None,
+                            started_at=None,
+                            finished_at=None,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+
+                conv_id = str(row.conversation_id)
+                seg_id = str(row.segment_id)
+                question = str(row.question or "")
+                mode = str(row.mode)
+                strict_mode = bool(row.strict_mode)
+                config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
+                conn.commit()
+
+            QaService._execute_run(
+                actor,
+                run_id,
+                conv_id,
+                seg_id,
+                question,
+                mode,
+                strict_mode,
+                config_id,
+            )
+
+    @staticmethod
     def _record_event(tenant_id: str, run_id: str, stage: str, payload: Optional[Dict[str, Any]] = None):
         try:
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, tenant_id, run_id):
+                    return
                 seq = conn.execute(
                     select(run_event_table.c.sequence_no)
                     .where(
@@ -568,6 +675,8 @@ class QaService:
         now = datetime.now(timezone.utc)
         try:
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(
@@ -693,6 +802,8 @@ class QaService:
             evidence = []
             evidence_map = {}
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
                 # A second ACL + active-build check happens immediately before
                 # evidence is persisted and sent to any external model.
                 assert_hits_still_readable(conn, actor, hits, allowed_kb_ids or None)
@@ -833,18 +944,53 @@ class QaService:
             return r and (r.status == "CANCELLED" or r.cancel_requested_at is not None)
 
     @staticmethod
-    def _finalize_run(tenant_id: str, run_id: str, status: str, stage: str, terminal_reason: str, result_json: Dict[str, Any]):
+    def _finalize_run(
+        tenant_id: str,
+        run_id: str,
+        status: str,
+        stage: str,
+        terminal_reason: str,
+        result_json: Dict[str, Any],
+    ) -> bool:
         now = datetime.now(timezone.utc)
+        current = current_qa_execution()
         with get_db_connection() as conn:
+            if current is not None:
+                job_id, lease_epoch = current
+                job_result = conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                        job_table.c.target_id == run_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.status == "RUNNING",
+                        job_table.c.lease_epoch == lease_epoch,
+                    ))
+                    .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
+                )
+                if job_result.rowcount != 1:
+                    conn.rollback()
+                    return False
+            else:
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.target_id == run_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                    ))
+                    .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
+                )
+
             conn.execute(
                 update(qa_run_table)
-                .where(
-                    and_(
-                        qa_run_table.c.tenant_id == tenant_id,
-                        qa_run_table.c.id == run_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
-                    )
-                )
+                .where(and_(
+                    qa_run_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.id == run_id,
+                    qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                ))
                 .values(
                     status=status,
                     stage=stage,
@@ -855,20 +1001,61 @@ class QaService:
                 )
             )
             conn.commit()
+            return True
 
     @staticmethod
-    def _fail_run(tenant_id: str, run_id: str, error_code: str):
+    def _fail_run(tenant_id: str, run_id: str, error_code: str) -> bool:
         now = datetime.now(timezone.utc)
+        current = current_qa_execution()
         with get_db_connection() as conn:
-            conn.execute(
-                update(qa_run_table)
-                .where(
-                    and_(
-                        qa_run_table.c.tenant_id == tenant_id,
-                        qa_run_table.c.id == run_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+            if current is not None:
+                job_id, lease_epoch = current
+                job_result = conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                        job_table.c.target_id == run_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.status == "RUNNING",
+                        job_table.c.lease_epoch == lease_epoch,
+                    ))
+                    .values(
+                        status="FAILED",
+                        stage="FINISHED",
+                        lease_until=None,
+                        error_code=error_code,
+                        updated_at=now,
                     )
                 )
+                if job_result.rowcount != 1:
+                    conn.rollback()
+                    return False
+            else:
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.target_id == run_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                    ))
+                    .values(
+                        status="FAILED",
+                        stage="FINISHED",
+                        lease_until=None,
+                        error_code=error_code,
+                        updated_at=now,
+                    )
+                )
+
+            conn.execute(
+                update(qa_run_table)
+                .where(and_(
+                    qa_run_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.id == run_id,
+                    qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                ))
                 .values(
                     status="FAILED",
                     stage="FINISHED",
@@ -878,8 +1065,8 @@ class QaService:
                 )
             )
             conn.commit()
+            return True
 
-    @staticmethod
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
         stmt = (

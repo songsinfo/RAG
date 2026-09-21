@@ -98,48 +98,51 @@ class MilvusHybridService:
             return
 
         epoch = int(index_epoch or 0)
-        texts = [c["text_content"] for c in chunks]
-        embeddings = get_embeddings(texts, dim=1024)
-
-        milvus_records = []
-        for chunk, emb in zip(chunks, embeddings):
-            chunk_id = str(chunk["id"])
-            norm = normalize_terms(chunk["text_content"])
-            if epoch > 0:
-                record_id = hashlib.sha256(
-                    f"{tenant_id}:{build_id}:{epoch}:{chunk_id}".encode("utf-8")
-                ).hexdigest()
-            else:
-                # Preserve legacy IDs for builds published before index fencing.
-                record_id = f"{tenant_id}:{build_id}:{chunk_id}"
-            record = {
-                "id": record_id,
-                "parent_id": str(chunk.get("parent_id") or ""),
-                "tenant_id": tenant_id,
-                "kb_id": kb_id,
-                "document_id": doc_id,
-                "version_id": version_id,
-                "build_id": build_id,
-                "index_epoch": epoch,
-                "chunk_id": chunk_id,
-                "representation_type": "ORIGINAL",
-                "text_content": chunk["text_content"],
-                "normalized_terms": norm,
-                "dense_vector": emb,
-            }
-            cls._mock_store[record["id"]] = record
-            milvus_records.append(record)
-
+        batch_size = max(1, min(512, int(os.getenv("MILVUS_UPSERT_BATCH_SIZE", "128"))))
         client = cls.get_client()
-        if client:
-            try:
-                client.upsert(collection_name=COLLECTION_NAME, data=milvus_records)
-            except Exception as e:
-                logger.error("Failed to upsert to Milvus: %s", e)
-                if not is_test_env():
-                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 入库失败: {e}")
-        elif not is_test_env():
-            raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 服务不可用，文档入库中止")
+
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start:start + batch_size]
+            texts = [c["text_content"] for c in batch]
+            embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size)
+            records = []
+
+            for chunk, emb in zip(batch, embeddings):
+                chunk_id = str(chunk["id"])
+                norm = normalize_terms(chunk["text_content"])
+                if epoch > 0:
+                    record_id = hashlib.sha256(
+                        f"{tenant_id}:{build_id}:{epoch}:{chunk_id}".encode("utf-8")
+                    ).hexdigest()
+                else:
+                    record_id = f"{tenant_id}:{build_id}:{chunk_id}"
+                record = {
+                    "id": record_id,
+                    "parent_id": str(chunk.get("parent_id") or ""),
+                    "tenant_id": tenant_id,
+                    "kb_id": kb_id,
+                    "document_id": doc_id,
+                    "version_id": version_id,
+                    "build_id": build_id,
+                    "index_epoch": epoch,
+                    "chunk_id": chunk_id,
+                    "representation_type": "ORIGINAL",
+                    "text_content": chunk["text_content"],
+                    "normalized_terms": norm,
+                    "dense_vector": emb,
+                }
+                cls._mock_store[record_id] = record
+                records.append(record)
+
+            if client:
+                try:
+                    client.upsert(collection_name=COLLECTION_NAME, data=records)
+                except Exception as exc:
+                    logger.error("Failed to upsert to Milvus: %s", exc)
+                    if not is_test_env():
+                        raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 入库失败: {exc}")
+            elif not is_test_env():
+                raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 服务不可用，文档入库中止")
 
     @classmethod
     def delete_by_build(
@@ -254,17 +257,25 @@ class MilvusHybridService:
         if client:
             try:
                 if allowed_build_epochs:
-                    build_clauses = []
+                    grouped: Dict[int, List[str]] = {}
+                    legacy_builds: List[str] = []
                     for allowed_build_id in allowed_build_ids:
                         expected_epoch = int(allowed_build_epochs.get(allowed_build_id, 0) or 0)
                         if expected_epoch > 0:
-                            build_clauses.append(
-                                f'(build_id == "{allowed_build_id}" and index_epoch == {expected_epoch})'
-                            )
+                            grouped.setdefault(expected_epoch, []).append(allowed_build_id)
                         else:
-                            # Legacy published builds have fence=0 and may not
-                            # have an index_epoch field in an existing collection.
-                            build_clauses.append(f'build_id == "{allowed_build_id}"')
+                            legacy_builds.append(allowed_build_id)
+
+                    build_clauses = []
+                    for epoch, build_ids in grouped.items():
+                        ids_expr = ", ".join(f'"{build_id}"' for build_id in build_ids)
+                        build_clauses.append(
+                            f'(index_epoch == {epoch} and build_id in [{ids_expr}])'
+                        )
+                    if legacy_builds:
+                        ids_expr = ", ".join(f'"{build_id}"' for build_id in legacy_builds)
+                        build_clauses.append(f'build_id in [{ids_expr}]')
+
                     build_filter = " or ".join(build_clauses)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and ({build_filter}) '
