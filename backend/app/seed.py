@@ -132,7 +132,67 @@ class DemoSeed:
                 )
                 conn.commit()
 
-            # 6. Seed Default Retrieval Strategy Config
+            # 6. Seed versioned enterprise retrieval strategy.
+            enterprise_cfg_id = "cfg-enterprise-retrieval-v2"
+            enterprise_cfg = conn.execute(
+                select(config_revision_table).where(
+                    config_revision_table.c.tenant_id == tenant_id,
+                    config_revision_table.c.id == enterprise_cfg_id,
+                )
+            ).first()
+            if not enterprise_cfg:
+                enterprise_payload = {
+                    "retrieval": {
+                        "mode": "HYBRID",
+                        "denseTopK": 30,
+                        "sparseTopK": 30,
+                        "fusionTopK": 20,
+                        "rrfK": 60,
+                        "finalTopK": 8,
+                    },
+                    "rerank": {
+                        "enabled": True,
+                        "topK": 10,
+                        "model": "rerank-main",
+                        "failOpen": True,
+                    },
+                    "parentExpansion": {
+                        "enabled": True,
+                        "maxChars": 6000,
+                    },
+                }
+                payload_str = json.dumps(enterprise_payload, sort_keys=True)
+                conn.execute(
+                    config_revision_table.insert().values(
+                        tenant_id=tenant_id,
+                        id=enterprise_cfg_id,
+                        kind="RETRIEVAL",
+                        name="enterprise_retrieval_pipeline",
+                        revision=2,
+                        sha256=hashlib.sha256(payload_str.encode("utf-8")).digest(),
+                        payload=enterprise_payload,
+                        status="PUBLISHED",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+
+            tenant_cfg = conn.execute(
+                select(tenant_table.c.active_retrieval_config_id).where(
+                    tenant_table.c.id == tenant_id
+                )
+            ).scalar()
+            if not tenant_cfg or str(tenant_cfg) == "cfg-default-retrieval":
+                conn.execute(
+                    tenant_table.update()
+                    .where(tenant_table.c.id == tenant_id)
+                    .values(active_retrieval_config_id=enterprise_cfg_id)
+                )
+                conn.commit()
+
+            # Keep v1 for backwards-compatible historical runs.
+            # 6b. Seed Default Retrieval Strategy Config
             default_cfg = conn.execute(
                 select(config_revision_table).where(
                     config_revision_table.c.tenant_id == tenant_id,
@@ -172,6 +232,7 @@ class DemoSeed:
                 "cfg-model-chat-main": "chat-main",
                 "cfg-model-embedding-main": "embedding-main",
                 "cfg-model-judge-main": "judge-main",
+                "cfg-model-rerank-main": "rerank-main",
             }
             for config_id, alias in model_configs.items():
                 exists_row = conn.execute(

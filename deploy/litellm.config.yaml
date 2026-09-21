@@ -14,6 +14,11 @@ model_list:
       model: os.environ/LITELLM_JUDGE_TARGET
       api_base: os.environ/MODEL_BASE_URL
       api_key: os.environ/MODEL_API_KEY
+  - model_name: rerank-main
+    litellm_params:
+      model: os.environ/LITELLM_RERANK_TARGET
+      api_base: os.environ/MODEL_BASE_URL
+      api_key: os.environ/MODEL_API_KEY
 
 litellm_settings:
   num_retries: 2

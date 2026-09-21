@@ -13,7 +13,7 @@ from sqlalchemy import select, and_, or_, exists, update
 from app.config import is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor, can_read_document
+from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     tenant_table,
     conversation_table,
@@ -33,7 +33,7 @@ from app.qa.content_guard import validate_input, validate_output
 from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
-from app.retrieval.milvus_service import MilvusHybridService
+from app.retrieval.pipeline import RetrievalPipeline
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -477,7 +477,7 @@ class QaService:
                 if t_row and t_row.active_retrieval_config_id:
                     config_id = str(t_row.active_retrieval_config_id)
                 else:
-                    config_id = "cfg-default-retrieval"
+                    config_id = "cfg-enterprise-retrieval-v2"
 
             conn.execute(
                 qa_run_table.insert().values(
@@ -508,7 +508,7 @@ class QaService:
             )
             conn.commit()
 
-        run_args = (actor, run_id, conv_id, str(seg.id), question, mode, strict_mode)
+        run_args = (actor, run_id, conv_id, str(seg.id), question, mode, strict_mode, str(config_id))
         if is_test_env():
             QaService._execute_run(*run_args)
         else:
@@ -563,6 +563,7 @@ class QaService:
         question: str,
         mode: str,
         strict_mode: bool,
+        config_id: str,
     ):
         now = datetime.now(timezone.utc)
         try:
@@ -611,6 +612,7 @@ class QaService:
                     segment_id=seg_id,
                     record_event_fn=QaService._record_event,
                     is_cancelled_fn=QaService._is_cancelled,
+                    config_id=config_id,
                 )
                 if strict_mode and agent_res.get("claims"):
                     agent_res["verification"] = "SUPPORTED"
@@ -620,10 +622,9 @@ class QaService:
                 QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", agent_res)
                 return
 
-            # 2. Scope & Retrieval
-            QaService._record_event(actor.tenant_id, run_id, "RETRIEVING")
+            # 2. Scope + ACL + config-driven retrieval pipeline
+            QaService._record_event(actor.tenant_id, run_id, "RETRIEVING", {"configId": config_id})
             with get_db_connection() as conn:
-                # Get segment scope
                 seg = conn.execute(
                     select(context_segment_table).where(
                         and_(
@@ -645,65 +646,25 @@ class QaService:
                     ).fetchall()
                     allowed_kb_ids = [str(k.kb_id) for k in kbs]
 
-                # Resolve allowed active build IDs based on MySQL ACL
-                stmt = select(document_table.c.active_build_id, document_table.c.id.label("document_id")).where(
-                    and_(
-                        document_table.c.tenant_id == actor.tenant_id,
-                        document_table.c.status == "LIVE",
-                        document_table.c.active_build_id.isnot(None),
-                    )
-                )
-                if allowed_kb_ids:
-                    stmt = stmt.where(document_table.c.kb_id.in_(allowed_kb_ids))
-
-                if not actor.admin:
-                    stmt = stmt.where(
-                        or_(
-                            exists().where(
-                                and_(
-                                    kb_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                    kb_grant_table.c.kb_id == document_table.c.kb_id,
-                                    or_(
-                                        kb_grant_table.c.principal_type == "ALL",
-                                        kb_grant_table.c.user_id == actor.user_id,
-                                    ),
-                                )
-                            ),
-                            exists().where(
-                                and_(
-                                    document_grant_table.c.tenant_id == document_table.c.tenant_id,
-                                    document_grant_table.c.document_id == document_table.c.id,
-                                    document_grant_table.c.user_id == actor.user_id,
-                                )
-                            ),
-                        )
-                    )
-                permitted_rows = conn.execute(stmt).fetchall()
-                allowed_build_ids = [str(r.active_build_id) for r in permitted_rows]
-                build_to_doc = {str(r.active_build_id): str(r.document_id) for r in permitted_rows}
-
-            # 3. If no permitted builds, return NO_EVIDENCE without calling LLM
-            if not allowed_build_ids:
-                no_ev_res = {
-                    "status": "NO_EVIDENCE",
-                    "claims": [],
-                    "conflicts": [],
-                    "answer": "当前可访问资料不足以回答。",
-                    "verification": "NOT_APPLICABLE",
-                    "evidence": [],
-                    "warnings": [],
-                }
-                QaService._finalize_run(actor.tenant_id, run_id, "COMPLETED", "FINISHED", "NO_EVIDENCE", no_ev_res)
-                return
-
-            # Hybrid Search
-            hits = MilvusHybridService.search(
-                tenant_id=actor.tenant_id,
+            retrieval = RetrievalPipeline.retrieve(
+                actor=actor,
                 query=question,
-                allowed_build_ids=allowed_build_ids,
-                top_k=5,
+                kb_ids=allowed_kb_ids or None,
+                config_id=config_id,
+                run_id=run_id,
             )
-            QaService._record_event(actor.tenant_id, run_id, "RETRIEVED", {"hitCount": len(hits)})
+            hits = retrieval["hits"]
+            QaService._record_event(
+                actor.tenant_id,
+                run_id,
+                "RETRIEVED",
+                {
+                    "hitCount": len(hits),
+                    "configId": config_id,
+                    "retrievalConfig": retrieval["config"],
+                    "warnings": retrieval["warnings"],
+                },
+            )
 
             if not hits:
                 no_ev_res = {
@@ -713,43 +674,66 @@ class QaService:
                     "answer": "当前可访问资料不足以回答。",
                     "verification": "NOT_APPLICABLE",
                     "evidence": [],
-                    "warnings": [],
+                    "warnings": retrieval["warnings"],
                 }
-                QaService._finalize_run(actor.tenant_id, run_id, "COMPLETED", "FINISHED", "NO_EVIDENCE", no_ev_res)
+                QaService._finalize_run(
+                    actor.tenant_id,
+                    run_id,
+                    "COMPLETED",
+                    "FINISHED",
+                    "NO_EVIDENCE",
+                    no_ev_res,
+                )
                 return
 
             if QaService._is_cancelled(actor.tenant_id, run_id):
                 return
 
-            # 4. Context assembly
+            # 3. Context assembly with exact retrieval provenance.
             evidence = []
             evidence_map = {}
             with get_db_connection() as conn:
+                # A second ACL + active-build check happens immediately before
+                # evidence is persisted and sent to any external model.
+                assert_hits_still_readable(conn, actor, hits, allowed_kb_ids or None)
+
                 for idx, h in enumerate(hits, start=1):
                     eid = f"E{idx}"
-                    doc_id = h.get("documentId")
+                    source_units = h.get("sourceUnits") or []
+                    unit_id = source_units[0].get("unitId") if source_units else None
                     ev_item = {
                         "evidenceId": eid,
-                        "chunkId": h["chunkId"],
-                        "documentId": doc_id,
+                        "kbId": h.get("kbId"),
+                        "documentId": h.get("documentId"),
+                        "versionId": h.get("versionId"),
+                        "buildId": h.get("buildId"),
+                        "chunkId": h.get("chunkId"),
+                        "parentChunkId": h.get("parentChunkId"),
+                        "unitId": unit_id,
+                        "location": source_units[0].get("location") if source_units else {},
+                        "matchedText": h.get("matchedText"),
                         "text": h["text"],
-                        "score": round(h["score"], 6),
+                        "score": round(float(h.get("score", 0.0)), 6),
+                        "rerankScore": h.get("rerankScore"),
                     }
                     evidence.append(ev_item)
                     evidence_map[eid] = h["text"]
 
-                    # Record run_source
                     conn.execute(
                         run_source_table.insert().values(
                             tenant_id=actor.tenant_id,
                             id=str(uuid.uuid4()),
                             run_id=run_id,
-                            document_id=doc_id,
-                            build_id=allowed_build_ids[0] if allowed_build_ids else "",
-                            unit_id=None,
+                            document_id=h.get("documentId"),
+                            build_id=h.get("buildId"),
+                            unit_id=unit_id,
                             evidence_id=eid,
                             purpose="CITATION",
-                            span_json={},
+                            span_json={
+                                "chunkId": h.get("chunkId"),
+                                "parentChunkId": h.get("parentChunkId"),
+                                "sourceUnits": source_units,
+                            },
                             payload_hash=hashlib.sha256(h["text"].encode("utf-8")).digest(),
                             send_status="SENT",
                             created_at=now,
@@ -758,7 +742,10 @@ class QaService:
                     )
                 conn.commit()
 
-            # 5. Generation
+            # 4. Generation
+            # Final pre-send authorization check. Revocation wins even after retrieval.
+            with get_db_connection() as conn:
+                assert_hits_still_readable(conn, actor, evidence, allowed_kb_ids or None)
             QaService._record_event(actor.tenant_id, run_id, "GENERATING")
             messages = [
                 {"role": "system", "content": INSTRUCTION},
@@ -782,7 +769,7 @@ class QaService:
             QaService._record_event(actor.tenant_id, run_id, "VALIDATING")
             validated = validate_claims(parsed_answer, evidence_map)
             validated["evidence"] = evidence
-            validated["warnings"] = []
+            validated["warnings"] = retrieval["warnings"]
 
             # 7. Strict Mode Verification
             if strict_mode and validated.get("claims"):

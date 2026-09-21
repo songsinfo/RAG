@@ -9,7 +9,7 @@ from sqlalchemy import select, and_, or_, exists
 
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor
+from app.identity.deps import Actor, assert_hits_still_readable
 from app.models import (
     document_table,
     kb_grant_table,
@@ -21,7 +21,7 @@ from app.models import (
 )
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
-from app.retrieval.milvus_service import MilvusHybridService
+from app.retrieval.pipeline import RetrievalPipeline
 
 AGENT_TOOLS = [
     {
@@ -80,6 +80,7 @@ class LangGraphAgent:
         segment_id: str,
         record_event_fn,
         is_cancelled_fn,
+        config_id: str,
     ) -> Dict[str, Any]:
         initial_messages = [
             {
@@ -112,6 +113,10 @@ class LangGraphAgent:
                 raise ApiException(429, "BUDGET_EXCEEDED", "Agent 主循环次数已耗尽")
 
             record_event_fn(actor.tenant_id, run_id, "AGENT_MODEL", {"round": s["round"] + 1})
+
+            # ACL may be revoked between tool execution and the next model call.
+            with get_db_connection() as conn:
+                assert_hits_still_readable(conn, actor, s["evidence"])
 
             reply = ModelGateway.chat_tools(
                 tenant_id=actor.tenant_id,
@@ -191,26 +196,39 @@ class LangGraphAgent:
                         if not query or not isinstance(top_k, int) or top_k < 1 or top_k > 10:
                             raise ApiException(400, "INVALID_TOOL_ARGUMENTS", "检索工具参数无效")
 
-                        # Resolve allowed builds in MySQL
-                        allowed_builds = cls._resolve_allowed_builds(actor, segment_id)
-                        hits = MilvusHybridService.search(
-                            tenant_id=actor.tenant_id,
+                        allowed_kbs = cls._resolve_allowed_kbs(actor, segment_id)
+                        retrieval = RetrievalPipeline.retrieve(
+                            actor=actor,
                             query=query,
-                            allowed_build_ids=allowed_builds,
-                            top_k=top_k,
+                            kb_ids=allowed_kbs or None,
+                            config_id=config_id,
+                            run_id=run_id,
+                            limit_override=top_k,
                         )
+                        hits = retrieval["hits"]
+                        warnings_list.extend(retrieval["warnings"])
 
                         tool_ev = []
                         now = datetime.now(timezone.utc)
                         with get_db_connection() as conn:
                             for h in hits:
                                 eid = f"E{len(evidence_list) + 1}"
+                                source_units = h.get("sourceUnits") or []
+                                unit_id = source_units[0].get("unitId") if source_units else None
                                 ev_item = {
                                     "evidenceId": eid,
-                                    "chunkId": h["chunkId"],
+                                    "kbId": h.get("kbId"),
                                     "documentId": h.get("documentId"),
+                                    "versionId": h.get("versionId"),
+                                    "buildId": h.get("buildId"),
+                                    "chunkId": h.get("chunkId"),
+                                    "parentChunkId": h.get("parentChunkId"),
+                                    "unitId": unit_id,
+                                    "location": source_units[0].get("location") if source_units else {},
+                                    "matchedText": h.get("matchedText"),
                                     "text": h["text"],
-                                    "score": round(h["score"], 6),
+                                    "score": round(float(h.get("score", 0.0)), 6),
+                                    "rerankScore": h.get("rerankScore"),
                                 }
                                 evidence_list.append(ev_item)
                                 evidence_map[eid] = h["text"]
@@ -223,11 +241,15 @@ class LangGraphAgent:
                                         id=str(uuid.uuid4()),
                                         run_id=run_id,
                                         document_id=h.get("documentId"),
-                                        build_id=allowed_builds[0] if allowed_builds else "",
-                                        unit_id=None,
+                                        build_id=h.get("buildId"),
+                                        unit_id=unit_id,
                                         evidence_id=eid,
                                         purpose="TOOL",
-                                        span_json={},
+                                        span_json={
+                                            "chunkId": h.get("chunkId"),
+                                            "parentChunkId": h.get("parentChunkId"),
+                                            "sourceUnits": source_units,
+                                        },
                                         payload_hash=hashlib.sha256(h["text"].encode("utf-8")).digest(),
                                         send_status="SENT",
                                         created_at=now,
@@ -310,7 +332,7 @@ class LangGraphAgent:
         }
 
     @classmethod
-    def _resolve_allowed_builds(cls, actor: Actor, segment_id: str) -> List[str]:
+    def _resolve_allowed_kbs(cls, actor: Actor, segment_id: str) -> List[str]:
         with get_db_connection() as conn:
             seg = conn.execute(
                 select(context_segment_table).where(
@@ -333,8 +355,7 @@ class LangGraphAgent:
                 ).fetchall()
                 allowed_kbs = [str(r.kb_id) for r in kb_rows]
 
-            from app.identity.deps import get_readable_builds
-            return get_readable_builds(conn, actor, allowed_kbs)
+            return allowed_kbs
 
     @classmethod
     def _read_section(
