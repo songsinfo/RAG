@@ -1,4 +1,5 @@
 from copy import deepcopy
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -6,6 +7,7 @@ from sqlalchemy import and_, select, update
 
 from app.db import get_db_connection
 from app.models import job_table
+from app.qa.runtime import AgentRuntimePolicy
 
 
 def load_agent_checkpoint(tenant_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -104,6 +106,9 @@ def resolve_agent_approval(
         runtime["state"] = state
         runtime["pendingApproval"] = None
         runtime["nextNode"] = "tools"
+        # Human approval time is outside the active execution budget. Resume
+        # with a fresh execution deadline while keeping the same turn/tool/token budgets.
+        runtime["deadlineEpoch"] = time.time() + AgentRuntimePolicy.from_env().overall_timeout_seconds
         runtime["updatedAt"] = now.isoformat()
         checkpoint["agentRuntime"] = runtime
 

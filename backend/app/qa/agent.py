@@ -15,7 +15,7 @@ from sqlalchemy import and_, select
 
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor, assert_hits_still_readable
+from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     context_segment_table,
     qa_run_table,
@@ -371,6 +371,8 @@ class LangGraphAgent:
         ctx = runtime.context
         actor = ctx.actor
         cls._guard_runtime(state, ctx)
+        with get_db_connection() as conn:
+            assert_hits_still_readable(conn, actor, state["evidence"])
 
         last_msg = state["messages"][-1]
         tool_calls = last_msg.get("tool_calls", [])
@@ -692,6 +694,7 @@ class LangGraphAgent:
         with get_db_connection() as conn:
             rows = conn.execute(
                 select(
+                    qa_run_table.c.id,
                     qa_run_table.c.question,
                     qa_run_table.c.result_json,
                 ).where(
@@ -702,11 +705,27 @@ class LangGraphAgent:
                         qa_run_table.c.id != current_run_id,
                         qa_run_table.c.status.in_(["SUCCEEDED", "COMPLETED"]),
                     )
-                ).order_by(qa_run_table.c.created_at.desc()).limit(max_turns)
+                ).order_by(qa_run_table.c.created_at.desc()).limit(max_turns * 2)
             ).fetchall()
 
+            visible_rows = []
+            for row in rows:
+                source_rows = conn.execute(
+                    select(run_source_table.c.document_id.distinct()).where(and_(
+                        run_source_table.c.tenant_id == actor.tenant_id,
+                        run_source_table.c.run_id == str(row.id),
+                    ))
+                ).fetchall()
+                if all(
+                    can_read_document(conn, actor, str(source.document_id))
+                    for source in source_rows
+                ):
+                    visible_rows.append(row)
+                if len(visible_rows) >= max_turns:
+                    break
+
         messages: List[Dict[str, Any]] = []
-        for row in reversed(rows):
+        for row in reversed(visible_rows):
             question = str(row.question or "")
             result = row.result_json or {}
             answer = str(result.get("answer") or "") if isinstance(result, dict) else ""
