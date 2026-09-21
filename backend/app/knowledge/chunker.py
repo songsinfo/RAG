@@ -1,154 +1,141 @@
 import hashlib
-import re
 import uuid
 from typing import Any, Dict, List, Tuple
 
 
-def _split_text(text: str, max_chars: int) -> List[Tuple[int, int, str]]:
-    """Split a single oversized source unit while preserving source offsets."""
-    if len(text) <= max_chars:
-        return [(0, len(text), text)]
-
-    parts: List[Tuple[int, int, str]] = []
-    start = 0
-    while start < len(text):
-        hard_end = min(len(text), start + max_chars)
-        end = hard_end
-        if hard_end < len(text):
-            window = text[start:hard_end]
-            # Prefer paragraph/sentence/whitespace boundaries in the back half.
-            min_break = max(1, max_chars // 2)
-            candidates = [
-                window.rfind("\n\n", min_break),
-                max(window.rfind("。", min_break), window.rfind("！", min_break), window.rfind("？", min_break)),
-                max(window.rfind(". ", min_break), window.rfind("! ", min_break), window.rfind("? ", min_break)),
-                window.rfind("\n", min_break),
-                window.rfind(" ", min_break),
-            ]
-            best = max(candidates)
-            if best > 0:
-                token_len = 2 if window[best:best + 2] in {"\n\n", ". ", "! ", "? "} else 1
-                end = start + best + token_len
-
-        piece = text[start:end]
-        if piece:
-            parts.append((start, end, piece))
-        start = end
-    return parts
+def _heading_key(item: Dict[str, Any]) -> Tuple[str, ...]:
+    headings = item.get("headings")
+    if not isinstance(headings, list):
+        return ()
+    return tuple(str(value).strip() for value in headings if str(value).strip())
 
 
-def chunk_units(
-    units: List[Dict[str, Any]],
-    max_parent_chars: int = 2000,
-    max_child_chars: int = 400,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _location(item: Dict[str, Any]) -> Dict[str, Any]:
+    location: Dict[str, Any] = {
+        "doclingChunkIndex": int(item.get("chunk_index") or 0),
+        "headings": list(_heading_key(item)),
+        "captions": list(item.get("captions") or []),
+        "docItems": list(item.get("doc_items") or []),
+        "pageNumbers": list(item.get("page_numbers") or []),
+    }
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        location["metadata"] = metadata
+    return location
+
+
+def adapt_docling_hybrid_chunks(
+    items: List[Dict[str, Any]],
+    *,
+    parent_max_tokens: int = 1200,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Adapt Docling HybridChunker output to the enterprise provenance schema.
+
+    HybridChunker owns all child splitting/token sizing. This adapter only groups
+    adjacent child chunks into larger retrieval parents and maps Docling metadata
+    into SourceUnit/ChunkSpan records.
     """
-    Structural parent-child chunking.
+    if not items:
+        return [], [], []
 
-    Parent sections preserve document structure. Child chunks are hard-bounded by
-    max_child_chars even when a single SourceUnit is larger than the target size.
-    Chunk spans retain source-unit offsets so evidence provenance stays exact.
-    """
+    units: List[Dict[str, Any]] = []
     chunks: List[Dict[str, Any]] = []
-    chunk_spans: List[Dict[str, Any]] = []
-    current_parent_units: List[Dict[str, Any]] = []
+    spans: List[Dict[str, Any]] = []
+
+    normalized: List[Dict[str, Any]] = []
+    for position, item in enumerate(items):
+        text = str(item.get("text") or "").strip()
+        raw_text = str(item.get("raw_text") or text).strip()
+        if not text:
+            continue
+        if not raw_text:
+            raw_text = text
+        unit_id = str(uuid.uuid4())
+        location = _location(item)
+        units.append(
+            {
+                "id": unit_id,
+                "unit_key": f"docling_chunk_{int(item.get('chunk_index') if item.get('chunk_index') is not None else position)}",
+                "kind": "TEXT",
+                "text_content": raw_text,
+                "location": location,
+                "content_hash": hashlib.sha256(raw_text.encode("utf-8")).digest(),
+            }
+        )
+        normalized.append(
+            {
+                "unit_id": unit_id,
+                "text": text,
+                "raw_text": raw_text,
+                "num_tokens": max(1, int(item.get("num_tokens") or max(1, len(text) // 4))),
+                "headings": _heading_key(item),
+                "location": location,
+            }
+        )
+
     parent_ordinal = 0
     child_ordinal = 0
+    group: List[Dict[str, Any]] = []
+    group_tokens = 0
+    group_heading: Tuple[str, ...] | None = None
 
-    def append_child(parent_id: str, text: str, spans: List[Dict[str, Any]]):
-        nonlocal child_ordinal
-        if not text:
+    def flush_group() -> None:
+        nonlocal parent_ordinal, child_ordinal, group, group_tokens, group_heading
+        if not group:
             return
-        child_ordinal += 1
-        child_id = str(uuid.uuid4())
-        chunks.append({
-            "id": child_id,
-            "parent_id": parent_id,
-            "kind": "CHILD",
-            "ordinal": child_ordinal,
-            "text_content": text,
-            "token_count": max(1, len(text) // 4),
-            "content_hash": hashlib.sha256(text.encode("utf-8")).digest(),
-        })
-        for ordinal, span in enumerate(spans, start=1):
-            chunk_spans.append({
-                **span,
-                "chunk_id": child_id,
-                "ordinal": ordinal,
-            })
-
-    def flush_parent_and_children(parent_units: List[Dict[str, Any]]):
-        nonlocal parent_ordinal
-        if not parent_units:
-            return
-
         parent_ordinal += 1
         parent_id = str(uuid.uuid4())
-        combined_text = "\n\n".join(u["text_content"] for u in parent_units)
-        chunks.append({
-            "id": parent_id,
-            "parent_id": None,
-            "kind": "PARENT",
-            "ordinal": parent_ordinal,
-            "text_content": combined_text,
-            "token_count": max(1, len(combined_text) // 4),
-            "content_hash": hashlib.sha256(combined_text.encode("utf-8")).digest(),
-        })
-
-        child_text = ""
-        child_spans: List[Dict[str, Any]] = []
-
-        for unit in parent_units:
-            unit_text = str(unit["text_content"])
-            unit_id = unit["id"]
-
-            for source_start, source_end, fragment in _split_text(unit_text, max_child_chars):
-                separator = "\n" if child_text else ""
-                proposed_len = len(child_text) + len(separator) + len(fragment)
-                if child_text and proposed_len > max_child_chars:
-                    append_child(parent_id, child_text, child_spans)
-                    child_text = ""
-                    child_spans = []
-                    separator = ""
-
-                # Oversized fragments are already hard-bounded by _split_text.
-                if separator:
-                    child_text += separator
-                child_text += fragment
-                child_spans.append({
-                    "id": str(uuid.uuid4()),
-                    "unit_id": unit_id,
-                    "start_cp": source_start,
-                    "end_cp": source_end,
-                    "location": unit.get("location"),
-                })
-
-                if len(child_text) >= max_child_chars:
-                    append_child(parent_id, child_text, child_spans)
-                    child_text = ""
-                    child_spans = []
-
-        append_child(parent_id, child_text, child_spans)
-
-    current_parent_len = 0
-    for unit in units:
-        is_major_heading = (
-            unit["kind"] == "HEADING"
-            and unit.get("location", {}).get("level", 1) <= 2
+        parent_text = "\n\n".join(item["text"] for item in group)
+        chunks.append(
+            {
+                "id": parent_id,
+                "parent_id": None,
+                "kind": "PARENT",
+                "ordinal": parent_ordinal,
+                "text_content": parent_text,
+                "token_count": sum(item["num_tokens"] for item in group),
+                "content_hash": hashlib.sha256(parent_text.encode("utf-8")).digest(),
+            }
         )
-        unit_len = len(unit["text_content"])
+        for item in group:
+            child_ordinal += 1
+            child_id = str(uuid.uuid4())
+            chunks.append(
+                {
+                    "id": child_id,
+                    "parent_id": parent_id,
+                    "kind": "CHILD",
+                    "ordinal": child_ordinal,
+                    "text_content": item["text"],
+                    "token_count": item["num_tokens"],
+                    "content_hash": hashlib.sha256(item["text"].encode("utf-8")).digest(),
+                }
+            )
+            spans.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "chunk_id": child_id,
+                    "unit_id": item["unit_id"],
+                    "ordinal": 1,
+                    "start_cp": 0,
+                    "end_cp": len(item["raw_text"]),
+                    "location": item["location"],
+                }
+            )
+        group = []
+        group_tokens = 0
+        group_heading = None
 
-        if is_major_heading and current_parent_units:
-            flush_parent_and_children(current_parent_units)
-            current_parent_units = [unit]
-            current_parent_len = unit_len
-        elif current_parent_len + unit_len > max_parent_chars and current_parent_units:
-            flush_parent_and_children(current_parent_units)
-            current_parent_units = [unit]
-            current_parent_len = unit_len
-        else:
-            current_parent_units.append(unit)
-            current_parent_len += unit_len
+    for item in normalized:
+        heading = item["headings"]
+        would_exceed = bool(group) and group_tokens + item["num_tokens"] > parent_max_tokens
+        heading_changed = bool(group) and heading != group_heading
+        if would_exceed or heading_changed:
+            flush_group()
+        if not group:
+            group_heading = heading
+        group.append(item)
+        group_tokens += item["num_tokens"]
+    flush_group()
 
-    flush_parent_and_children(current_parent_units)
-    return chunks, chunk_spans
+    return units, chunks, spans
