@@ -52,8 +52,6 @@ class QaService:
                 )
             )
             with get_db_connection() as conn:
-                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
-                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(and_(
@@ -669,6 +667,8 @@ class QaService:
         now = datetime.now(timezone.utc)
         try:
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(
