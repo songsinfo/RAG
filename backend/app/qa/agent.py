@@ -230,6 +230,9 @@ class LangGraphAgent:
             "AGENT_RUNTIME",
             {
                 "deadlineEpoch": deadline_epoch,
+                "maxRounds": policy.max_rounds,
+                "maxToolCalls": policy.max_tool_calls,
+                "repeatCallLimit": policy.repeated_call_limit,
                 "maxContextTokens": policy.max_context_tokens,
                 "maxTotalTokens": policy.max_total_tokens,
                 "maxModelCalls": policy.max_model_calls,
@@ -281,7 +284,7 @@ class LangGraphAgent:
         ctx = runtime.context
         actor = ctx.actor
         usage = cls._guard_runtime(state, ctx)
-        if state["round"] >= 6:
+        if state["round"] >= ctx.policy.max_rounds:
             raise ApiException(429, "BUDGET_EXCEEDED", "Agent 主循环次数已耗尽")
 
         messages, trim_info = compact_messages(
@@ -310,18 +313,13 @@ class LangGraphAgent:
             assert_hits_still_readable(conn, actor, state["evidence"])
 
         with agent_span("agent.model", {"agent.round": state["round"] + 1}):
-            reply = retry_call(
-                "llm:agent",
-                lambda: ModelGateway.chat_tools(
-                    tenant_id=actor.tenant_id,
-                    run_id=ctx.run_id,
-                    purpose="AGENT",
-                    messages=messages,
-                    tools=AGENT_TOOLS,
-                    max_tokens=1200,
-                    deadline_epoch=ctx.deadline_epoch,
-                ),
-                policy=ctx.policy,
+            reply = ModelGateway.chat_tools(
+                tenant_id=actor.tenant_id,
+                run_id=ctx.run_id,
+                purpose="AGENT",
+                messages=messages,
+                tools=AGENT_TOOLS,
+                max_tokens=1200,
                 deadline_epoch=ctx.deadline_epoch,
             )
 
@@ -395,14 +393,14 @@ class LangGraphAgent:
         for tc in tool_calls:
             cls._guard_runtime(state, ctx)
             calls_count += 1
-            if calls_count > 8:
+            if calls_count > ctx.policy.max_tool_calls:
                 raise ApiException(429, "BUDGET_EXCEEDED", "工具调用次数已耗尽")
 
             name, args = cls._tool_call_parts(tc)
             call_id = str(tc.get("id") or f"call-{calls_count}")
             sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
             repeated_map[sig] = repeated_map.get(sig, 0) + 1
-            if repeated_map[sig] >= 3:
+            if repeated_map[sig] >= ctx.policy.repeated_call_limit:
                 raise ApiException(409, "REPEATED_CALLS", "重复工具调用已终止")
 
             if name in ctx.policy.approval_tools and call_id not in approved:

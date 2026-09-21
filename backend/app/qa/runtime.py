@@ -20,6 +20,9 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class AgentRuntimePolicy:
     overall_timeout_seconds: int = 120
+    max_rounds: int = 6
+    max_tool_calls: int = 8
+    repeated_call_limit: int = 3
     max_context_tokens: int = 20000
     max_total_tokens: int = 50000
     max_model_calls: int = 12
@@ -38,6 +41,9 @@ class AgentRuntimePolicy:
         )
         return cls(
             overall_timeout_seconds=max(5, int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))),
+            max_rounds=max(1, int(os.getenv("AGENT_MAX_ROUNDS", "6"))),
+            max_tool_calls=max(1, int(os.getenv("AGENT_MAX_TOOL_CALLS", "8"))),
+            repeated_call_limit=max(2, int(os.getenv("AGENT_REPEAT_CALL_LIMIT", "3"))),
             max_context_tokens=max(1000, int(os.getenv("AGENT_MAX_CONTEXT_TOKENS", "20000"))),
             max_total_tokens=max(1000, int(os.getenv("AGENT_MAX_TOTAL_TOKENS", "50000"))),
             max_model_calls=max(1, int(os.getenv("AGENT_MAX_MODEL_CALLS", "12"))),

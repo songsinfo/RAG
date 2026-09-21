@@ -11,7 +11,7 @@ from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
 from app.qa.model_clients import get_chat_model, get_http_client
-from app.qa.runtime import AgentRuntimePolicy, retry_call
+from app.qa.runtime import AgentRuntimePolicy, estimate_tokens, retry_call
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,10 @@ class ModelGateway:
                 token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
                 input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
                 output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
+                if input_tokens <= 0:
+                    input_tokens = estimate_tokens(messages)
+                if output_tokens <= 0:
+                    output_tokens = estimate_tokens(content)
 
                 cls._record_call(
                     tenant_id=tenant_id,
@@ -310,6 +314,10 @@ class ModelGateway:
                 token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
                 input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
                 output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
+                if input_tokens <= 0:
+                    input_tokens = estimate_tokens(messages)
+                if output_tokens <= 0:
+                    output_tokens = estimate_tokens(response.content or "") + estimate_tokens(formatted_calls)
                 cls._record_call(
                     tenant_id,
                     call_id,

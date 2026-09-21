@@ -34,6 +34,8 @@ from app.models import (
     eval_run_table,
     eval_result_table,
     eval_review_table,
+    run_event_table,
+    model_call_table,
 )
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
@@ -474,10 +476,16 @@ class EvaluationRunner:
                     )
                     qa_run_id = submitted["runId"]
 
-                    # Wait for completion (bounded poll up to 30s)
+                    # Wait for completion. Agent runs have an explicit runtime deadline,
+                    # so evaluation waits slightly longer than that deadline.
+                    poll_limit = (
+                        float(os.getenv("AGENT_TIMEOUT_SECONDS", "120")) + 10.0
+                        if mode == "AGENT"
+                        else 30.0
+                    )
                     poll_start = time.time()
                     qa_detail = QaService.get_run(persona_actor, qa_run_id)
-                    while qa_detail.get("status") in {"QUEUED", "RUNNING"} and (time.time() - poll_start) < 30.0:
+                    while qa_detail.get("status") in {"QUEUED", "RUNNING", "WAITING_APPROVAL"} and (time.time() - poll_start) < poll_limit:
                         time.sleep(0.5)
                         qa_detail = QaService.get_run(persona_actor, qa_run_id)
 

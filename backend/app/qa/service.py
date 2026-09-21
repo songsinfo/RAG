@@ -47,7 +47,7 @@ class QaService:
                     job_table.c.tenant_id == qa_run_table.c.tenant_id,
                     job_table.c.target_id == qa_run_table.c.id,
                     job_table.c.kind == "QA_RUN",
-                    job_table.c.status.in_(["QUEUED", "RUNNING"]),
+                    job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
                 )
             )
             with get_db_connection() as conn:
