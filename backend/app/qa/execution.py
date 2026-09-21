@@ -7,12 +7,7 @@ from sqlalchemy import and_, select
 
 from app.models import job_table
 
-
-_execution_lease: ContextVar[Optional[Tuple[str, int]]] = ContextVar(
-    "qa_execution_lease",
-    default=None,
-)
-
+_execution_lease: ContextVar[Optional[Tuple[str, int]]] = ContextVar("qa_execution_lease", default=None)
 
 @contextmanager
 def qa_execution_scope(job_id: Optional[str], lease_epoch: Optional[int]) -> Iterator[None]:
@@ -25,17 +20,10 @@ def qa_execution_scope(job_id: Optional[str], lease_epoch: Optional[int]) -> Ite
     finally:
         _execution_lease.reset(token)
 
-
 def current_qa_execution() -> Optional[Tuple[str, int]]:
     return _execution_lease.get()
 
-
 def qa_lease_is_current(conn, tenant_id: str, run_id: str) -> bool:
-    """Fence QA side effects with the current durable lease.
-
-    The job row is locked in the caller's transaction, so a replacement claim
-    cannot race between this ownership check and the protected writes.
-    """
     current = current_qa_execution()
     if current is None:
         return True

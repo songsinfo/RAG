@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["feat/enterprise-rag-retrieval", "feat/langchain-v1-performance"]
+    branches: ["feat/enterprise-rag-retrieval", "feat/langchain-v1-performance", "feat/agent-runtime-hardening"]
   pull_request:
     branches: ["feat/python-migration"]
 
@@ -26,7 +26,7 @@ jobs:
       - name: Stack review regressions
         env:
           REVIEW_ROOT: ${{ github.workspace }}
-        run: python -m pytest ../docs/reviews/pr-stack-20260921/test_stack_review.py -q -p no:cacheprovider --tb=short -k "restore or production or takeover"
+        run: python -m pytest ../docs/reviews/pr-stack-20260921/test_stack_review.py -q -p no:cacheprovider --tb=short
       - name: Late-worker lease regression
         env:
           REVIEW_ROOT: ${{ github.workspace }}

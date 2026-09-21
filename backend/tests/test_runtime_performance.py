@@ -53,3 +53,17 @@ def test_langchain_v1_chat_model_and_tool_binding(monkeypatch):
     assert model is not None
     bound = model.bind_tools(AGENT_TOOLS, strict=True)
     assert bound is not None
+
+
+def test_agent_runtime_policy_is_configurable(monkeypatch):
+    from app.qa.runtime import AgentRuntimePolicy
+
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("AGENT_MAX_ROUNDS", "4")
+    monkeypatch.setenv("AGENT_MAX_TOOL_CALLS", "5")
+    monkeypatch.setenv("AGENT_MAX_CONTEXT_TOKENS", "9000")
+    policy = AgentRuntimePolicy.from_env()
+    assert policy.overall_timeout_seconds == 45
+    assert policy.max_rounds == 4
+    assert policy.max_tool_calls == 5
+    assert policy.max_context_tokens == 9000

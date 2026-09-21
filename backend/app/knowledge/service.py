@@ -1466,6 +1466,29 @@ class KnowledgeService:
                         result_json=None,
                         status="CANCELLED",
                         terminal_reason="SOURCE_PURGED",
+                        cancel_requested_at=now,
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                )
+                # Permanent deletion also destroys any Agent checkpoint/HITL payload.
+                # Bump the lease epoch and cancel the durable job so a stale worker
+                # cannot write the checkpoint back after this transaction commits.
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                    ))
+                    .values(
+                        status="CANCELLED",
+                        stage="FINISHED",
+                        lease_epoch=job_table.c.lease_epoch + 1,
+                        lease_until=None,
+                        checkpoint=None,
+                        error_code="SOURCE_PURGED",
+                        cancel_requested_at=now,
                         updated_at=now,
                     )
                 )

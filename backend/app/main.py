@@ -15,6 +15,9 @@ from app.models import tenant_table, app_user_table, user_group_table, group_mem
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.telemetry import configure_telemetry
+    configure_telemetry()
+
     # Startup: ensure DB connection is reachable and seed database
     try:
         with get_db_connection() as conn:
@@ -46,6 +49,7 @@ async def lifespan(app: FastAPI):
     worker_threads = []
     if not is_test_env() and settings.RAG_EMBEDDED_WORKER:
         from app.runtime.worker import DurableJobWorker
+
         pools = [
             ("qa", {"QA_RUN"}, max(1, settings.RAG_QA_WORKERS)),
             ("ingest", {"INGEST", "PURGE"}, max(1, settings.RAG_INGEST_WORKERS)),
@@ -53,7 +57,10 @@ async def lifespan(app: FastAPI):
         ]
         for pool_name, kinds, count in pools:
             for index in range(count):
-                worker = DurableJobWorker(worker_id=f"embedded-{pool_name}-{index}", kinds=kinds)
+                worker = DurableJobWorker(
+                    worker_id=f"embedded-{pool_name}-{index}",
+                    kinds=kinds,
+                )
                 thread = threading.Thread(
                     target=worker.run_forever,
                     name=f"rag-worker-{pool_name}-{index}",

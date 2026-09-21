@@ -34,6 +34,8 @@ from app.models import (
     eval_run_table,
     eval_result_table,
     eval_review_table,
+    run_event_table,
+    model_call_table,
 )
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
@@ -474,10 +476,16 @@ class EvaluationRunner:
                     )
                     qa_run_id = submitted["runId"]
 
-                    # Wait for completion (bounded poll up to 30s)
+                    # Wait for completion. Agent runs have an explicit runtime deadline,
+                    # so evaluation waits slightly longer than that deadline.
+                    poll_limit = (
+                        float(os.getenv("AGENT_TIMEOUT_SECONDS", "120")) + 10.0
+                        if mode == "AGENT"
+                        else 30.0
+                    )
                     poll_start = time.time()
                     qa_detail = QaService.get_run(persona_actor, qa_run_id)
-                    while qa_detail.get("status") in {"QUEUED", "RUNNING"} and (time.time() - poll_start) < 30.0:
+                    while qa_detail.get("status") in {"QUEUED", "RUNNING", "WAITING_APPROVAL"} and (time.time() - poll_start) < poll_limit:
                         time.sleep(0.5)
                         qa_detail = QaService.get_run(persona_actor, qa_run_id)
 
@@ -515,6 +523,56 @@ class EvaluationRunner:
                     metrics["correctness"] = correctness
                     metrics["taskSuccess"] = is_terminal_success and status_matches and correctness == "CORRECT"
                     metrics["costCny"] = 0.01
+
+                    if mode == "AGENT":
+                        with get_db_connection() as conn:
+                            event_rows = conn.execute(
+                                select(run_event_table.c.stage, run_event_table.c.payload).where(and_(
+                                    run_event_table.c.tenant_id == actor.tenant_id,
+                                    run_event_table.c.run_id == qa_run_id,
+                                ))
+                            ).fetchall()
+                            call_rows = conn.execute(
+                                select(
+                                    model_call_table.c.input_tokens,
+                                    model_call_table.c.output_tokens,
+                                    model_call_table.c.status,
+                                ).where(and_(
+                                    model_call_table.c.tenant_id == actor.tenant_id,
+                                    model_call_table.c.run_id == qa_run_id,
+                                ))
+                            ).fetchall()
+
+                        tool_events = [e for e in event_rows if str(e.stage) == "AGENT_TOOL"]
+                        model_events = [e for e in event_rows if str(e.stage) == "AGENT_MODEL"]
+                        trim_events = [e for e in event_rows if str(e.stage) == "AGENT_CONTEXT_TRIMMED"]
+                        approval_events = [e for e in event_rows if str(e.stage) == "AGENT_APPROVAL_REQUIRED"]
+                        tool_names = [
+                            str((e.payload or {}).get("name") or "")
+                            for e in tool_events
+                            if (e.payload or {}).get("name")
+                        ]
+                        expected_tools = expected_obj.get("tools") if isinstance(expected_obj.get("tools"), list) else []
+                        expected_tools = [str(x) for x in expected_tools]
+                        tool_accuracy = None
+                        if expected_tools:
+                            expected_set = set(expected_tools)
+                            actual_set = set(tool_names)
+                            tool_accuracy = len(expected_set & actual_set) / len(expected_set)
+
+                        metrics["agentTrajectory"] = {
+                            "turns": len(model_events),
+                            "toolCalls": len(tool_events),
+                            "uniqueTools": sorted(set(tool_names)),
+                            "toolSelectionAccuracy": tool_accuracy,
+                            "contextTrimEvents": len(trim_events),
+                            "approvalInterrupts": len(approval_events),
+                            "modelCalls": len(call_rows),
+                            "inputTokens": sum(int(c.input_tokens or 0) for c in call_rows),
+                            "outputTokens": sum(int(c.output_tokens or 0) for c in call_rows),
+                            "failedModelCalls": sum(1 for c in call_rows if str(c.status) == "FAILED"),
+                            "timeout": status_str == "FAILED" and qa_detail.get("terminalReason") == "AGENT_TIMEOUT",
+                        }
 
                     final_status = "COMPLETED" if is_terminal_success else "FAILED"
                     EvaluationRunner._update_result(
@@ -719,6 +777,12 @@ class EvaluationRunner:
         retrieval_n = 0
         ndcg_n = 0
         durations: List[float] = []
+        agent_cases = 0
+        agent_turns = 0
+        agent_tool_calls = 0
+        agent_input_tokens = 0
+        agent_output_tokens = 0
+        agent_timeouts = 0
 
         for r in rows:
             m = obj(r.metrics_json)
@@ -734,6 +798,14 @@ class EvaluationRunner:
             if isinstance(m.get("ndcg"), (int, float)):
                 ndcg_n += 1
                 ndcg_sum += float(m["ndcg"])
+            trajectory = m.get("agentTrajectory")
+            if isinstance(trajectory, dict):
+                agent_cases += 1
+                agent_turns += int(trajectory.get("turns") or 0)
+                agent_tool_calls += int(trajectory.get("toolCalls") or 0)
+                agent_input_tokens += int(trajectory.get("inputTokens") or 0)
+                agent_output_tokens += int(trajectory.get("outputTokens") or 0)
+                agent_timeouts += 1 if trajectory.get("timeout") else 0
 
         p50 = EvaluationMetrics.percentile(durations, 0.5) if durations else None
         p95 = EvaluationMetrics.percentile(durations, 0.95) if durations else None
@@ -753,6 +825,11 @@ class EvaluationRunner:
             "observedP50Ms": round(p50, 2) if p50 is not None else None,
             "observedP95Ms": round(p95, 2) if p95 is not None else None,
             "knownCostCny": 0.0,
+            "agentCases": agent_cases,
+            "avgAgentTurns": (agent_turns / agent_cases) if agent_cases else None,
+            "avgAgentToolCalls": (agent_tool_calls / agent_cases) if agent_cases else None,
+            "avgAgentTokens": ((agent_input_tokens + agent_output_tokens) / agent_cases) if agent_cases else None,
+            "agentTimeoutRate": (agent_timeouts / agent_cases) if agent_cases else None,
         }
 
     @staticmethod

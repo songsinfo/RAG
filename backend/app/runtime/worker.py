@@ -9,7 +9,8 @@ from sqlalchemy import and_, or_, select, update
 
 from app.db import get_db_connection
 from app.knowledge.artifacts import read_artifact
-from app.models import app_user_table, deletion_record_table, job_table
+from app.models import app_user_table, deletion_record_table, job_table, qa_run_table
+from app.qa.runtime import is_retryable_job_code
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +210,12 @@ class DurableJobWorker:
     def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
         with get_db_connection() as conn:
             row = conn.execute(
-                select(job_table.c.status, job_table.c.attempt, job_table.c.lease_epoch).where(and_(
+                select(
+                    job_table.c.status,
+                    job_table.c.attempt,
+                    job_table.c.lease_epoch,
+                    job_table.c.error_code,
+                ).where(and_(
                     job_table.c.tenant_id == job["tenant_id"],
                     job_table.c.id == job["id"],
                 ))
@@ -217,6 +223,8 @@ class DurableJobWorker:
             if not row or str(row.status) != "FAILED":
                 return
             if int(row.attempt or 0) >= self.max_attempts:
+                return
+            if not is_retryable_job_code(str(row.error_code or "")):
                 return
             if int(row.lease_epoch or 0) != int(job.get("lease_epoch") or 0):
                 return
@@ -237,6 +245,22 @@ class DurableJobWorker:
                     updated_at=now,
                 )
             )
+            if job.get("kind") == "QA_RUN":
+                conn.execute(
+                    update(qa_run_table)
+                    .where(and_(
+                        qa_run_table.c.tenant_id == job["tenant_id"],
+                        qa_run_table.c.id == job["target_id"],
+                        qa_run_table.c.status == "FAILED",
+                    ))
+                    .values(
+                        status="QUEUED",
+                        stage="ROUTING",
+                        terminal_reason=None,
+                        finished_at=None,
+                        updated_at=now,
+                    )
+                )
             conn.commit()
 
     def _fail(self, job: Dict[str, Any], code: str):
