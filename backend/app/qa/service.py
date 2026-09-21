@@ -576,7 +576,8 @@ class QaService:
                 checkpoint = dict(job_row.checkpoint or {}) if job_row and job_row.checkpoint else {}
                 has_agent_checkpoint = (
                     str(row.mode) == "AGENT"
-                    and isinstance(checkpoint.get("agentRuntime"), dict)
+                    and isinstance(checkpoint.get("langgraph"), dict)
+                    and bool(checkpoint.get("langgraph", {}).get("checkpoints"))
                 )
                 if not has_agent_checkpoint:
                     conn.execute(delete(run_source_table).where(and_(
@@ -964,7 +965,7 @@ class QaService:
 
     @staticmethod
     def resolve_tool_approval(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        from app.qa.checkpoint import resolve_agent_approval
+        from app.qa.agent import LangGraphAgent
 
         tool_call_id = str(body.get("toolCallId") or "").strip()
         decision = str(body.get("decision") or "").strip().upper()
@@ -985,14 +986,7 @@ class QaService:
             if str(run.status) != "WAITING_APPROVAL":
                 raise ApiException(409, "RUN_NOT_WAITING_APPROVAL", "当前运行不在等待审批状态")
 
-        ok = resolve_agent_approval(
-            actor.tenant_id,
-            run_id,
-            tool_call_id,
-            approved=(decision == "APPROVE"),
-        )
-        if not ok:
-            raise ApiException(409, "APPROVAL_NOT_FOUND", "待审批工具调用不存在或已变化")
+        LangGraphAgent.queue_resume(actor, run_id, tool_call_id, decision)
 
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
