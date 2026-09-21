@@ -43,14 +43,14 @@ _eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
-    """Verify that pure retrieval mode does not configure LLM features."""
+    """Validate RETRIEVAL_ONLY: no generative query transformation or answer model."""
     retrieval = config.get("retrieval", {}) if isinstance(config.get("retrieval"), dict) else {}
-    mode = retrieval.get("mode", "BM25")
+    mode = str(retrieval.get("mode", "HYBRID")).upper()
+    if mode not in {"DENSE", "BM25", "HYBRID", "SPARSE", "LEXICAL"}:
+        raise ApiException(409, "INVALID_CONFIG", "RETRIEVAL_ONLY 检索模式无效")
     query = config.get("query", {}) if isinstance(config.get("query"), dict) else {}
-    post = config.get("post", {}) if isinstance(config.get("post"), dict) else {}
-
-    if mode != "BM25" or query.get("rewrite") or query.get("hyde") or query.get("multiQuery") or post.get("rerank") or post.get("mmr"):
-        raise ApiException(409, "MODEL_REQUIRED", "无模型评估只运行原查询BM25，可选父段扩展")
+    if query.get("rewrite") or query.get("hyde") or query.get("multiQuery"):
+        raise ApiException(409, "MODEL_REQUIRED", "RETRIEVAL_ONLY 不执行生成式 Query Rewrite/HyDE/MultiQuery")
 
 
 def number(v: Any) -> float:
@@ -144,7 +144,7 @@ class EvaluationRunner:
 
             if mode == "RETRIEVAL_ONLY":
                 ceiling = 0.0
-                cost_status = "NO_MODEL_CALLS"
+                cost_status = "RETRIEVAL_PIPELINE"
             else:
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats

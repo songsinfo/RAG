@@ -22,6 +22,7 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m compileall -q app tests
       - run: python -m pytest -q
+      - run: python -m pytest ../docs/reviews/pr-1/test_review.py -q -p no:cacheprovider --tb=short
 
   frontend:
     runs-on: ubuntu-latest

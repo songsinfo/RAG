@@ -15,10 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 class DurableJobWorker:
-    def __init__(self, worker_id: Optional[str] = None, lease_seconds: int = 120, poll_seconds: float = 1.0):
+    def __init__(
+        self,
+        worker_id: Optional[str] = None,
+        lease_seconds: int = 120,
+        poll_seconds: float = 1.0,
+        max_attempts: int = 3,
+    ):
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
+        self.max_attempts = max_attempts
         self._stop = threading.Event()
 
     def stop(self):
@@ -60,6 +67,7 @@ class DurableJobWorker:
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
+        self._requeue_failed_if_retryable(job)
         return True
 
     def _claim_one(self) -> Optional[Dict[str, Any]]:
@@ -132,6 +140,39 @@ class DurableJobWorker:
             str(job["tenant_id"]), str(job["target_id"]), str(job["id"]), str(cp["deletionRecordId"]),
             lease_epoch=int(job["lease_epoch"]),
         )
+
+    def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(job_table.c.status, job_table.c.attempt, job_table.c.lease_epoch).where(and_(
+                    job_table.c.tenant_id == job["tenant_id"],
+                    job_table.c.id == job["id"],
+                ))
+            ).first()
+            if not row or str(row.status) != "FAILED":
+                return
+            if int(row.attempt or 0) >= self.max_attempts:
+                return
+            if int(row.lease_epoch or 0) != int(job.get("lease_epoch") or 0):
+                return
+            delay_seconds = min(60, 2 ** max(0, int(row.attempt or 1) - 1))
+            now = datetime.now(timezone.utc)
+            conn.execute(
+                update(job_table)
+                .where(and_(
+                    job_table.c.tenant_id == job["tenant_id"],
+                    job_table.c.id == job["id"],
+                    job_table.c.status == "FAILED",
+                    job_table.c.lease_epoch == job["lease_epoch"],
+                ))
+                .values(
+                    status="QUEUED",
+                    available_at=now + timedelta(seconds=delay_seconds),
+                    lease_until=None,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
 
     def _fail(self, job: Dict[str, Any], code: str):
         now = datetime.now(timezone.utc)
