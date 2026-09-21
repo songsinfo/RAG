@@ -257,6 +257,10 @@ class LangGraphAgent:
                 graph_input,
                 context=context,
                 config=graph_config,
+                # Persist before advancing to the next node. This is also the
+                # correct durability choice for HITL and avoids concurrent
+                # checkpoint writes racing application DB writes.
+                durability="sync",
             )
 
         snapshot = graph.get_state(graph_config)
