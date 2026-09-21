@@ -66,18 +66,33 @@ def test_revoked_hits_must_not_reach_reranker(monkeypatch, tmp_path):
 def test_expired_lease_restart_is_idempotent(monkeypatch, tmp_path):
     doc = queue_document(monkeypatch, tmp_path)
     with db.engine.begin() as conn:
-        # Match the production constraint in docs/design/schema.sql:246.
+        # Match the production uniqueness rule and simulate a process dying
+        # after SourceUnit persistence but before chunk/index completion.
         conn.execute(text("CREATE UNIQUE INDEX uq_unit_key ON source_unit(tenant_id, build_id, unit_key)"))
     worker = DurableJobWorker()
     job = worker._claim_one()
-    with monkeypatch.context() as patch:
-        def crash(*args):
-            raise SystemExit("simulate process death after source-unit commit")
-        patch.setattr(service, "chunk_units", crash)
-        with pytest.raises(SystemExit):
-            worker._run_ingest(job)
+    build_id = str(job["checkpoint"]["buildId"])
     with db.engine.begin() as conn:
-        conn.execute(update(job_table).values(lease_until=datetime.now(timezone.utc)-timedelta(seconds=1)))
+        conn.execute(source_unit_table.insert().values(
+            tenant_id=ACTOR.tenant_id,
+            id="partial-unit",
+            build_id=build_id,
+            document_id=doc["documentId"],
+            unit_key="docling_chunk_0",
+            kind="TEXT",
+            text_content="partial stale attempt",
+            location={},
+            machine_generated=False,
+            artifact_id=None,
+            content_hash=b"x" * 32,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        ))
+        conn.execute(
+            update(job_table)
+            .where(job_table.c.id == job["id"])
+            .values(lease_until=datetime.now(timezone.utc)-timedelta(seconds=1))
+        )
     recovered = worker._claim_one()
     assert recovered["lease_epoch"] == 2
     worker._run_ingest(recovered)
@@ -89,12 +104,12 @@ def test_old_worker_cannot_publish_after_lease_loss(monkeypatch, tmp_path):
     doc = queue_document(monkeypatch, tmp_path)
     worker = DurableJobWorker()
     old_job = worker._claim_one()
-    original_parse = service.parse_document
+    original_parse = service.parse_and_chunk_document
     def lose_lease(*args):
         with db.engine.begin() as conn:
             conn.execute(update(job_table).values(lease_epoch=2))
         return original_parse(*args)
-    monkeypatch.setattr(service, "parse_document", lose_lease)
+    monkeypatch.setattr(service, "parse_and_chunk_document", lose_lease)
     worker._run_ingest(old_job)
     with db.engine.connect() as conn:
         active = conn.execute(select(document_table.c.active_build_id)).scalar_one()
