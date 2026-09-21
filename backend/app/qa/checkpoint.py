@@ -8,6 +8,7 @@ from sqlalchemy import and_, select, update
 from app.db import get_db_connection
 from app.models import job_table
 from app.qa.runtime import AgentRuntimePolicy
+from app.qa.execution import current_qa_execution
 
 
 def load_agent_checkpoint(tenant_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -36,18 +37,27 @@ def save_agent_checkpoint(
     pending_approval: Optional[Dict[str, Any]] = None,
 ) -> None:
     now = datetime.now(timezone.utc)
+    current = current_qa_execution()
     with get_db_connection() as conn:
+        clauses = [
+            job_table.c.tenant_id == tenant_id,
+            job_table.c.kind == "QA_RUN",
+            job_table.c.target_id == run_id,
+            job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
+        ]
+        if current is not None:
+            job_id, lease_epoch = current
+            clauses.extend([
+                job_table.c.id == job_id,
+                job_table.c.status == "RUNNING",
+                job_table.c.lease_epoch == lease_epoch,
+            ])
         row = conn.execute(
-            select(job_table.c.id, job_table.c.checkpoint).where(
-                and_(
-                    job_table.c.tenant_id == tenant_id,
-                    job_table.c.kind == "QA_RUN",
-                    job_table.c.target_id == run_id,
-                )
-            )
+            select(job_table.c.id, job_table.c.checkpoint).where(and_(*clauses))
         ).first()
         if not row:
             return
+
         checkpoint = dict(row.checkpoint or {})
         checkpoint["agentRuntime"] = {
             "version": 1,
@@ -57,18 +67,15 @@ def save_agent_checkpoint(
             "pendingApproval": deepcopy(pending_approval),
             "updatedAt": now.isoformat(),
         }
-        conn.execute(
+        result = conn.execute(
             update(job_table)
-            .where(
-                and_(
-                    job_table.c.tenant_id == tenant_id,
-                    job_table.c.id == row.id,
-                )
-            )
+            .where(and_(*clauses, job_table.c.id == row.id))
             .values(checkpoint=checkpoint, updated_at=now)
         )
-        conn.commit()
-
+        if result.rowcount == 1:
+            conn.commit()
+        else:
+            conn.rollback()
 
 def resolve_agent_approval(
     tenant_id: str,
@@ -84,6 +91,7 @@ def resolve_agent_approval(
                     job_table.c.tenant_id == tenant_id,
                     job_table.c.kind == "QA_RUN",
                     job_table.c.target_id == run_id,
+                    job_table.c.status == "WAITING_APPROVAL",
                 )
             )
         ).first()
@@ -114,7 +122,11 @@ def resolve_agent_approval(
 
         conn.execute(
             update(job_table)
-            .where(and_(job_table.c.tenant_id == tenant_id, job_table.c.id == row.id))
+            .where(and_(
+                job_table.c.tenant_id == tenant_id,
+                job_table.c.id == row.id,
+                job_table.c.status == "WAITING_APPROVAL",
+            ))
             .values(
                 checkpoint=checkpoint,
                 status="QUEUED",
