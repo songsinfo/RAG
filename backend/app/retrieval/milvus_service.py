@@ -95,6 +95,7 @@ class MilvusHybridService:
             norm = normalize_terms(chunk["text_content"])
             record = {
                 "id": f"{tenant_id}:{build_id}:{chunk_id}",
+                "parent_id": str(chunk.get("parent_id") or ""),
                 "tenant_id": tenant_id,
                 "kb_id": kb_id,
                 "document_id": doc_id,
@@ -163,10 +164,25 @@ class MilvusHybridService:
         tenant_id: str,
         query: str,
         allowed_build_ids: List[str],
-        top_k: int = 10,
+        top_k: Optional[int] = None,
+        dense_top_k: Optional[int] = None,
+        sparse_top_k: Optional[int] = None,
+        fusion_top_k: Optional[int] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
+
+        # top_k is kept for backward compatibility with callers/tests. The
+        # production pipeline passes the explicit candidate/fusion limits from
+        # the immutable Retrieval Config.
+        if top_k is not None:
+            dense_top_k = dense_top_k or top_k * 2
+            sparse_top_k = sparse_top_k or top_k * 2
+            fusion_top_k = fusion_top_k or top_k
+        dense_top_k = dense_top_k or 30
+        sparse_top_k = sparse_top_k or 30
+        fusion_top_k = fusion_top_k or 20
 
         client = cls.get_client()
         if client:
@@ -179,23 +195,23 @@ class MilvusHybridService:
                     data=[query_emb],
                     anns_field="dense_vector",
                     param={"metric_type": "COSINE", "params": {"ef": 64}},
-                    limit=top_k * 2,
+                    limit=dense_top_k,
                     expr=filter_expr,
                 )
                 sparse_req = AnnSearchRequest(
                     data=[query],
                     anns_field="sparse_vector",
                     param={"metric_type": "BM25"},
-                    limit=top_k * 2,
+                    limit=sparse_top_k,
                     expr=filter_expr,
                 )
 
                 res = client.hybrid_search(
                     collection_name=COLLECTION_NAME,
                     reqs=[dense_req, sparse_req],
-                    ranker=RRFRanker(k=60),
-                    limit=top_k,
-                    output_fields=["chunk_id", "document_id", "text_content"],
+                    ranker=RRFRanker(k=rrf_k),
+                    limit=fusion_top_k,
+                    output_fields=["kb_id", "document_id", "version_id", "build_id", "chunk_id", "text_content"],
                 )
 
                 hits = []
@@ -206,7 +222,10 @@ class MilvusHybridService:
                         hits.append({
                             "id": chunk_id,
                             "chunkId": chunk_id,
+                            "kbId": entity.get("kb_id"),
                             "documentId": entity.get("document_id"),
+                            "versionId": entity.get("version_id"),
+                            "buildId": entity.get("build_id"),
                             "text": entity.get("text_content"),
                             "score": item.get("distance", 0.0),
                         })
@@ -235,7 +254,10 @@ class MilvusHybridService:
             if score > 0:
                 bm25_hits.append({
                     "id": item["chunk_id"],
+                    "kbId": item["kb_id"],
                     "documentId": item["document_id"],
+                    "versionId": item["version_id"],
+                    "buildId": item["build_id"],
                     "chunkId": item["chunk_id"],
                     "text": item["text_content"],
                     "bm25_score": score,
@@ -256,7 +278,10 @@ class MilvusHybridService:
             cos_sim = sum(a * b for a, b in zip(query_emb, v))
             dense_hits.append({
                 "id": item["chunk_id"],
+                "kbId": item["kb_id"],
                 "documentId": item["document_id"],
+                "versionId": item["version_id"],
+                "buildId": item["build_id"],
                 "chunkId": item["chunk_id"],
                 "text": item["text_content"],
                 "dense_score": cos_sim,
@@ -264,8 +289,12 @@ class MilvusHybridService:
 
         dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
 
-        fused = rrf_fuse([dense_hits[:top_k * 2], bm25_hits[:top_k * 2]], weights=[0.5, 0.5], rrf_k=60)
-        return fused[:top_k]
+        fused = rrf_fuse(
+            [dense_hits[:dense_top_k], bm25_hits[:sparse_top_k]],
+            weights=[0.5, 0.5],
+            rrf_k=rrf_k,
+        )
+        return fused[:fusion_top_k]
 
     @classmethod
     def rebuild_from_mysql(cls, tenant_id: str):
@@ -300,6 +329,7 @@ class MilvusHybridService:
             for b in active_builds:
                 chunk_stmt = select(
                     chunk_table.c.id,
+                    chunk_table.c.parent_id,
                     chunk_table.c.text_content,
                 ).where(
                     and_(
@@ -309,7 +339,14 @@ class MilvusHybridService:
                     )
                 )
                 chunks = conn.execute(chunk_stmt).fetchall()
-                chunk_dicts = [{"id": str(c.id), "text_content": c.text_content} for c in chunks]
+                chunk_dicts = [
+                    {
+                        "id": str(c.id),
+                        "parent_id": str(c.parent_id) if c.parent_id else None,
+                        "text_content": c.text_content,
+                    }
+                    for c in chunks
+                ]
                 cls.upsert_chunks(
                     tenant_id=tenant_id,
                     build_id=str(b.active_build_id),

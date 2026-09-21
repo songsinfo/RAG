@@ -1,12 +1,24 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 from fastapi import Request, Depends
-from sqlalchemy import select, and_
-from sqlalchemy.sql import func
+from sqlalchemy import and_, exists, or_, select
+
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.models import auth_session_table, app_user_table
 from app.identity.security import hash_token
+from app.models import (
+    app_user_table,
+    auth_session_table,
+    document_grant_table,
+    document_table,
+    group_member_table,
+    index_build_table,
+    kb_grant_table,
+    knowledge_base_table,
+    tenant_table,
+)
 
 
 @dataclass(frozen=True)
@@ -14,6 +26,7 @@ class Actor:
     tenant_id: str
     user_id: str
     admin: bool
+    security_epoch: int = 0
 
 
 def get_current_actor(request: Request) -> Actor:
@@ -29,6 +42,7 @@ def get_current_actor(request: Request) -> Actor:
                 app_user_table.c.tenant_id,
                 app_user_table.c.id.label("user_id"),
                 app_user_table.c.is_admin,
+                tenant_table.c.security_epoch,
             )
             .select_from(
                 auth_session_table.join(
@@ -37,6 +51,9 @@ def get_current_actor(request: Request) -> Actor:
                         app_user_table.c.tenant_id == auth_session_table.c.tenant_id,
                         app_user_table.c.id == auth_session_table.c.user_id,
                     ),
+                ).join(
+                    tenant_table,
+                    tenant_table.c.id == app_user_table.c.tenant_id,
                 )
             )
             .where(
@@ -56,6 +73,7 @@ def get_current_actor(request: Request) -> Actor:
             tenant_id=str(row.tenant_id),
             user_id=str(row.user_id),
             admin=bool(row.is_admin),
+            security_epoch=int(row.security_epoch or 0),
         )
 
 
@@ -66,9 +84,6 @@ def require_admin(actor: Actor = Depends(get_current_actor)) -> Actor:
 
 
 def principal_matches(grant_table, actor: Actor):
-    from sqlalchemy import or_, exists
-    from app.models import group_member_table
-
     return or_(
         grant_table.c.principal_type == "ALL",
         grant_table.c.user_id == actor.user_id,
@@ -82,15 +97,7 @@ def principal_matches(grant_table, actor: Actor):
     )
 
 
-def can_read_document(conn, actor: Actor, doc_id: str) -> bool:
-    from sqlalchemy import or_, exists
-    from app.models import (
-        document_table,
-        knowledge_base_table,
-        kb_grant_table,
-        document_grant_table,
-    )
-
+def _access_predicates(actor: Actor):
     user_active = exists().where(
         and_(
             app_user_table.c.tenant_id == actor.tenant_id,
@@ -122,6 +129,11 @@ def can_read_document(conn, actor: Actor, doc_id: str) -> bool:
             )
         ),
     )
+    return user_active, kb_accessible, doc_acl_ok
+
+
+def can_read_document(conn, actor: Actor, doc_id: str) -> bool:
+    user_active, kb_accessible, doc_acl_ok = _access_predicates(actor)
     stmt = select(document_table.c.id).where(
         and_(
             document_table.c.tenant_id == actor.tenant_id,
@@ -135,59 +147,71 @@ def can_read_document(conn, actor: Actor, doc_id: str) -> bool:
     return conn.execute(stmt).first() is not None
 
 
-def get_readable_builds(conn, actor: Actor, kb_ids=None) -> list:
-    from sqlalchemy import or_, exists
-    from app.models import (
-        document_table,
-        knowledge_base_table,
-        kb_grant_table,
-        document_grant_table,
-    )
-
-    user_active = exists().where(
-        and_(
-            app_user_table.c.tenant_id == actor.tenant_id,
-            app_user_table.c.id == actor.user_id,
-            app_user_table.c.status == "ACTIVE",
+def get_readable_build_records(
+    conn,
+    actor: Actor,
+    kb_ids: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    user_active, kb_accessible, doc_acl_ok = _access_predicates(actor)
+    stmt = (
+        select(
+            document_table.c.active_build_id,
+            document_table.c.id.label("document_id"),
+            document_table.c.kb_id,
+            index_build_table.c.version_id,
         )
-    )
-    kb_accessible = exists().where(
-        and_(
-            knowledge_base_table.c.tenant_id == actor.tenant_id,
-            knowledge_base_table.c.id == document_table.c.kb_id,
-            knowledge_base_table.c.status == "LIVE",
-            exists().where(
+        .select_from(
+            document_table.join(
+                index_build_table,
                 and_(
-                    kb_grant_table.c.tenant_id == actor.tenant_id,
-                    kb_grant_table.c.kb_id == knowledge_base_table.c.id,
-                    principal_matches(kb_grant_table, actor),
-                )
-            ),
-        )
-    )
-    doc_acl_ok = or_(
-        document_table.c.acl_mode == "INHERIT",
-        exists().where(
-            and_(
-                document_grant_table.c.tenant_id == actor.tenant_id,
-                document_grant_table.c.document_id == document_table.c.id,
-                principal_matches(document_grant_table, actor),
+                    index_build_table.c.tenant_id == document_table.c.tenant_id,
+                    index_build_table.c.id == document_table.c.active_build_id,
+                ),
             )
-        ),
-    )
-    stmt = select(document_table.c.active_build_id).where(
-        and_(
-            document_table.c.tenant_id == actor.tenant_id,
-            document_table.c.status == "LIVE",
-            document_table.c.active_build_id.isnot(None),
-            user_active,
-            kb_accessible,
-            doc_acl_ok,
+        )
+        .where(
+            and_(
+                document_table.c.tenant_id == actor.tenant_id,
+                document_table.c.status == "LIVE",
+                document_table.c.active_build_id.isnot(None),
+                index_build_table.c.status == "READY",
+                user_active,
+                kb_accessible,
+                doc_acl_ok,
+            )
         )
     )
     if kb_ids:
         stmt = stmt.where(document_table.c.kb_id.in_(kb_ids))
 
-    return [str(r.active_build_id) for r in conn.execute(stmt).fetchall()]
+    rows = conn.execute(stmt).fetchall()
+    return [
+        {
+            "buildId": str(r.active_build_id),
+            "documentId": str(r.document_id),
+            "kbId": str(r.kb_id),
+            "versionId": str(r.version_id),
+        }
+        for r in rows
+    ]
 
 
+def get_readable_builds(conn, actor: Actor, kb_ids=None) -> list:
+    return [r["buildId"] for r in get_readable_build_records(conn, actor, kb_ids)]
+
+
+def assert_hits_still_readable(
+    conn,
+    actor: Actor,
+    hits: List[Dict[str, Any]],
+    kb_ids: Optional[List[str]] = None,
+) -> None:
+    if not hits:
+        return
+    readable = get_readable_build_records(conn, actor, kb_ids)
+    allowed = {(r["buildId"], r["documentId"]) for r in readable}
+    for hit in hits:
+        build_id = str(hit.get("buildId") or "")
+        document_id = str(hit.get("documentId") or "")
+        if not build_id or not document_id or (build_id, document_id) not in allowed:
+            raise ApiException(409, "SOURCE_CHANGED", "检索来源权限或生效版本已变化，请重新提问")
