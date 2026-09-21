@@ -1466,6 +1466,28 @@ class KnowledgeService:
                         result_json=None,
                         status="CANCELLED",
                         terminal_reason="SOURCE_PURGED",
+                        cancel_requested_at=now,
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                )
+                # Purge is a privacy boundary: invalidate the QA execution lease
+                # and atomically destroy LangGraph history/pending writes/resume data.
+                conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                    ))
+                    .values(
+                        status="CANCELLED",
+                        stage="FINISHED",
+                        lease_epoch=job_table.c.lease_epoch + 1,
+                        lease_until=None,
+                        checkpoint=None,
+                        error_code="SOURCE_PURGED",
+                        cancel_requested_at=now,
                         updated_at=now,
                     )
                 )
