@@ -52,10 +52,15 @@ def test_docling_hybrid_chunks_are_not_resplit_and_keep_provenance():
     assert [c["text_content"] for c in children] == [item["text"] for item in items]
     assert [c["token_count"] for c in children] == [120, 130, 100]
 
-    # Parent grouping is only contextual aggregation, split by heading path.
+    # Parent/SourceUnit grouping is contextual aggregation, split by heading path.
     assert len(parents) == 2
-    assert len(units) == 3
+    assert len(units) == 2
+    assert units[0]["text_content"] == "第一段\n\n第二段"
+    assert units[1]["location"]["pageNumbers"] == [2]
+
+    # Child spans point back into the grouped section SourceUnit.
     assert len(spans) == 3
+    assert spans[0]["unit_id"] == spans[1]["unit_id"]
     assert spans[0]["start_cp"] == 0
     assert spans[0]["end_cp"] == len("第一段")
-    assert units[2]["location"]["pageNumbers"] == [2]
+    assert spans[1]["start_cp"] == len("第一段\n\n")
