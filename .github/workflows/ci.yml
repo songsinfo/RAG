@@ -23,6 +23,10 @@ jobs:
       - run: python -m compileall -q app tests
       - run: python -m pytest -q
       - run: python -m pytest ../docs/reviews/pr-1/test_review.py -q -p no:cacheprovider --tb=short
+      - name: Stack review regressions
+        env:
+          REVIEW_ROOT: ${{ github.workspace }}
+        run: python -m pytest ../docs/reviews/pr-stack-20260921/test_stack_review.py -q -p no:cacheprovider --tb=short
 
   frontend:
     runs-on: ubuntu-latest
