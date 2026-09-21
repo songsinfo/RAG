@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import uuid
+import httpx
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -17,6 +18,7 @@ MODEL_CONFIG_IDS = {
     "chat-main": "cfg-model-chat-main",
     "embedding-main": "cfg-model-embedding-main",
     "judge-main": "cfg-model-judge-main",
+    "rerank-main": "cfg-model-rerank-main",
 }
 
 
@@ -25,7 +27,7 @@ class ModelGateway:
     def chat(
         cls,
         tenant_id: str,
-        run_id: str,
+        run_id: Optional[str],
         purpose: str,  # "ANSWER", "JUDGE", "ROUTING"
         messages: List[Dict[str, str]],
         max_tokens: int = 2400,
@@ -292,12 +294,123 @@ class ModelGateway:
                 "tool_calls": [],
             }
 
+
+    @classmethod
+    def rerank(
+        cls,
+        tenant_id: str,
+        run_id: Optional[str],
+        query: str,
+        documents: List[str],
+        top_n: int,
+        model_alias: str = "rerank-main",
+    ) -> List[Dict[str, Any]]:
+        if not documents:
+            return []
+
+        call_id = str(uuid.uuid4())
+        gateway_url = os.getenv("LITELLM_BASE_URL") or getattr(settings, "LITELLM_BASE_URL", "")
+        master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
+
+        if gateway_url:
+            base = gateway_url.rstrip("/")
+            endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
+            try:
+                with httpx.Client(timeout=20.0) as client:
+                    response = client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {master_key}"},
+                        json={
+                            "model": model_alias,
+                            "query": query,
+                            "documents": documents,
+                            "top_n": min(top_n, len(documents)),
+                            "return_documents": False,
+                        },
+                    )
+                if response.status_code != 200:
+                    raise ApiException(
+                        503,
+                        "RERANK_UNAVAILABLE",
+                        f"Reranker 网关返回异常状态码 {response.status_code}",
+                    )
+                payload = response.json()
+                results = payload.get("results") or payload.get("data") or []
+                normalized = []
+                for item in results:
+                    idx = item.get("index")
+                    if not isinstance(idx, int):
+                        continue
+                    normalized.append(
+                        {
+                            "index": idx,
+                            "relevance_score": float(
+                                item.get("relevance_score", item.get("score", 0.0)) or 0.0
+                            ),
+                        }
+                    )
+                if not normalized:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Reranker 未返回有效结果")
+
+                cls._record_call(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    run_id=run_id,
+                    purpose="RERANK",
+                    status="SUCCESS",
+                    input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
+                    output_tokens=0,
+                    model_alias=model_alias,
+                )
+                return normalized
+            except ApiException:
+                cls._record_call(
+                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                )
+                raise
+            except Exception as exc:
+                cls._record_call(
+                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                )
+                raise ApiException(503, "RERANK_UNAVAILABLE", f"Reranker 网关调用失败: {exc}")
+
+        if not is_test_env():
+            cls._record_call(
+                tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+            )
+            raise ApiException(503, "RERANK_UNAVAILABLE", "未配置可用的 Reranker 网关")
+
+        # Deterministic local reranker for tests: lexical overlap, then original order.
+        terms = [t.lower() for t in query.split() if t.strip()]
+        scored = []
+        for idx, document in enumerate(documents):
+            lowered = document.lower()
+            overlap = sum(1.0 for term in terms if term in lowered)
+            scored.append(
+                {
+                    "index": idx,
+                    "relevance_score": overlap + (1.0 / (1000.0 + idx)),
+                }
+            )
+        scored.sort(key=lambda item: item["relevance_score"], reverse=True)
+        cls._record_call(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            run_id=run_id,
+            purpose="RERANK",
+            status="SUCCESS",
+            input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
+            output_tokens=0,
+            model_alias=model_alias,
+        )
+        return scored[: min(top_n, len(scored))]
+
     @classmethod
     def _record_call(
         cls,
         tenant_id: str,
         call_id: str,
-        run_id: str,
+        run_id: Optional[str],
         purpose: str,
         status: str,
         input_tokens: int,

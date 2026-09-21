@@ -4,7 +4,7 @@ Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（�
 
 ## 系统架构与核心流程
 
-> 以下图基于当前默认分支 `feat/python-migration` 的实际 Python 实现整理。当前后端已迁移到 FastAPI + MySQL + Milvus + LiteLLM；`deploy/compose.yml` 已提供 Docling Serve，但当前 `backend/app/knowledge/parser.py` 仍使用 UTF-8 Markdown/TXT 解析器，Docling 尚未接入实际入库调用链。
+> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown/TXT 走本地结构解析，PDF/DOCX 等二进制文档通过 Docling Serve 转换后进入统一 Parent-Child 切块流程。后台 INGEST/PURGE 使用 MySQL 持久化 Job + Lease Worker，可在单机内嵌运行，也可独立启动 Worker。
 
 ### 系统架构图
 
@@ -17,7 +17,7 @@ flowchart LR
         AUTH[identity<br/>登录 / 租户 / ACL / CSRF]
         KB[knowledge<br/>文档 / 版本 / 生命周期 / 入库任务]
         PARSER[parser + chunker<br/>结构解析 / Parent-Child Chunking]
-        RET[retrieval<br/>Dense + Sparse BM25 + RRF]
+        RET[retrieval<br/>Dense + Sparse BM25 + RRF<br/>Reranker + Parent Expansion]
         QA[qa<br/>RAG / LangGraph Agent / Claim Validation]
         EVAL[evaluation<br/>题集 / 指标 / 消融实验]
         MODEL[ModelGateway<br/>LangChain OpenAI Client]
@@ -35,8 +35,9 @@ flowchart LR
     QA --> MYSQL
     EVAL --> MYSQL
 
-    KB --> FS[(私有文件制品)]
-    KB --> PARSER
+    KB --> FS[(Local / S3 / MinIO<br/>私有文件制品)]
+    KB --> JOB[Durable Job Worker<br/>Lease + Retry + Recovery]
+    JOB --> PARSER
     PARSER --> MYSQL
     PARSER --> RET
 
@@ -54,7 +55,7 @@ flowchart LR
     MILVUS --> ETCD[(etcd)]
     MILVUS --> MINIO[(MinIO)]
 
-    KB -. 当前代码尚未接入 .-> DOCLING[Docling Serve<br/>Compose documents profile]
+    PARSER -->|PDF / DOCX / Office / OCR| DOCLING[Docling Serve<br/>/v1/convert/file]
 ```
 
 架构中的关键约束：**MySQL 是权限与生效 Build 的权威来源**，Milvus 只保存可重建的检索索引；每次检索先从 MySQL 计算当前用户可读的 `active_build_id`，再把这些 Build ID 作为 Milvus 过滤条件，从源头避免越权召回。模型供应商密钥由 LiteLLM 独立持有，业务后端只调用内部模型别名。
@@ -66,8 +67,12 @@ flowchart TD
     A[管理员上传文档<br/>POST /admin/documents] --> B[认证 / CSRF / 25MB限制<br/>Idempotency-Key 校验]
     B --> C[保存原始文件到私有制品目录]
     C --> D[MySQL 创建<br/>Document / Version / Build Config / Index Build / Job]
-    D --> E[后台线程执行 INGEST Job]
-    E --> F[parse_document<br/>当前为 UTF-8 Markdown/TXT Parser]
+    D --> E[Durable Worker Claim<br/>MySQL Lease / Retry / Recovery]
+    E --> F{文件类型}
+    F -->|Markdown / TXT| F1[本地结构解析]
+    F -->|PDF / DOCX / Office 等| F2[Docling Serve<br/>OCR / Table Structure]
+    F1 --> G
+    F2 --> G
     F --> G[Source Units 写入 MySQL<br/>Heading / Text / Table / Code]
     G --> H[Parent-Child Chunking<br/>Parent≈2000字符 / Child≈400字符]
     H --> I[Chunk + Span 写入 MySQL]
@@ -79,7 +84,6 @@ flowchart TD
     N --> O[Document.active_build_id 原子切换到新 Build]
     O --> P[Job = COMPLETED]
 
-    F -. 待接入 .-> Q[Docling Serve<br/>PDF / DOCX / OCR 等]
 ```
 
 ### RAG / Agent 问答流程图
@@ -102,11 +106,18 @@ flowchart TD
     L -->|否| NOEV["NO_EVIDENCE"]
     L -->|是| M["Milvus Hybrid Search"]
 
-    M --> M1["Query Embedding<br/>LiteLLM embedding-main"]
-    M --> M2["Sparse BM25"]
-    M1 --> M3["RRF Fusion k=60"]
+    M --> M1["Dense Recall<br/>Query Embedding / LiteLLM"]
+    M --> M2["Sparse BM25 Recall"]
+    M1 --> M3["RRF Fusion<br/>参数来自 Retrieval Config"]
     M2 --> M3
-    M3 --> N["Top-K Evidence"]
+    M3 --> M4{"Rerank Enabled?"}
+    M4 -->|是| M5["Cross-Encoder / Rerank API"]
+    M4 -->|否| M6["保持 RRF 顺序"]
+    M5 --> M7{"Parent Expansion?"}
+    M6 --> M7
+    M7 -->|是| M8["Child 命中 → Parent Context"]
+    M7 -->|否| N["Final Top-K Evidence"]
+    M8 --> N
     N --> O["登记 run_source / Evidence"]
     O --> P["ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims"]
     P --> Q["Claim Validation<br/>引用范围与 Evidence 绑定"]
@@ -134,7 +145,19 @@ flowchart TD
     Z --> FINAL["前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace"]
 ```
 
-当前普通 RAG 主链路的检索实现是 **Dense + Sparse BM25 → RRF → Top-K**；代码中尚未接入独立 Cross-Encoder Reranker 或 MMR，因此图中没有把它们画成已实现步骤。Agent 模式使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断，防止无界循环。
+当前普通 RAG 与 Agent 的 `search_knowledge` 已统一走同一条 `RetrievalPipeline`：**ACL Scope → Dense + Sparse BM25 → RRF → 可选 Reranker → 可选 Parent Expansion → Final Top-K → 外发前 ACL/Active Build 二次复核**。参数由不可变版本的 Retrieval Config 决定，`qa_run.config_id` 保存本次运行所用配置版本，便于消融实验、回放和回滚。Agent 仍使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断。
+
+## 企业化增强（当前分支）
+
+- **统一权限真源**：Search API、普通 RAG、Agent 检索统一使用 `get_readable_build_records()`，同时覆盖租户、用户状态、KB ACL、文档 ACL、用户组和 active build。
+- **TOCTOU 防护**：检索后、模型外发前再次核对当前权限与 `active_build_id`；权限撤销或版本切换时返回 `SOURCE_CHANGED`，不把失效来源发送给模型。
+- **完整 Evidence Provenance**：Milvus Hit 返回真实 `kbId/documentId/versionId/buildId/chunkId`，并关联 `source_unit/location`；不再用 `allowed_build_ids[0]` 猜测来源。
+- **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
+- **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
+- **Docling 已接入**：Markdown/TXT 本地解析；PDF/DOCX/Office 等通过 Docling `/v1/convert/file` 转 Markdown，再进入统一结构解析与切块。
+- **Durable Job Worker**：INGEST/PURGE 从进程内 ThreadPool 升级为 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
+- **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
+- **CI 基线**：GitHub Actions 执行 Python compile/pytest 与前端 type-check/test/build。
 
 ## 阅读顺序
 

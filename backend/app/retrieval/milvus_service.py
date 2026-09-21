@@ -1,3 +1,4 @@
+import hashlib
 import os
 import logging
 from typing import List, Dict, Any, Optional
@@ -41,6 +42,7 @@ class MilvusHybridService:
                         FieldSchema("document_id", DataType.VARCHAR, max_length=64),
                         FieldSchema("version_id", DataType.VARCHAR, max_length=64),
                         FieldSchema("build_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("index_epoch", DataType.INT64),
                         FieldSchema("chunk_id", DataType.VARCHAR, max_length=64),
                         FieldSchema("representation_type", DataType.VARCHAR, max_length=32),
                         FieldSchema("text_content", DataType.VARCHAR, max_length=65535, enable_analyzer=True),
@@ -82,10 +84,20 @@ class MilvusHybridService:
         return cls._client
 
     @classmethod
-    def upsert_chunks(cls, tenant_id: str, build_id: str, chunks: List[Dict[str, Any]], kb_id: str, doc_id: str, version_id: str):
+    def upsert_chunks(
+        cls,
+        tenant_id: str,
+        build_id: str,
+        chunks: List[Dict[str, Any]],
+        kb_id: str,
+        doc_id: str,
+        version_id: str,
+        index_epoch: Optional[int] = None,
+    ):
         if not chunks:
             return
 
+        epoch = int(index_epoch or 0)
         texts = [c["text_content"] for c in chunks]
         embeddings = get_embeddings(texts, dim=1024)
 
@@ -93,13 +105,22 @@ class MilvusHybridService:
         for chunk, emb in zip(chunks, embeddings):
             chunk_id = str(chunk["id"])
             norm = normalize_terms(chunk["text_content"])
+            if epoch > 0:
+                record_id = hashlib.sha256(
+                    f"{tenant_id}:{build_id}:{epoch}:{chunk_id}".encode("utf-8")
+                ).hexdigest()
+            else:
+                # Preserve legacy IDs for builds published before index fencing.
+                record_id = f"{tenant_id}:{build_id}:{chunk_id}"
             record = {
-                "id": f"{tenant_id}:{build_id}:{chunk_id}",
+                "id": record_id,
+                "parent_id": str(chunk.get("parent_id") or ""),
                 "tenant_id": tenant_id,
                 "kb_id": kb_id,
                 "document_id": doc_id,
                 "version_id": version_id,
                 "build_id": build_id,
+                "index_epoch": epoch,
                 "chunk_id": chunk_id,
                 "representation_type": "ORIGINAL",
                 "text_content": chunk["text_content"],
@@ -121,18 +142,32 @@ class MilvusHybridService:
             raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 服务不可用，文档入库中止")
 
     @classmethod
-    def delete_by_build(cls, tenant_id: str, build_id: str):
-        prefix = f"{tenant_id}:{build_id}:"
-        to_delete = [k for k in cls._mock_store.keys() if k.startswith(prefix)]
-        for k in to_delete:
-            cls._mock_store.pop(k, None)
+    def delete_by_build(
+        cls,
+        tenant_id: str,
+        build_id: str,
+        index_epoch: Optional[int] = None,
+    ):
+        epoch = int(index_epoch) if index_epoch is not None else None
+        to_delete = [
+            key
+            for key, value in cls._mock_store.items()
+            if value.get("tenant_id") == tenant_id
+            and value.get("build_id") == build_id
+            and (epoch is None or int(value.get("index_epoch") or 0) == epoch)
+        ]
+        for key in to_delete:
+            cls._mock_store.pop(key, None)
 
         client = cls.get_client()
         if client:
             try:
+                filter_expr = f'tenant_id == "{tenant_id}" and build_id == "{build_id}"'
+                if epoch is not None:
+                    filter_expr += f" and index_epoch == {epoch}"
                 client.delete(
                     collection_name=COLLECTION_NAME,
-                    filter=f'tenant_id == "{tenant_id}" and build_id == "{build_id}"',
+                    filter=filter_expr,
                 )
             except Exception as e:
                 logger.warning("Failed to delete from Milvus by build: %s", e)
@@ -163,109 +198,214 @@ class MilvusHybridService:
         tenant_id: str,
         query: str,
         allowed_build_ids: List[str],
-        top_k: int = 10,
+        top_k: Optional[int] = None,
+        dense_top_k: Optional[int] = None,
+        sparse_top_k: Optional[int] = None,
+        fusion_top_k: Optional[int] = None,
+        mode: str = "HYBRID",
+        rrf_enabled: bool = True,
+        rrf_k: int = 60,
+        allowed_build_epochs: Optional[Dict[str, int]] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
 
+        mode = str(mode or "HYBRID").upper()
+        if mode == "SPARSE":
+            mode = "BM25"
+        if mode not in {"DENSE", "BM25", "HYBRID"}:
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", f"不支持的检索模式: {mode}")
+        if mode == "HYBRID" and not rrf_enabled:
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", "HYBRID 模式需要 RRF 融合")
+
+        if top_k is not None:
+            if dense_top_k is None:
+                dense_top_k = top_k * 2
+            if sparse_top_k is None:
+                sparse_top_k = top_k * 2
+            if fusion_top_k is None:
+                fusion_top_k = top_k
+        dense_top_k = 0 if dense_top_k is None and mode == "BM25" else (dense_top_k if dense_top_k is not None else 30)
+        sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
+        fusion_top_k = fusion_top_k or 20
+
+        output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "text_content"]
+
+        def normalize_result(res):
+            hits = []
+            rows = res[0] if res and isinstance(res, list) and res and isinstance(res[0], list) else (res or [])
+            for item in rows:
+                entity = item.get("entity", {}) if isinstance(item, dict) else {}
+                chunk_id = entity.get("chunk_id") or (item.get("id") if isinstance(item, dict) else None)
+                hits.append({
+                    "id": chunk_id,
+                    "chunkId": chunk_id,
+                    "kbId": entity.get("kb_id"),
+                    "documentId": entity.get("document_id"),
+                    "versionId": entity.get("version_id"),
+                    "buildId": entity.get("build_id"),
+                    "indexEpoch": int(entity.get("index_epoch") or 0),
+                    "text": entity.get("text_content"),
+                    "score": float(item.get("distance", item.get("score", 0.0)) or 0.0) if isinstance(item, dict) else 0.0,
+                })
+            return hits
+
         client = cls.get_client()
         if client:
             try:
-                query_emb = get_embeddings([query], dim=1024)[0]
-                build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
-                filter_expr = f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] and representation_type == "ORIGINAL"'
+                if allowed_build_epochs:
+                    build_clauses = []
+                    for allowed_build_id in allowed_build_ids:
+                        expected_epoch = int(allowed_build_epochs.get(allowed_build_id, 0) or 0)
+                        if expected_epoch > 0:
+                            build_clauses.append(
+                                f'(build_id == "{allowed_build_id}" and index_epoch == {expected_epoch})'
+                            )
+                        else:
+                            # Legacy published builds have fence=0 and may not
+                            # have an index_epoch field in an existing collection.
+                            build_clauses.append(f'build_id == "{allowed_build_id}"')
+                    build_filter = " or ".join(build_clauses)
+                    filter_expr = (
+                        f'tenant_id == "{tenant_id}" and ({build_filter}) '
+                        'and representation_type == "ORIGINAL"'
+                    )
+                else:
+                    build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
+                    filter_expr = (
+                        f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] '
+                        'and representation_type == "ORIGINAL"'
+                    )
 
+                if mode == "DENSE":
+                    query_emb = get_embeddings([query], dim=1024)[0]
+                    res = client.search(
+                        collection_name=COLLECTION_NAME,
+                        data=[query_emb],
+                        anns_field="dense_vector",
+                        search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                        limit=max(1, dense_top_k),
+                        filter=filter_expr,
+                        output_fields=output_fields,
+                    )
+                    return normalize_result(res)[:fusion_top_k]
+
+                if mode == "BM25":
+                    res = client.search(
+                        collection_name=COLLECTION_NAME,
+                        data=[query],
+                        anns_field="sparse_vector",
+                        search_params={"metric_type": "BM25"},
+                        limit=max(1, sparse_top_k),
+                        filter=filter_expr,
+                        output_fields=output_fields,
+                    )
+                    return normalize_result(res)[:fusion_top_k]
+
+                query_emb = get_embeddings([query], dim=1024)[0]
                 dense_req = AnnSearchRequest(
                     data=[query_emb],
                     anns_field="dense_vector",
                     param={"metric_type": "COSINE", "params": {"ef": 64}},
-                    limit=top_k * 2,
+                    limit=max(1, dense_top_k),
                     expr=filter_expr,
                 )
                 sparse_req = AnnSearchRequest(
                     data=[query],
                     anns_field="sparse_vector",
                     param={"metric_type": "BM25"},
-                    limit=top_k * 2,
+                    limit=max(1, sparse_top_k),
                     expr=filter_expr,
                 )
-
                 res = client.hybrid_search(
                     collection_name=COLLECTION_NAME,
                     reqs=[dense_req, sparse_req],
-                    ranker=RRFRanker(k=60),
-                    limit=top_k,
-                    output_fields=["chunk_id", "document_id", "text_content"],
+                    ranker=RRFRanker(k=rrf_k),
+                    limit=fusion_top_k,
+                    output_fields=output_fields,
                 )
-
-                hits = []
-                if res and len(res) > 0:
-                    for item in res[0]:
-                        entity = item.get("entity", {})
-                        chunk_id = entity.get("chunk_id") or item.get("id")
-                        hits.append({
-                            "id": chunk_id,
-                            "chunkId": chunk_id,
-                            "documentId": entity.get("document_id"),
-                            "text": entity.get("text_content"),
-                            "score": item.get("distance", 0.0),
-                        })
-                return hits
+                return normalize_result(res)
+            except ApiException:
+                raise
             except Exception as e:
-                logger.error("Milvus hybrid search error: %s", e)
+                logger.error("Milvus search error: %s", e)
                 if not is_test_env():
-                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 混合检索失败: {e}")
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 检索失败: {e}")
 
-        # In non-test environment without a live Milvus connection, fail fast
         if not is_test_env():
             raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 检索服务不可用")
 
-        # In-memory mock fallback ONLY for unit tests (RAG_ENVIRONMENT == 'test')
         bm25_hits: List[Dict[str, Any]] = []
+        dense_hits: List[Dict[str, Any]] = []
         query_terms = [t.lower() for t in query.split() if t.strip()]
 
-        for item in cls._mock_store.values():
-            if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
-                continue
-            if item["representation_type"] != "ORIGINAL":
-                continue
+        def record_is_allowed(item: Dict[str, Any]) -> bool:
+            build_id = str(item.get("build_id") or "")
+            if item.get("tenant_id") != tenant_id or build_id not in allowed_build_ids:
+                return False
+            if allowed_build_epochs:
+                expected_epoch = int(allowed_build_epochs.get(build_id, 0) or 0)
+                if expected_epoch > 0 and int(item.get("index_epoch") or 0) != expected_epoch:
+                    return False
+            return True
 
-            text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
-            score = sum(1.0 for t in query_terms if t in text_lower)
-            if score > 0:
-                bm25_hits.append({
+        if mode in {"BM25", "HYBRID"}:
+            for item in cls._mock_store.values():
+                if not record_is_allowed(item):
+                    continue
+                if item["representation_type"] != "ORIGINAL":
+                    continue
+                text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
+                score = sum(1.0 for t in query_terms if t in text_lower)
+                if score > 0:
+                    bm25_hits.append({
+                        "id": item["chunk_id"],
+                        "kbId": item["kb_id"],
+                        "documentId": item["document_id"],
+                        "versionId": item["version_id"],
+                        "buildId": item["build_id"],
+                        "indexEpoch": int(item.get("index_epoch") or 0),
+                        "chunkId": item["chunk_id"],
+                        "text": item["text_content"],
+                        "bm25_score": score,
+                        "score": score,
+                    })
+            bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
+
+        if mode in {"DENSE", "HYBRID"}:
+            query_emb = get_embeddings([query], dim=1024)[0]
+            for item in cls._mock_store.values():
+                if not record_is_allowed(item):
+                    continue
+                if item["representation_type"] != "ORIGINAL":
+                    continue
+                v = item["dense_vector"]
+                cos_sim = sum(a * b for a, b in zip(query_emb, v))
+                dense_hits.append({
                     "id": item["chunk_id"],
+                    "kbId": item["kb_id"],
                     "documentId": item["document_id"],
+                    "versionId": item["version_id"],
+                    "buildId": item["build_id"],
+                    "indexEpoch": int(item.get("index_epoch") or 0),
                     "chunkId": item["chunk_id"],
                     "text": item["text_content"],
-                    "bm25_score": score,
+                    "dense_score": cos_sim,
+                    "score": cos_sim,
                 })
+            dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
 
-        bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
+        if mode == "DENSE":
+            return dense_hits[:min(dense_top_k, fusion_top_k)]
+        if mode == "BM25":
+            return bm25_hits[:min(sparse_top_k, fusion_top_k)]
 
-        query_emb = get_embeddings([query], dim=1024)[0]
-        dense_hits: List[Dict[str, Any]] = []
-
-        for item in cls._mock_store.values():
-            if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
-                continue
-            if item["representation_type"] != "ORIGINAL":
-                continue
-
-            v = item["dense_vector"]
-            cos_sim = sum(a * b for a, b in zip(query_emb, v))
-            dense_hits.append({
-                "id": item["chunk_id"],
-                "documentId": item["document_id"],
-                "chunkId": item["chunk_id"],
-                "text": item["text_content"],
-                "dense_score": cos_sim,
-            })
-
-        dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
-
-        fused = rrf_fuse([dense_hits[:top_k * 2], bm25_hits[:top_k * 2]], weights=[0.5, 0.5], rrf_k=60)
-        return fused[:top_k]
+        fused = rrf_fuse(
+            [dense_hits[:dense_top_k], bm25_hits[:sparse_top_k]],
+            weights=[0.5, 0.5],
+            rrf_k=rrf_k,
+        )
+        return fused[:fusion_top_k]
 
     @classmethod
     def rebuild_from_mysql(cls, tenant_id: str):
@@ -277,6 +417,7 @@ class MilvusHybridService:
                     document_table.c.id.label("document_id"),
                     document_table.c.active_build_id,
                     index_build_table.c.version_id,
+                    index_build_table.c.fence,
                 )
                 .select_from(
                     document_table.join(
@@ -300,6 +441,7 @@ class MilvusHybridService:
             for b in active_builds:
                 chunk_stmt = select(
                     chunk_table.c.id,
+                    chunk_table.c.parent_id,
                     chunk_table.c.text_content,
                 ).where(
                     and_(
@@ -309,7 +451,14 @@ class MilvusHybridService:
                     )
                 )
                 chunks = conn.execute(chunk_stmt).fetchall()
-                chunk_dicts = [{"id": str(c.id), "text_content": c.text_content} for c in chunks]
+                chunk_dicts = [
+                    {
+                        "id": str(c.id),
+                        "parent_id": str(c.parent_id) if c.parent_id else None,
+                        "text_content": c.text_content,
+                    }
+                    for c in chunks
+                ]
                 cls.upsert_chunks(
                     tenant_id=tenant_id,
                     build_id=str(b.active_build_id),
@@ -317,4 +466,5 @@ class MilvusHybridService:
                     kb_id=str(b.kb_id),
                     doc_id=str(b.document_id),
                     version_id=str(b.version_id),
+                    index_epoch=int(b.fence or 0),
                 )

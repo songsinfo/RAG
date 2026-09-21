@@ -38,19 +38,35 @@ from app.models import (
 )
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
+from app.retrieval.config import validate_retrieval_payload
 
 _eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
-    """Verify that pure retrieval mode does not configure LLM features."""
-    retrieval = config.get("retrieval", {}) if isinstance(config.get("retrieval"), dict) else {}
-    mode = retrieval.get("mode", "BM25")
+    """Verify RETRIEVAL_ONLY against the same effective config used at runtime."""
+    try:
+        effective = validate_retrieval_payload(config)
+    except ApiException as exc:
+        raise ApiException(409, "INVALID_CONFIG", exc.message) from exc
+
     query = config.get("query", {}) if isinstance(config.get("query"), dict) else {}
     post = config.get("post", {}) if isinstance(config.get("post"), dict) else {}
 
-    if mode != "BM25" or query.get("rewrite") or query.get("hyde") or query.get("multiQuery") or post.get("rerank") or post.get("mmr"):
-        raise ApiException(409, "MODEL_REQUIRED", "无模型评估只运行原查询BM25，可选父段扩展")
+    if (
+        effective.mode != "BM25"
+        or effective.rerank_enabled
+        or query.get("rewrite")
+        or query.get("hyde")
+        or query.get("multiQuery")
+        or post.get("rerank")
+        or post.get("mmr")
+    ):
+        raise ApiException(
+            409,
+            "MODEL_REQUIRED",
+            "RETRIEVAL_ONLY 只运行无模型 BM25；Dense/Hybrid/Rerank 消融请使用 RETRIEVAL_PIPELINE",
+        )
 
 
 def number(v: Any) -> float:
@@ -116,7 +132,7 @@ class EvaluationRunner:
                 raise ApiException(400, "INVALID_INPUT", "重复次数1..3")
 
             mode = str(body.get("mode", "RAG")).strip().upper()
-            if mode not in {"RAG", "AGENT", "RETRIEVAL_ONLY"}:
+            if mode not in {"RAG", "AGENT", "RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 raise ApiException(400, "INVALID_INPUT", "评估模式无效")
 
             cfg_payload = obj(cfg.payload)
@@ -292,7 +308,7 @@ class EvaluationRunner:
     @staticmethod
     def _execute_run(actor: Actor, run_id: str):
         """Asynchronous execution of all cases in an eval run."""
-        from app.retrieval.milvus_service import MilvusHybridService
+        from app.retrieval.pipeline import RetrievalPipeline
         from app.qa.service import QaService
 
         now = datetime.now(timezone.utc)
@@ -319,6 +335,7 @@ class EvaluationRunner:
             manifest = obj(run_row.manifest_json)
             mode = manifest.get("mode", "RAG")
             snapshot_id = str(run_row.snapshot_id)
+            eval_config_id = str(run_row.config_id)
 
             snap_docs = conn.execute(
                 select(eval_snapshot_document_table.c.document_id).where(
@@ -388,20 +405,24 @@ class EvaluationRunner:
 
             start_t = time.perf_counter()
 
-            if mode == "RETRIEVAL_ONLY":
+            if mode in {"RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 try:
-                    hits = MilvusHybridService.search(
-                        tenant_id=actor.tenant_id,
+                    retrieval = RetrievalPipeline.retrieve(
+                        actor=actor,
                         query=question_text,
-                        allowed_build_ids=allowed_build_ids,
-                        top_k=5,
+                        document_ids=allowed_doc_ids,
+                        config_id=eval_config_id,
+                        run_id=None,
                     )
+                    hits = retrieval["hits"]
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
 
                     metric = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, hits, hits)
                     metric["durationMs"] = round(latency_ms, 2)
                     metric["costCny"] = 0.0
-                    metric["mode"] = "RETRIEVAL_ONLY"
+                    metric["mode"] = mode
+                    metric["configId"] = eval_config_id
+                    metric["retrievalConfig"] = retrieval["config"]
                     hit_val = metric.get("hit")
                     exp_status = expected_obj.get("status", "ANSWER")
                     if exp_status == "ABSTAIN":
@@ -446,7 +467,12 @@ class EvaluationRunner:
                     submitted = QaService.submit_run(
                         persona_actor,
                         conv_id,
-                        {"question": question_text, "mode": "RAG", "strictMode": manifest.get("strict", False)},
+                        {
+                            "question": question_text,
+                            "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
+                            "strictMode": manifest.get("strict", False),
+                            "configId": eval_config_id,
+                        },
                         idempotency_key=f"eval:{result_id}:0",
                     )
                     qa_run_id = submitted["runId"]

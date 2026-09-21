@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     LITELLM_MASTER_KEY: str = "sk-litellm-internal-master-key"
     DOCLING_URL: str = "http://127.0.0.1:5001"
     DOCLING_API_KEY: str = ""
+    RAG_EMBEDDED_WORKER: bool = True
+    RAG_ARTIFACT_STORE: str = "local"
+    S3_ENDPOINT_URL: str = ""
+    S3_BUCKET: str = "rag-artifacts"
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    S3_REGION: str = "us-east-1"
 
     model_config = SettingsConfigDict(
         env_file=None,
@@ -85,6 +92,13 @@ def load_settings() -> Settings:
         LITELLM_MASTER_KEY=os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key"),
         DOCLING_URL=os.getenv("DOCLING_URL", "http://127.0.0.1:5001"),
         DOCLING_API_KEY=os.getenv("DOCLING_API_KEY", ""),
+        RAG_EMBEDDED_WORKER=os.getenv("RAG_EMBEDDED_WORKER", "true").lower() in ("true", "1", "yes"),
+        RAG_ARTIFACT_STORE=os.getenv("RAG_ARTIFACT_STORE", "local"),
+        S3_ENDPOINT_URL=os.getenv("S3_ENDPOINT_URL", ""),
+        S3_BUCKET=os.getenv("S3_BUCKET", "rag-artifacts"),
+        S3_ACCESS_KEY_ID=os.getenv("S3_ACCESS_KEY_ID", ""),
+        S3_SECRET_ACCESS_KEY=os.getenv("S3_SECRET_ACCESS_KEY", ""),
+        S3_REGION=os.getenv("S3_REGION", "us-east-1"),
     )
     if s.ENVIRONMENT != "test":
         if not os.getenv("MILVUS_URI"):
