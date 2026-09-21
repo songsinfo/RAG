@@ -276,10 +276,6 @@ class RetrievalPipeline:
                     pos = context_text.find(unit_text, cursor) if unit_text else -1
                     if pos < 0 and unit_text:
                         pos = context_text.find(unit_text)
-                    if unit_text and pos < 0:
-                        # The parent may be truncated before this unit.
-                        continue
-
                     source = {
                         "unitId": unit_id,
                         "location": span["location"] or unit["location"],
@@ -289,7 +285,14 @@ class RetrievalPipeline:
                     if pos >= 0:
                         source["contextStart"] = pos
                         source["contextEnd"] = pos + len(unit_text)
+                        source["contextMapped"] = True
                         cursor = source["contextEnd"]
+                    else:
+                        # Keep provenance even when the source unit was normalized,
+                        # summarized or the parent context was truncated. In that
+                        # case the exact parent offsets are unavailable, but the
+                        # unit/location chain must not disappear.
+                        source["contextMapped"] = False
                     source_units.append(source)
 
             item["sourceUnits"] = source_units
