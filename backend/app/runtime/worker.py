@@ -21,11 +21,13 @@ class DurableJobWorker:
         lease_seconds: int = 120,
         poll_seconds: float = 1.0,
         max_attempts: int = 3,
+        kinds: Optional[set[str]] = None,
     ):
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
         self.max_attempts = max_attempts
+        self.kinds = kinds or {"INGEST", "PURGE", "EVALUATE", "QA_RUN"}
         self._stop = threading.Event()
 
     def stop(self):
@@ -80,7 +82,7 @@ class DurableJobWorker:
             row = conn.execute(
                 select(job_table)
                 .where(and_(
-                    job_table.c.kind.in_(["INGEST", "PURGE", "EVALUATE", "QA_RUN"]),
+                    job_table.c.kind.in_(sorted(self.kinds)),
                     job_table.c.available_at <= now,
                     or_(job_table.c.status == "QUEUED",
                         and_(job_table.c.status == "RUNNING", job_table.c.lease_until.isnot(None), job_table.c.lease_until < now)),
@@ -197,7 +199,12 @@ class DurableJobWorker:
             admin=bool(user.is_admin),
             security_epoch=0,
         )
-        QaService.execute_queued_run(actor, str(job["target_id"]))
+        QaService.execute_queued_run(
+            actor,
+            str(job["target_id"]),
+            job_id=str(job["id"]),
+            lease_epoch=int(job["lease_epoch"]),
+        )
 
     def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
         with get_db_connection() as conn:
