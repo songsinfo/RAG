@@ -3,7 +3,6 @@ import logging
 import os
 import time
 import uuid
-import httpx
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -11,6 +10,7 @@ from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
+from app.qa.model_clients import get_chat_model, get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,7 @@ class ModelGateway:
         # Attempt to call LiteLLM Gateway via langchain_openai if configured
         if gateway_url:
             try:
-                from langchain_openai import ChatOpenAI
-                from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+                from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
                 lc_messages = []
                 for m in messages:
@@ -56,15 +55,9 @@ class ModelGateway:
                     else:
                         lc_messages.append(AIMessage(content=content))
 
-                llm = ChatOpenAI(
-                    model=model_alias,
-                    openai_api_base=gateway_url if gateway_url.endswith("/v1") else f"{gateway_url}/v1",
-                    openai_api_key=master_key,
-                    max_retries=0,
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                    timeout=30.0,
-                )
+                llm = get_chat_model(model_alias, max_tokens)
+                if llm is None:
+                    raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
                 response = llm.invoke(lc_messages)
                 content = str(response.content)
 
@@ -201,8 +194,7 @@ class ModelGateway:
 
         if gateway_url:
             try:
-                from langchain_openai import ChatOpenAI
-                from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+                from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
                 lc_messages = []
                 for m in messages:
@@ -216,28 +208,44 @@ class ModelGateway:
                         lc_messages.append(ToolMessage(content=content, tool_call_id=m.get("tool_call_id", "")))
                     elif role == "assistant":
                         t_calls = m.get("tool_calls", [])
-                        lc_messages.append(AIMessage(content=content, tool_calls=t_calls))
+                        normalized_calls = []
+                        for tc in t_calls:
+                            if tc.get("name"):
+                                args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                                normalized_calls.append({
+                                    "name": tc.get("name"),
+                                    "args": args,
+                                    "id": tc.get("id"),
+                                    "type": "tool_call",
+                                })
+                            else:
+                                fn = tc.get("function") or {}
+                                raw_args = fn.get("arguments", "{}")
+                                try:
+                                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                                except Exception:
+                                    args = {}
+                                normalized_calls.append({
+                                    "name": fn.get("name"),
+                                    "args": args if isinstance(args, dict) else {},
+                                    "id": tc.get("id"),
+                                    "type": "tool_call",
+                                })
+                        lc_messages.append(AIMessage(content=content, tool_calls=normalized_calls))
 
-                llm = ChatOpenAI(
-                    model=model_alias,
-                    openai_api_base=gateway_url if gateway_url.endswith("/v1") else f"{gateway_url}/v1",
-                    openai_api_key=master_key,
-                    max_retries=0,
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                    timeout=30.0,
-                ).bind_tools(tools)
+                base_model = get_chat_model(model_alias, max_tokens)
+                if base_model is None:
+                    raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
+                llm = base_model.bind_tools(tools, strict=True)
 
                 response = llm.invoke(lc_messages)
                 tool_calls = getattr(response, "tool_calls", [])
                 formatted_calls = [
                     {
                         "id": tc.get("id", f"call_{i}"),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name"),
-                            "arguments": json.dumps(tc.get("args", {}), ensure_ascii=False) if isinstance(tc.get("args"), dict) else str(tc.get("args", "{}")),
-                        },
+                        "name": tc.get("name"),
+                        "args": tc.get("args", {}) if isinstance(tc.get("args"), dict) else {},
+                        "type": "tool_call",
                     }
                     for i, tc in enumerate(tool_calls)
                 ]
@@ -268,11 +276,9 @@ class ModelGateway:
                 "tool_calls": [
                     {
                         "id": "call_search_1",
-                        "type": "function",
-                        "function": {
-                            "name": "search_knowledge",
-                            "arguments": json.dumps({"query": user_msg, "topK": 5}, ensure_ascii=False),
-                        },
+                        "name": "search_knowledge",
+                        "args": {"query": user_msg, "topK": 5},
+                        "type": "tool_call",
                     }
                 ],
             }
@@ -316,18 +322,18 @@ class ModelGateway:
             base = gateway_url.rstrip("/")
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
             try:
-                with httpx.Client(timeout=20.0) as client:
-                    response = client.post(
-                        endpoint,
-                        headers={"Authorization": f"Bearer {master_key}"},
-                        json={
-                            "model": model_alias,
-                            "query": query,
-                            "documents": documents,
-                            "top_n": min(top_n, len(documents)),
-                            "return_documents": False,
-                        },
-                    )
+                response = get_http_client().post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {master_key}"},
+                    json={
+                        "model": model_alias,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": min(top_n, len(documents)),
+                        "return_documents": False,
+                    },
+                    timeout=20.0,
+                )
                 if response.status_code != 200:
                     raise ApiException(
                         503,
