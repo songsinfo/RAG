@@ -52,8 +52,6 @@ class QaService:
                 )
             )
             with get_db_connection() as conn:
-                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
-                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(and_(
@@ -682,6 +680,8 @@ class QaService:
         now = datetime.now(timezone.utc)
         try:
             with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
                 conn.execute(
                     update(qa_run_table)
                     .where(
@@ -938,9 +938,41 @@ class QaService:
             QaService._fail_run(actor.tenant_id, run_id, "INTERNAL_ERROR")
 
     @staticmethod
-    def _mark_waiting_approval(tenant_id: str, run_id: str):
+    def _mark_waiting_approval(tenant_id: str, run_id: str) -> bool:
         now = datetime.now(timezone.utc)
+        current = current_qa_execution()
         with get_db_connection() as conn:
+            job_clauses = [
+                job_table.c.tenant_id == tenant_id,
+                job_table.c.target_id == run_id,
+                job_table.c.kind == "QA_RUN",
+                job_table.c.status.in_(["QUEUED", "RUNNING"]),
+            ]
+            if current is not None:
+                job_id, lease_epoch = current
+                job_clauses.extend([
+                    job_table.c.id == job_id,
+                    job_table.c.status == "RUNNING",
+                    job_table.c.lease_epoch == lease_epoch,
+                ])
+            job_result = conn.execute(
+                update(job_table)
+                .where(and_(*job_clauses))
+                .values(
+                    status="WAITING_APPROVAL",
+                    stage="APPROVAL",
+                    lease_until=None,
+                    error_code=None,
+                    updated_at=now,
+                )
+            )
+            if current is not None and job_result.rowcount != 1:
+                conn.rollback()
+                return False
+            if current is None and job_result.rowcount == 0:
+                conn.rollback()
+                return False
+
             conn.execute(
                 update(qa_run_table)
                 .where(and_(
@@ -955,23 +987,8 @@ class QaService:
                     updated_at=now,
                 )
             )
-            conn.execute(
-                update(job_table)
-                .where(and_(
-                    job_table.c.tenant_id == tenant_id,
-                    job_table.c.target_id == run_id,
-                    job_table.c.kind == "QA_RUN",
-                    job_table.c.status == "RUNNING",
-                ))
-                .values(
-                    status="WAITING_APPROVAL",
-                    stage="APPROVAL",
-                    lease_until=None,
-                    error_code=None,
-                    updated_at=now,
-                )
-            )
             conn.commit()
+            return True
 
     @staticmethod
     def resolve_tool_approval(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
