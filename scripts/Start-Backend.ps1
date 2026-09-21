@@ -11,6 +11,6 @@ $env:RAG_IMPORT_ROOT=Join-Path $ragRoot ".runtime/$Environment/import"
 $backendDir=Join-Path $ragRoot 'backend'
 $env:PYTHONPATH=$backendDir
 $venvPython=Join-Path $backendDir '.venv/Scripts/python.exe'
-if(-not(Test-Path -LiteralPath $venvPython)){throw "Python venv not found at $venvPython. Run: python -m venv backend/.venv && backend/.venv/Scripts/pip install -r backend/requirements.txt"}
+if(-not(Test-Path -LiteralPath $venvPython)){throw "Python venv not found at $venvPython. Run: python -m venv backend/.venv && backend/.venv/Scripts/pip install -e backend"}
 & $venvPython -m uvicorn app.main:app --host 0.0.0.0 --port $Port
 if($LASTEXITCODE -ne 0){throw "Backend failed with exit code $LASTEXITCODE"}

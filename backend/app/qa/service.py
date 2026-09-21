@@ -1,16 +1,21 @@
 import hashlib
 import json
+import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
+logger = logging.getLogger(__name__)
+
 from sqlalchemy import select, and_, or_, exists, update
+from app.config import is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.identity.deps import Actor, can_read_document
 from app.models import (
+    tenant_table,
     conversation_table,
     context_segment_table,
     segment_kb_table,
@@ -463,6 +468,17 @@ class QaService:
                 .order_by(qa_run_table.c.turn_no.desc())
             ).scalar() or 0
 
+            # Resolve retrieval config_id
+            config_id = body.get("configId")
+            if not config_id:
+                t_row = conn.execute(
+                    select(tenant_table.c.active_retrieval_config_id).where(tenant_table.c.id == actor.tenant_id)
+                ).first()
+                if t_row and t_row.active_retrieval_config_id:
+                    config_id = str(t_row.active_retrieval_config_id)
+                else:
+                    config_id = "cfg-default-retrieval"
+
             conn.execute(
                 qa_run_table.insert().values(
                     tenant_id=actor.tenant_id,
@@ -471,7 +487,7 @@ class QaService:
                     conversation_id=conv_id,
                     segment_id=seg.id,
                     turn_no=max_turn + 1,
-                    config_id=None,
+                    config_id=config_id,
                     mode=mode,
                     strict_mode=strict_mode,
                     status="QUEUED",
@@ -492,17 +508,11 @@ class QaService:
             )
             conn.commit()
 
-        # Submit to async executor
-        _executor.submit(
-            QaService._execute_run,
-            actor,
-            run_id,
-            conv_id,
-            str(seg.id),
-            question,
-            mode,
-            strict_mode,
-        )
+        run_args = (actor, run_id, conv_id, str(seg.id), question, mode, strict_mode)
+        if is_test_env():
+            QaService._execute_run(*run_args)
+        else:
+            _executor.submit(QaService._execute_run, *run_args)
 
         return {
             "runId": run_id,
@@ -812,8 +822,10 @@ class QaService:
             QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", validated)
 
         except ApiException as e:
+            logger.error("Run %s failed with ApiException: %s (code=%s)", run_id, e.message, e.code)
             QaService._fail_run(actor.tenant_id, run_id, e.code)
         except Exception as e:
+            logger.exception("Run %s failed with unexpected exception: %s", run_id, e)
             QaService._fail_run(actor.tenant_id, run_id, "INTERNAL_ERROR")
 
     @staticmethod
@@ -1266,4 +1278,3 @@ class QaService:
             conn.commit()
 
         return {"status": status_val}
-

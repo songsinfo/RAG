@@ -14,11 +14,31 @@ class Settings(BaseSettings):
     RAG_CSRF_SECRET: str = "default-csrf-secret-change-in-prod"
     RAG_COOKIE_SECURE: bool = False
     PORT: int = 8080
+    MILVUS_HOST: str = "127.0.0.1"
+    MILVUS_PORT: int = 19530
+    MILVUS_URI: str = ""
+    LITELLM_BASE_URL: str = ""
+    LITELLM_PORT: int = 4000
+    LITELLM_MASTER_KEY: str = "sk-litellm-internal-master-key"
+    DOCLING_URL: str = "http://127.0.0.1:5001"
+    DOCLING_API_KEY: str = ""
 
     model_config = SettingsConfigDict(
         env_file=None,
         extra="ignore"
     )
+
+    @property
+    def milvus_effective_uri(self) -> str:
+        if self.MILVUS_URI:
+            return self.MILVUS_URI
+        return f"http://{self.MILVUS_HOST}:{self.MILVUS_PORT}"
+
+    @property
+    def litellm_effective_url(self) -> str:
+        if self.LITELLM_BASE_URL:
+            return self.LITELLM_BASE_URL
+        return f"http://127.0.0.1:{self.LITELLM_PORT}"
 
     @property
     def sqlalchemy_database_uri(self) -> str:
@@ -46,7 +66,7 @@ def load_settings() -> Settings:
         from dotenv import load_dotenv
         load_dotenv(env_file)
 
-    return Settings(
+    s = Settings(
         ENVIRONMENT=os.getenv("RAG_ENVIRONMENT", "demo"),
         DB_NAME=os.getenv("DB_NAME", "rag_demo"),
         DB_USER=os.getenv("DB_USER", "rag"),
@@ -57,7 +77,29 @@ def load_settings() -> Settings:
         RAG_CSRF_SECRET=os.getenv("RAG_CSRF_SECRET", "default-csrf-secret-change-in-prod"),
         RAG_COOKIE_SECURE=os.getenv("RAG_COOKIE_SECURE", "false").lower() in ("true", "1", "yes"),
         PORT=int(os.getenv("PORT", "8080")),
+        MILVUS_HOST=os.getenv("MILVUS_HOST", "127.0.0.1"),
+        MILVUS_PORT=int(os.getenv("MILVUS_PORT", "19530")),
+        MILVUS_URI=os.getenv("MILVUS_URI", ""),
+        LITELLM_BASE_URL=os.getenv("LITELLM_BASE_URL", ""),
+        LITELLM_PORT=int(os.getenv("LITELLM_PORT", "4000")),
+        LITELLM_MASTER_KEY=os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key"),
+        DOCLING_URL=os.getenv("DOCLING_URL", "http://127.0.0.1:5001"),
+        DOCLING_API_KEY=os.getenv("DOCLING_API_KEY", ""),
     )
+    if s.ENVIRONMENT != "test":
+        if not os.getenv("MILVUS_URI"):
+            os.environ["MILVUS_URI"] = s.milvus_effective_uri
+        if not os.getenv("LITELLM_BASE_URL") and s.LITELLM_BASE_URL:
+            os.environ["LITELLM_BASE_URL"] = s.LITELLM_BASE_URL
+    return s
 
 
 settings = load_settings()
+
+
+def is_test_env() -> bool:
+    return (
+        os.getenv("RAG_ENVIRONMENT") == "test"
+        or getattr(settings, "ENVIRONMENT", "") == "test"
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+    )

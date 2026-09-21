@@ -6,11 +6,18 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 import bcrypt
 
-# Ensure test secret
+# Ensure test environment
+os.environ["RAG_ENVIRONMENT"] = "test"
 os.environ["RAG_CSRF_SECRET"] = "test-secret-key-12345"
+os.environ["LITELLM_BASE_URL"] = ""
+os.environ["MILVUS_URI"] = ""
+
+from app.config import settings
+settings.ENVIRONMENT = "test"
+settings.LITELLM_BASE_URL = ""
+settings.MILVUS_URI = ""
 
 from app.models import metadata, tenant_table, app_user_table, user_group_table, group_member_table
-from app.config import settings
 import app.db as app_db
 from app.main import app
 

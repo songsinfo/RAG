@@ -1,14 +1,23 @@
 import json
+import logging
 import os
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-from sqlalchemy import insert
+from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
+
+logger = logging.getLogger(__name__)
+
+MODEL_CONFIG_IDS = {
+    "chat-main": "cfg-model-chat-main",
+    "embedding-main": "cfg-model-embedding-main",
+    "judge-main": "cfg-model-judge-main",
+}
 
 
 class ModelGateway:
@@ -73,6 +82,8 @@ class ModelGateway:
                     model_alias=model_alias,
                 )
                 return content
+            except ApiException:
+                raise
             except Exception as e:
                 # Failure終态 - record failed call and raise
                 cls._record_call(
@@ -86,6 +97,19 @@ class ModelGateway:
                     model_alias=model_alias,
                 )
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"大模型网关调用失败: {e}")
+
+        if not is_test_env():
+            cls._record_call(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                run_id=run_id,
+                purpose=purpose,
+                status="FAILED",
+                input_tokens=0,
+                output_tokens=0,
+                model_alias=model_alias,
+            )
+            raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # Fallback for offline unit test environments
         duration_ms = int((time.time() - start_time) * 1000)
@@ -221,9 +245,15 @@ class ModelGateway:
                     "content": response.content or "",
                     "tool_calls": formatted_calls,
                 }
+            except ApiException:
+                raise
             except Exception as e:
                 cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"Agent大模型网关调用失败: {e}")
+
+        if not is_test_env():
+            cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
+            raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # Default deterministic mock: first round search, second round answer
         cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias)
@@ -284,7 +314,7 @@ class ModelGateway:
                         run_id=run_id,
                         job_id=None,
                         purpose=purpose,
-                        model_config_id=model_alias,
+                        model_config_id=MODEL_CONFIG_IDS.get(model_alias, model_alias),
                         attempt_no=1,
                         status=status,
                         reserved_amount="0.000000",
@@ -302,4 +332,4 @@ class ModelGateway:
                 )
                 conn.commit()
         except Exception:
-            pass
+            logger.exception("Failed to persist model call %s", call_id)

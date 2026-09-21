@@ -106,7 +106,7 @@ class KnowledgeService:
                         tenant_id=actor.tenant_id,
                         id=str(uuid.uuid4()),
                         kb_id=kb_id,
-                        principal_type=r.get("type", "USER"),
+                        principal_type=r.get("principalType") or r.get("type", "USER"),
                         user_id=r.get("userId"),
                         group_id=r.get("groupId"),
                         created_at=now,
@@ -199,7 +199,7 @@ class KnowledgeService:
                         tenant_id=actor.tenant_id,
                         id=str(uuid.uuid4()),
                         kb_id=kb_id,
-                        principal_type=r.get("type", "USER"),
+                        principal_type=r.get("principalType") or r.get("type", "USER"),
                         user_id=r.get("userId"),
                         group_id=r.get("groupId"),
                         created_at=now,
@@ -556,8 +556,10 @@ class KnowledgeService:
                     raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
             # 4. Save Artifact
-            storage_key, sha256_bytes, size_bytes = save_artifact(actor.tenant_id, filename, file_bytes)
             art_id = str(uuid.uuid4())
+            storage_key, sha256_bytes, size_bytes = save_artifact(
+                actor.tenant_id, filename, file_bytes, document_id=doc_id, artifact_id=art_id
+            )
             conn.execute(
                 artifact_table.insert().values(
                     tenant_id=actor.tenant_id,
@@ -611,7 +613,7 @@ class KnowledgeService:
                     tenant_id=actor.tenant_id,
                     id=cfg_id,
                     kind="BUILD",
-                    name=f"build-cfg-{v_no}",
+                    name=f"build-cfg-{doc_id}",
                     revision=v_no,
                     sha256=cfg_hash,
                     payload=build_config,

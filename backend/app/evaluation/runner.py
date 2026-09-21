@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import os
 import time
@@ -8,11 +9,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 
+logger = logging.getLogger(__name__)
+
 from sqlalchemy import select, and_, or_, func, text, update, delete
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.identity.deps import Actor, can_read_document
-from app.config import settings
+from app.config import settings, is_test_env
 from app.models import (
     tenant_table,
     app_user_table,
@@ -279,8 +282,10 @@ class EvaluationRunner:
                     )
             conn.commit()
 
-        # Submit to background executor
-        _eval_executor.submit(EvaluationRunner._execute_run, actor, run_id)
+        if is_test_env():
+            EvaluationRunner._execute_run(actor, run_id)
+        else:
+            _eval_executor.submit(EvaluationRunner._execute_run, actor, run_id)
 
         return {"runId": run_id, "jobId": job_id, "status": "QUEUED"}
 
@@ -441,7 +446,7 @@ class EvaluationRunner:
                     submitted = QaService.submit_run(
                         persona_actor,
                         conv_id,
-                        {"question": question_text, "mode": "RAG", "strict": manifest.get("strict", False)},
+                        {"question": question_text, "mode": "RAG", "strictMode": manifest.get("strict", False)},
                         idempotency_key=f"eval:{result_id}:0",
                     )
                     qa_run_id = submitted["runId"]
@@ -455,7 +460,7 @@ class EvaluationRunner:
 
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
                     status_str = qa_detail.get("status", "FAILED")
-                    is_terminal_success = status_str in {"COMPLETED", "PARTIAL", "NO_EVIDENCE", "CONFLICT"}
+                    is_terminal_success = status_str in {"SUCCEEDED", "COMPLETED", "PARTIAL", "NO_EVIDENCE", "CONFLICT"}
 
                     evidence_items = qa_detail.get("evidence", [])
                     metrics = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, evidence_items, evidence_items)

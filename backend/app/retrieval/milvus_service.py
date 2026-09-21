@@ -1,9 +1,11 @@
 import os
 import logging
 from typing import List, Dict, Any, Optional
-from pymilvus import DataType
+from pymilvus import DataType, Function, FunctionType, AnnSearchRequest, RRFRanker, CollectionSchema, FieldSchema
 from sqlalchemy import select, and_, or_, exists
+from app.config import settings, is_test_env
 from app.db import get_db_connection
+from app.errors import ApiException
 from app.models import chunk_table, index_build_table, document_table, kb_grant_table, document_grant_table
 from app.retrieval.normalizer import normalize_terms
 from app.retrieval.ranking import rrf_fuse
@@ -24,34 +26,58 @@ class MilvusHybridService:
     def get_client(cls):
         if not cls._client_checked:
             cls._client_checked = True
-            milvus_uri = os.getenv("MILVUS_URI")
-            if not milvus_uri:
+            if is_test_env() and not os.getenv("MILVUS_URI"):
                 cls._client = None
                 return None
+            milvus_uri = os.getenv("MILVUS_URI") or f"http://{os.getenv('MILVUS_HOST', '127.0.0.1')}:{os.getenv('MILVUS_PORT', '19530')}"
             try:
                 from pymilvus import MilvusClient
-                client = MilvusClient(uri=milvus_uri, timeout=1.0)
+                client = MilvusClient(uri=milvus_uri, timeout=3.0)
                 if not client.has_collection(COLLECTION_NAME):
-                    schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
-                    schema.add_field(field_name="id", datatype=DataType.VARCHAR, max_length=128, is_primary=True)
-                    schema.add_field(field_name="tenant_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="kb_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="document_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="version_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="build_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="chunk_id", datatype=DataType.VARCHAR, max_length=64)
-                    schema.add_field(field_name="representation_type", datatype=DataType.VARCHAR, max_length=32)
-                    schema.add_field(field_name="text_content", datatype=DataType.VARCHAR, max_length=65535)
-                    schema.add_field(field_name="normalized_terms", datatype=DataType.VARCHAR, max_length=65535)
-                    schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
-
+                    fields = [
+                        FieldSchema("id", DataType.VARCHAR, max_length=128, is_primary=True),
+                        FieldSchema("tenant_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("kb_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("document_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("version_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("build_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("chunk_id", DataType.VARCHAR, max_length=64),
+                        FieldSchema("representation_type", DataType.VARCHAR, max_length=32),
+                        FieldSchema("text_content", DataType.VARCHAR, max_length=65535, enable_analyzer=True),
+                        FieldSchema("sparse_vector", DataType.SPARSE_FLOAT_VECTOR),
+                        FieldSchema("dense_vector", DataType.FLOAT_VECTOR, dim=1024),
+                    ]
+                    bm25_fn = Function(
+                        name="text_bm25_emb",
+                        function_type=FunctionType.BM25,
+                        input_field_names=["text_content"],
+                        output_field_names=["sparse_vector"],
+                    )
+                    schema = CollectionSchema(fields=fields, functions=[bm25_fn], auto_id=False, enable_dynamic_field=True)
                     index_params = client.prepare_index_params()
-                    index_params.add_index(field_name="dense_vector", index_type="HNSW", metric_type="COSINE", params={"M": 16, "efConstruction": 200})
-                    client.create_collection(collection_name=COLLECTION_NAME, schema=schema, index_params=index_params)
+                    index_params.add_index(
+                        field_name="dense_vector",
+                        index_type="HNSW",
+                        metric_type="COSINE",
+                        params={"M": 16, "efConstruction": 200},
+                    )
+                    index_params.add_index(
+                        field_name="sparse_vector",
+                        index_type="SPARSE_INVERTED_INDEX",
+                        metric_type="BM25",
+                    )
+                    client.create_collection(
+                        collection_name=COLLECTION_NAME,
+                        schema=schema,
+                        index_params=index_params,
+                    )
                 cls._client = client
                 logger.info("Connected to Milvus server at %s", milvus_uri)
             except Exception as e:
-                logger.warning("Milvus connection failed (%s); using in-memory hybrid retrieval fallback.", e)
+                if not is_test_env():
+                    logger.error("Milvus connection failed at %s: %s", milvus_uri, e)
+                else:
+                    logger.warning("Milvus connection failed (%s); using in-memory mock store for test environment.", e)
                 cls._client = None
         return cls._client
 
@@ -88,7 +114,11 @@ class MilvusHybridService:
             try:
                 client.upsert(collection_name=COLLECTION_NAME, data=milvus_records)
             except Exception as e:
-                logger.warning("Failed to upsert to Milvus: %s", e)
+                logger.error("Failed to upsert to Milvus: %s", e)
+                if not is_test_env():
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 入库失败: {e}")
+        elif not is_test_env():
+            raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 服务不可用，文档入库中止")
 
     @classmethod
     def delete_by_build(cls, tenant_id: str, build_id: str):
@@ -106,6 +136,8 @@ class MilvusHybridService:
                 )
             except Exception as e:
                 logger.warning("Failed to delete from Milvus by build: %s", e)
+                if not is_test_env():
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 删除失败: {e}")
 
     @classmethod
     def delete_by_document(cls, tenant_id: str, doc_id: str):
@@ -122,6 +154,8 @@ class MilvusHybridService:
                 )
             except Exception as e:
                 logger.warning("Failed to delete from Milvus by document: %s", e)
+                if not is_test_env():
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 删除失败: {e}")
 
     @classmethod
     def search(
@@ -134,7 +168,59 @@ class MilvusHybridService:
         if not allowed_build_ids:
             return []
 
-        # 1. BM25 Route: keyword matching across text_content and normalized_terms
+        client = cls.get_client()
+        if client:
+            try:
+                query_emb = get_embeddings([query], dim=1024)[0]
+                build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
+                filter_expr = f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] and representation_type == "ORIGINAL"'
+
+                dense_req = AnnSearchRequest(
+                    data=[query_emb],
+                    anns_field="dense_vector",
+                    param={"metric_type": "COSINE", "params": {"ef": 64}},
+                    limit=top_k * 2,
+                    expr=filter_expr,
+                )
+                sparse_req = AnnSearchRequest(
+                    data=[query],
+                    anns_field="sparse_vector",
+                    param={"metric_type": "BM25"},
+                    limit=top_k * 2,
+                    expr=filter_expr,
+                )
+
+                res = client.hybrid_search(
+                    collection_name=COLLECTION_NAME,
+                    reqs=[dense_req, sparse_req],
+                    ranker=RRFRanker(k=60),
+                    limit=top_k,
+                    output_fields=["chunk_id", "document_id", "text_content"],
+                )
+
+                hits = []
+                if res and len(res) > 0:
+                    for item in res[0]:
+                        entity = item.get("entity", {})
+                        chunk_id = entity.get("chunk_id") or item.get("id")
+                        hits.append({
+                            "id": chunk_id,
+                            "chunkId": chunk_id,
+                            "documentId": entity.get("document_id"),
+                            "text": entity.get("text_content"),
+                            "score": item.get("distance", 0.0),
+                        })
+                return hits
+            except Exception as e:
+                logger.error("Milvus hybrid search error: %s", e)
+                if not is_test_env():
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 混合检索失败: {e}")
+
+        # In non-test environment without a live Milvus connection, fail fast
+        if not is_test_env():
+            raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 检索服务不可用")
+
+        # In-memory mock fallback ONLY for unit tests (RAG_ENVIRONMENT == 'test')
         bm25_hits: List[Dict[str, Any]] = []
         query_terms = [t.lower() for t in query.split() if t.strip()]
 
@@ -157,7 +243,6 @@ class MilvusHybridService:
 
         bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
-        # 2. Dense Route: cosine similarity on embeddings
         query_emb = get_embeddings([query], dim=1024)[0]
         dense_hits: List[Dict[str, Any]] = []
 
@@ -179,7 +264,6 @@ class MilvusHybridService:
 
         dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
 
-        # 3. RRF Fusion
         fused = rrf_fuse([dense_hits[:top_k * 2], bm25_hits[:top_k * 2]], weights=[0.5, 0.5], rrf_k=60)
         return fused[:top_k]
 

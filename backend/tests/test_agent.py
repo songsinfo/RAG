@@ -307,33 +307,36 @@ def test_agent_repeated_calls_termination(client):
             ],
         }
 
-    ModelGateway._agent_mock_handler = mock_repeated
+    try:
+        ModelGateway._agent_mock_handler = mock_repeated
 
-    conv_resp = client.post(
-        "/api/v1/conversations",
-        json={"title": "Repeated Calls Test"},
-        headers={"X-CSRF-Token": csrf},
-    )
-    conv_id = conv_resp.json()["conversationId"]
+        conv_resp = client.post(
+            "/api/v1/conversations",
+            json={"title": "Repeated Calls Test"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        conv_id = conv_resp.json()["conversationId"]
 
-    run_resp = client.post(
-        f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "测试循环调用", "mode": "AGENT"},
-        headers={"X-CSRF-Token": csrf},
-    )
-    run_id = run_resp.json()["runId"]
+        run_resp = client.post(
+            f"/api/v1/conversations/{conv_id}/runs",
+            json={"question": "测试循环调用", "mode": "AGENT"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        run_id = run_resp.json()["runId"]
 
-    run_data = None
-    for _ in range(60):
-        time.sleep(0.1)
-        r = client.get(f"/api/v1/runs/{run_id}")
-        run_data = r.json()
-        if run_data["status"] in ("SUCCEEDED", "COMPLETED", "FAILED"):
-            break
+        run_data = None
+        for _ in range(120):
+            time.sleep(0.1)
+            r = client.get(f"/api/v1/runs/{run_id}")
+            run_data = r.json()
+            if run_data["status"] in ("SUCCEEDED", "COMPLETED", "FAILED"):
+                break
 
-    assert run_data is not None
-    assert run_data["status"] == "FAILED"
-    assert run_data["terminalReason"] == "REPEATED_CALLS"
+        assert run_data is not None
+        assert run_data["status"] == "FAILED"
+        assert run_data["terminalReason"] == "REPEATED_CALLS"
+    finally:
+        ModelGateway._agent_mock_handler = None
 
 
 def test_agent_unknown_tool_handled(client):

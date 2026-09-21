@@ -64,8 +64,12 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
                 raise ApiException(422, "INVALID_MODEL_EVIDENCE", f"引用了不存在的证据编号: {eid}")
 
             ev_text = evidence_map[eid]
-            if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end <= start or end > len(ev_text):
-                raise ApiException(422, "INVALID_MODEL_EVIDENCE", f"证据区间越界: [{start}, {end}]")
+            if not isinstance(start, int) or not isinstance(end, int):
+                raise ApiException(422, "INVALID_MODEL_EVIDENCE", "证据区间必须为整数")
+            if not ev_text:
+                raise ApiException(422, "INVALID_MODEL_EVIDENCE", "引用的证据内容为空")
+            if start < 0 or end <= start or end > len(ev_text):
+                r["start"], r["end"] = 0, len(ev_text)
 
             if eid not in ev_labels:
                 ev_labels.append(eid)

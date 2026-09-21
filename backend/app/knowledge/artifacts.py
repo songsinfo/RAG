@@ -16,7 +16,13 @@ def get_artifact_root() -> Path:
     return p
 
 
-def save_artifact(tenant_id: str, filename: str, data: bytes) -> Tuple[str, bytes, int]:
+def save_artifact(
+    tenant_id: str,
+    filename: str,
+    data: bytes,
+    document_id: str | None = None,
+    artifact_id: str | None = None,
+) -> Tuple[str, bytes, int]:
     """Saves file to private directory and returns (storage_key, sha256_binary, size_bytes)."""
     sha = hashlib.sha256(data)
     sha_digest = sha.digest()
@@ -24,39 +30,53 @@ def save_artifact(tenant_id: str, filename: str, data: bytes) -> Tuple[str, byte
 
     safe_name = Path(filename).name.replace(" ", "_")
     root = get_artifact_root()
-    tenant_dir = root / tenant_id / sha_hex[:2] / sha_hex
-    tenant_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = tenant_dir / safe_name
+    if document_id and artifact_id:
+        storage_key = f"{tenant_id}/{document_id}/{artifact_id}/{safe_name}"
+        dest = root / tenant_id / document_id / artifact_id / safe_name
+    else:
+        storage_key = f"{tenant_id}/{sha_hex}/{safe_name}"
+        dest = root / tenant_id / sha_hex[:2] / sha_hex / safe_name
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
 
-    # storage_key is relative or URI-like
-    storage_key = f"{tenant_id}/{sha_hex}/{safe_name}"
     return storage_key, sha_digest, len(data)
 
 
 def read_artifact(storage_key: str) -> bytes:
     root = get_artifact_root()
+    target = (root / storage_key).resolve()
+    if target.is_file() and target.is_relative_to(root.resolve()):
+        return target.read_bytes()
+
     parts = storage_key.split("/")
-    if len(parts) != 3:
-        raise ApiException(404, "ARTIFACT_NOT_FOUND", "构件不存在")
-    tenant_id, sha_hex, filename = parts
-    target = root / tenant_id / sha_hex[:2] / sha_hex / filename
-    if not target.exists():
-        raise ApiException(404, "ARTIFACT_NOT_FOUND", "构件不存在")
-    return target.read_bytes()
+    if len(parts) == 3:
+        tenant_id, sha_hex, filename = parts
+        legacy_target = (root / tenant_id / sha_hex[:2] / sha_hex / filename).resolve()
+        if legacy_target.is_file() and legacy_target.is_relative_to(root.resolve()):
+            return legacy_target.read_bytes()
+
+    raise ApiException(404, "ARTIFACT_NOT_FOUND", "构件不存在")
 
 
 def delete_artifact(storage_key: str):
     root = get_artifact_root()
-    parts = storage_key.split("/")
-    if len(parts) != 3:
-        return
-    tenant_id, sha_hex, filename = parts
-    target = root / tenant_id / sha_hex[:2] / sha_hex / filename
-    if target.exists():
+    target = (root / storage_key).resolve()
+    if target.is_file() and target.is_relative_to(root.resolve()):
         try:
             target.unlink()
         except OSError:
             pass
+        return
+
+    parts = storage_key.split("/")
+    if len(parts) == 3:
+        tenant_id, sha_hex, filename = parts
+        legacy_target = (root / tenant_id / sha_hex[:2] / sha_hex / filename).resolve()
+        if legacy_target.is_file() and legacy_target.is_relative_to(root.resolve()):
+            try:
+                legacy_target.unlink()
+            except OSError:
+                pass
 

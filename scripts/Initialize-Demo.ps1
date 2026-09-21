@@ -12,15 +12,19 @@ $offset=@{demo=0;evaluation=1;test=2}[$Environment]
 $dbPort=3307+$offset
 $milvusPort=19530+$offset
 $doclingPort=5001+$offset
+$litellmPort=4000+$offset
 $values=@{
  RAG_ENVIRONMENT=$Environment
  COMPOSE_PROJECT_NAME="rag-$Environment"
  DB_NAME="rag_$Environment"
  DB_PORT=$dbPort
  MILVUS_PORT=$milvusPort
+ MILVUS_HOST="127.0.0.1"
+ MILVUS_URI="http://localhost:$milvusPort"
+ LITELLM_PORT=$litellmPort
+ LITELLM_BASE_URL="http://localhost:$litellmPort"
  DOCLING_PORT=$doclingPort
  DB_URL=('jdbc:mysql://localhost:{0}/rag_{1}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true' -f $dbPort,$Environment)
- MILVUS_HOST="127.0.0.1"
  DOCLING_URL="http://localhost:$doclingPort"
  DB_PASSWORD=(New-Secret)
  MYSQL_ROOT_PASSWORD=(New-Secret)

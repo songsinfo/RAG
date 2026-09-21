@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, and_, text
 
-from app.config import settings
+from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException, api_exception_handler
 from app.identity.deps import Actor, get_current_actor
@@ -14,12 +14,22 @@ from app.models import tenant_table, app_user_table, user_group_table, group_mem
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: ensure DB connection is reachable and recover unfinished runs
+    # Startup: ensure DB connection is reachable and seed database
     try:
         with get_db_connection() as conn:
             conn.execute(text("SELECT 1"))
     except Exception as e:
+        if not is_test_env():
+            raise RuntimeError(f"Fatal: Database connection failed during startup: {e}") from e
         print(f"Warning: Database startup check failed: {e}")
+
+    try:
+        from app.seed import DemoSeed
+        DemoSeed.run()
+    except Exception as e:
+        if not is_test_env():
+            raise RuntimeError(f"Fatal: Database seed failed during startup: {e}") from e
+        print(f"Warning: Database seed check: {e}")
     try:
         from app.qa.service import QaService
         QaService.recover_unfinished_runs()
