@@ -17,7 +17,7 @@ def guard_retrieved_content(text: str) -> Tuple[str, Dict[str, object]]:
     # Retrieved content is always explicitly data-delimited. Suspicious content
     # remains citeable but cannot masquerade as system/tool instructions.
     wrapped = (
-        "<retrieved_document trust="untrusted-data">\n"
+        '<retrieved_document trust="untrusted-data">\n'
         + raw
         + "\n</retrieved_document>"
     )
