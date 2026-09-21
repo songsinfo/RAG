@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Iterator, Optional, Tuple
 
 from sqlalchemy import and_, select
@@ -30,18 +31,27 @@ def current_qa_execution() -> Optional[Tuple[str, int]]:
 
 
 def qa_lease_is_current(conn, tenant_id: str, run_id: str) -> bool:
+    """Fence QA side effects with the current durable lease.
+
+    The job row is locked in the caller's transaction, so a replacement claim
+    cannot race between this ownership check and the protected writes.
+    """
     current = current_qa_execution()
     if current is None:
         return True
     job_id, lease_epoch = current
+    now = datetime.now(timezone.utc)
     row = conn.execute(
-        select(job_table.c.id).where(and_(
+        select(job_table.c.id)
+        .where(and_(
             job_table.c.tenant_id == tenant_id,
             job_table.c.id == job_id,
             job_table.c.kind == "QA_RUN",
             job_table.c.target_id == run_id,
             job_table.c.status == "RUNNING",
             job_table.c.lease_epoch == lease_epoch,
+            job_table.c.lease_until > now,
         ))
+        .with_for_update()
     ).first()
     return row is not None

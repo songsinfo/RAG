@@ -556,56 +556,64 @@ class QaService:
         job_id: Optional[str] = None,
         lease_epoch: Optional[int] = None,
     ):
-        with get_db_connection() as conn:
-            row = conn.execute(
-                select(qa_run_table).where(and_(
-                    qa_run_table.c.tenant_id == actor.tenant_id,
-                    qa_run_table.c.id == run_id,
-                    qa_run_table.c.owner_id == actor.user_id,
-                ))
-            ).first()
-            if not row:
-                raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
-            if str(row.status) in {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"}:
-                return
+        # Establish the execution lease before reading or mutating any retry
+        # state. The ownership check locks the job row in this transaction so
+        # a stale worker cannot erase a replacement worker's sources/events.
+        with qa_execution_scope(job_id, lease_epoch):
+            with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
 
-            # A durable retry replays the run from its immutable request fields.
-            # Clear only derived attempt state; model_call remains as audit history.
-            if str(row.status) == "RUNNING":
-                conn.execute(delete(run_source_table).where(and_(
-                    run_source_table.c.tenant_id == actor.tenant_id,
-                    run_source_table.c.run_id == run_id,
-                )))
-                conn.execute(delete(run_event_table).where(and_(
-                    run_event_table.c.tenant_id == actor.tenant_id,
-                    run_event_table.c.run_id == run_id,
-                )))
-                conn.execute(
-                    update(qa_run_table)
+                row = conn.execute(
+                    select(qa_run_table)
                     .where(and_(
                         qa_run_table.c.tenant_id == actor.tenant_id,
                         qa_run_table.c.id == run_id,
+                        qa_run_table.c.owner_id == actor.user_id,
                     ))
-                    .values(
-                        status="QUEUED",
-                        stage="ROUTING",
-                        result_json=None,
-                        terminal_reason=None,
-                        started_at=None,
-                        finished_at=None,
-                        updated_at=datetime.now(timezone.utc),
+                    .with_for_update()
+                ).first()
+                if not row:
+                    raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
+                if str(row.status) in {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"}:
+                    return
+
+                # A valid durable retry may reset only its own previous
+                # attempt's derived state while holding the current job lease.
+                if str(row.status) == "RUNNING":
+                    conn.execute(delete(run_source_table).where(and_(
+                        run_source_table.c.tenant_id == actor.tenant_id,
+                        run_source_table.c.run_id == run_id,
+                    )))
+                    conn.execute(delete(run_event_table).where(and_(
+                        run_event_table.c.tenant_id == actor.tenant_id,
+                        run_event_table.c.run_id == run_id,
+                    )))
+                    conn.execute(
+                        update(qa_run_table)
+                        .where(and_(
+                            qa_run_table.c.tenant_id == actor.tenant_id,
+                            qa_run_table.c.id == run_id,
+                        ))
+                        .values(
+                            status="QUEUED",
+                            stage="ROUTING",
+                            result_json=None,
+                            terminal_reason=None,
+                            started_at=None,
+                            finished_at=None,
+                            updated_at=datetime.now(timezone.utc),
+                        )
                     )
-                )
+
+                conv_id = str(row.conversation_id)
+                seg_id = str(row.segment_id)
+                question = str(row.question or "")
+                mode = str(row.mode)
+                strict_mode = bool(row.strict_mode)
+                config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
                 conn.commit()
 
-            conv_id = str(row.conversation_id)
-            seg_id = str(row.segment_id)
-            question = str(row.question or "")
-            mode = str(row.mode)
-            strict_mode = bool(row.strict_mode)
-            config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
-
-        with qa_execution_scope(job_id, lease_epoch):
             QaService._execute_run(
                 actor,
                 run_id,
