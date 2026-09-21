@@ -54,7 +54,7 @@ class QaService:
                 conn.execute(
                     update(qa_run_table)
                     .where(and_(
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                        qa_run_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
                         ~durable_job_exists,
                     ))
                     .values(
@@ -560,20 +560,33 @@ class QaService:
             ).first()
             if not row:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
-            if str(row.status) in {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"}:
+            if str(row.status) in {"SUCCEEDED", "COMPLETED", "CANCELLED", "WAITING_APPROVAL"}:
                 return
 
             # A durable retry replays the run from its immutable request fields.
             # Clear only derived attempt state; model_call remains as audit history.
-            if str(row.status) == "RUNNING":
-                conn.execute(delete(run_source_table).where(and_(
-                    run_source_table.c.tenant_id == actor.tenant_id,
-                    run_source_table.c.run_id == run_id,
-                )))
-                conn.execute(delete(run_event_table).where(and_(
-                    run_event_table.c.tenant_id == actor.tenant_id,
-                    run_event_table.c.run_id == run_id,
-                )))
+            if str(row.status) in {"RUNNING", "FAILED"}:
+                job_row = conn.execute(
+                    select(job_table.c.checkpoint, job_table.c.status).where(and_(
+                        job_table.c.tenant_id == actor.tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                    ))
+                ).first()
+                checkpoint = dict(job_row.checkpoint or {}) if job_row and job_row.checkpoint else {}
+                has_agent_checkpoint = (
+                    str(row.mode) == "AGENT"
+                    and isinstance(checkpoint.get("agentRuntime"), dict)
+                )
+                if not has_agent_checkpoint:
+                    conn.execute(delete(run_source_table).where(and_(
+                        run_source_table.c.tenant_id == actor.tenant_id,
+                        run_source_table.c.run_id == run_id,
+                    )))
+                    conn.execute(delete(run_event_table).where(and_(
+                        run_event_table.c.tenant_id == actor.tenant_id,
+                        run_event_table.c.run_id == run_id,
+                    )))
                 conn.execute(
                     update(qa_run_table)
                     .where(and_(
@@ -585,7 +598,7 @@ class QaService:
                         stage="ROUTING",
                         result_json=None,
                         terminal_reason=None,
-                        started_at=None,
+                        started_at=None if not has_agent_checkpoint else row.started_at,
                         finished_at=None,
                         updated_at=datetime.now(timezone.utc),
                     )
@@ -699,6 +712,7 @@ class QaService:
                     actor=actor,
                     run_id=run_id,
                     question=question,
+                    conversation_id=conv_id,
                     segment_id=seg_id,
                     record_event_fn=QaService._record_event,
                     is_cancelled_fn=QaService._is_cancelled,
@@ -904,10 +918,101 @@ class QaService:
 
         except ApiException as e:
             logger.error("Run %s failed with ApiException: %s (code=%s)", run_id, e.message, e.code)
+            if e.code == "APPROVAL_REQUIRED":
+                QaService._mark_waiting_approval(actor.tenant_id, run_id)
+                return
             QaService._fail_run(actor.tenant_id, run_id, e.code)
         except Exception as e:
             logger.exception("Run %s failed with unexpected exception: %s", run_id, e)
             QaService._fail_run(actor.tenant_id, run_id, "INTERNAL_ERROR")
+
+    @staticmethod
+    def _mark_waiting_approval(tenant_id: str, run_id: str):
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            conn.execute(
+                update(qa_run_table)
+                .where(and_(
+                    qa_run_table.c.tenant_id == tenant_id,
+                    qa_run_table.c.id == run_id,
+                    qa_run_table.c.status == "RUNNING",
+                ))
+                .values(
+                    status="WAITING_APPROVAL",
+                    stage="APPROVAL",
+                    terminal_reason=None,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                update(job_table)
+                .where(and_(
+                    job_table.c.tenant_id == tenant_id,
+                    job_table.c.target_id == run_id,
+                    job_table.c.kind == "QA_RUN",
+                    job_table.c.status == "RUNNING",
+                ))
+                .values(
+                    status="WAITING_APPROVAL",
+                    stage="APPROVAL",
+                    lease_until=None,
+                    error_code=None,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
+
+    @staticmethod
+    def resolve_tool_approval(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        from app.qa.checkpoint import resolve_agent_approval
+
+        tool_call_id = str(body.get("toolCallId") or "").strip()
+        decision = str(body.get("decision") or "").strip().upper()
+        if not tool_call_id or decision not in {"APPROVE", "REJECT"}:
+            raise ApiException(400, "INVALID_INPUT", "审批参数无效")
+
+        with get_db_connection() as conn:
+            run = conn.execute(
+                select(qa_run_table.c.id, qa_run_table.c.owner_id, qa_run_table.c.status).where(and_(
+                    qa_run_table.c.tenant_id == actor.tenant_id,
+                    qa_run_table.c.id == run_id,
+                ))
+            ).first()
+            if not run:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
+            if not actor.admin and str(run.owner_id) != actor.user_id:
+                raise ApiException(403, "OPERATION_FORBIDDEN", "无权审批此运行")
+            if str(run.status) != "WAITING_APPROVAL":
+                raise ApiException(409, "RUN_NOT_WAITING_APPROVAL", "当前运行不在等待审批状态")
+
+        ok = resolve_agent_approval(
+            actor.tenant_id,
+            run_id,
+            tool_call_id,
+            approved=(decision == "APPROVE"),
+        )
+        if not ok:
+            raise ApiException(409, "APPROVAL_NOT_FOUND", "待审批工具调用不存在或已变化")
+
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            conn.execute(
+                update(qa_run_table)
+                .where(and_(
+                    qa_run_table.c.tenant_id == actor.tenant_id,
+                    qa_run_table.c.id == run_id,
+                ))
+                .values(status="QUEUED", stage="ROUTING", updated_at=now)
+            )
+            conn.commit()
+
+        QaService._record_event(
+            actor.tenant_id,
+            run_id,
+            "AGENT_APPROVAL_RESOLVED",
+            {"toolCallId": tool_call_id, "decision": decision, "actorId": actor.user_id},
+        )
+        return {"runId": run_id, "status": "QUEUED", "decision": decision}
 
     @staticmethod
     def _is_cancelled(tenant_id: str, run_id: str) -> bool:
@@ -1131,6 +1236,21 @@ class QaService:
                     cancel_requested_at=now,
                     finished_at=now,
                     terminal_reason="USER_CANCELLED",
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                update(job_table)
+                .where(and_(
+                    job_table.c.tenant_id == actor.tenant_id,
+                    job_table.c.kind == "QA_RUN",
+                    job_table.c.target_id == run_id,
+                    job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
+                ))
+                .values(
+                    status="CANCELLED",
+                    cancel_requested_at=now,
+                    lease_until=None,
                     updated_at=now,
                 )
             )
