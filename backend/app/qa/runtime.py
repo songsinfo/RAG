@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import httpx
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from sqlalchemy import and_, func, select
 
 from app.db import get_db_connection
@@ -64,103 +66,104 @@ def estimate_tokens(value: Any) -> int:
     return max(1, (len(value) + 2) // 3)
 
 
+def _to_langchain_message(message: Dict[str, Any]):
+    role = str(message.get("role") or "")
+    content = message.get("content", "")
+    if role == "system":
+        return SystemMessage(content=content)
+    if role == "user":
+        return HumanMessage(content=content)
+    if role == "assistant":
+        calls = []
+        for call in message.get("tool_calls") or []:
+            if call.get("name"):
+                calls.append({
+                    "name": str(call.get("name")),
+                    "args": call.get("args") if isinstance(call.get("args"), dict) else {},
+                    "id": call.get("id"),
+                    "type": "tool_call",
+                })
+        return AIMessage(content=content, tool_calls=calls)
+    if role == "tool":
+        return ToolMessage(
+            content=content,
+            tool_call_id=str(message.get("tool_call_id") or ""),
+            name=message.get("name"),
+        )
+    return HumanMessage(content=str(content))
+
+
+def _from_langchain_message(message) -> Dict[str, Any]:
+    if isinstance(message, SystemMessage):
+        return {"role": "system", "content": message.content}
+    if isinstance(message, HumanMessage):
+        return {"role": "user", "content": message.content}
+    if isinstance(message, ToolMessage):
+        result = {
+            "role": "tool",
+            "content": message.content,
+            "tool_call_id": message.tool_call_id,
+        }
+        if message.name:
+            result["name"] = message.name
+        return result
+    if isinstance(message, AIMessage):
+        result = {"role": "assistant", "content": message.content}
+        if message.tool_calls:
+            result["tool_calls"] = [
+                {
+                    "name": call.get("name"),
+                    "args": call.get("args") if isinstance(call.get("args"), dict) else {},
+                    "id": call.get("id"),
+                    "type": "tool_call",
+                }
+                for call in message.tool_calls
+            ]
+        return result
+    return {"role": "user", "content": str(message.content)}
+
+
 def message_tokens(messages: List[Dict[str, Any]]) -> int:
-    return sum(estimate_tokens(message) for message in messages)
+    converted = [_to_langchain_message(message) for message in messages]
+    return int(count_tokens_approximately(converted))
 
 
 def compact_messages(
     messages: List[Dict[str, Any]],
     max_tokens: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    original_tokens = message_tokens(messages)
+    """Trim context with LangChain's supported message utility.
+
+    We keep the system instruction and the most recent valid conversation tail.
+    `start_on="human"` prevents a retained ToolMessage from being detached from
+    the conversational turn that produced it.
+    """
+    converted = [_to_langchain_message(message) for message in messages]
+    original_tokens = int(count_tokens_approximately(converted))
     if original_tokens <= max_tokens:
         return list(messages), {
             "trimmed": False,
             "droppedMessages": 0,
             "estimatedTokens": original_tokens,
+            "strategy": "langchain.trim_messages",
         }
 
-    source = [dict(message) for message in messages]
-    system = next((m for m in source if m.get("role") == "system"), None)
-    user_indexes = [i for i, m in enumerate(source) if m.get("role") == "user"]
-    current_user_index = user_indexes[-1] if user_indexes else 0
-    current_user = source[current_user_index] if source else {"role": "user", "content": ""}
-
-    # Previous conversation turns are the first candidates for compaction. The
-    # current user request and newest assistant/tool exchanges are preserved.
-    tail = source[current_user_index + 1:]
-    groups: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = []
-    for message in tail:
-        if message.get("role") == "assistant" and current:
-            groups.append(current)
-            current = []
-        current.append(message)
-    if current:
-        groups.append(current)
-
-    mandatory = ([system] if system else []) + [current_user]
-    kept_groups: List[List[Dict[str, Any]]] = []
-    dropped_groups: List[List[Dict[str, Any]]] = []
-    for group in reversed(groups):
-        candidate_groups = [group] + kept_groups
-        candidate = mandatory + [item for g in candidate_groups for item in g]
-        if message_tokens(candidate) <= max_tokens:
-            kept_groups.insert(0, group)
-        else:
-            dropped_groups.insert(0, group)
-
-    # Everything before the current user plus any old tool interaction groups
-    # becomes a non-factual execution summary.
-    dropped_messages = source[:current_user_index] + [
-        item for group in dropped_groups for item in group
-    ]
-    if system and dropped_messages and dropped_messages[0] is system:
-        dropped_messages = dropped_messages[1:]
-
-    tool_names: List[str] = []
-    evidence_ids: List[str] = []
-    for message in dropped_messages:
-        if message.get("role") == "assistant":
-            for call in message.get("tool_calls") or []:
-                if call.get("name"):
-                    tool_names.append(str(call["name"]))
-        if message.get("role") == "tool":
-            try:
-                payload = json.loads(str(message.get("content") or "{}"))
-                for evidence in payload.get("evidence") or []:
-                    if evidence.get("evidenceId"):
-                        evidence_ids.append(str(evidence["evidenceId"]))
-            except Exception:
-                pass
-
-    summary = {
-        "role": "system",
-        "content": (
-            "Earlier conversation/agent steps were compacted for context budget. "
-            f"Dropped messages={len(dropped_messages)}; "
-            f"tools={sorted(set(tool_names))}; evidenceIds={sorted(set(evidence_ids))}. "
-            "This is execution metadata, not factual evidence."
-        ),
-    }
-    compacted = ([system] if system else []) + [summary, current_user] + [
-        item for group in kept_groups for item in group
-    ]
-
-    # Bound giant tool payloads while preserving assistant/tool pairing.
-    if message_tokens(compacted) > max_tokens:
-        for message in compacted:
-            if message.get("role") == "tool":
-                content = str(message.get("content") or "")
-                if len(content) > 1000:
-                    message["content"] = content[:1000] + "...<trimmed>"
-            if message_tokens(compacted) <= max_tokens:
-                break
-
+    trimmed = trim_messages(
+        converted,
+        max_tokens=max_tokens,
+        token_counter="approximate",
+        strategy="last",
+        allow_partial=False,
+        start_on="human",
+        include_system=True,
+    )
+    compacted = [_from_langchain_message(message) for message in trimmed]
+    estimated = int(count_tokens_approximately(trimmed))
     return compacted, {
         "trimmed": True,
-        "droppedMessages": len(dropped_messages),
-        "estimatedTokens": message_tokens(compacted),
+        "droppedMessages": max(0, len(messages) - len(compacted)),
+        "estimatedTokens": estimated,
+        "strategy": "langchain.trim_messages",
     }
 
 

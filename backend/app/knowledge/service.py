@@ -1471,9 +1471,8 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
-                # Permanent deletion also destroys any Agent checkpoint/HITL payload.
-                # Bump the lease epoch and cancel the durable job so a stale worker
-                # cannot write the checkpoint back after this transaction commits.
+                # Purge is a privacy boundary: invalidate the QA execution lease
+                # and atomically destroy LangGraph history/pending writes/resume data.
                 conn.execute(
                     update(job_table)
                     .where(and_(

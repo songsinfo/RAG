@@ -157,6 +157,8 @@ flowchart TD
 - **Docling 已接入**：Markdown/TXT 本地解析；PDF/DOCX/Office 等通过 Docling `/v1/convert/file` 转 Markdown，再进入统一结构解析与切块。
 - **Durable Job Worker**：INGEST/PURGE 从进程内 ThreadPool 升级为 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
 - **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
+- **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文裁剪使用 LangChain `trim_messages` / `count_tokens_approximately`，不再维护平行的自研 checkpoint/resume 协议。
+- **职责边界**：LangGraph/LangChain 负责图状态、HITL 恢复与消息裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
 - **CI 基线**：GitHub Actions 执行 Python compile/pytest 与前端 type-check/test/build。
 
 ## 阅读顺序

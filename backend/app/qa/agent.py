@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, select
 
@@ -18,17 +19,18 @@ from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     context_segment_table,
+    job_table,
     qa_run_table,
     run_source_table,
     segment_kb_table,
     source_unit_table,
 )
 from app.observability import add_span_event, agent_span
-from app.qa.checkpoint import load_agent_checkpoint, save_agent_checkpoint
+from app.qa.job_checkpointer import JobCheckpointSaver
+from app.qa.execution import current_qa_execution, qa_lease_is_current
 from app.qa.claim_validator import INSTRUCTION, validate_claims
 from app.qa.guardrails import guard_retrieved_content
 from app.qa.model_gateway import ModelGateway
-from app.qa.execution import qa_lease_is_current
 from app.qa.runtime import (
     AgentRuntimePolicy,
     assert_runtime_budget,
@@ -106,9 +108,6 @@ class AgentState(TypedDict):
     warnings: List[str]
     final_answer: Optional[Dict[str, Any]]
     error: Optional[str]
-    resume_node: str
-    approved_tool_calls: List[str]
-    rejected_tool_calls: List[str]
 
 
 @dataclass(frozen=True)
@@ -137,25 +136,17 @@ class LangGraphAgent:
                 return cls._graph
 
             builder = StateGraph(AgentState, context_schema=AgentContext)
-            builder.add_conditional_edges(
-                START,
-                cls._route_start,
-                {"model": "model", "tools": "tools"},
-            )
             builder.add_node("model", cls._model_step)
             builder.add_node("tools", cls._tools_step)
+            builder.add_edge(START, "model")
             builder.add_conditional_edges(
                 "model",
                 cls._route_after_model,
                 {"tools": "tools", END: END},
             )
             builder.add_edge("tools", "model")
-            cls._graph = builder.compile()
+            cls._graph = builder.compile(checkpointer=JobCheckpointSaver())
             return cls._graph
-
-    @staticmethod
-    def _route_start(state: AgentState) -> str:
-        return "tools" if state.get("resume_node") == "tools" else "model"
 
     @classmethod
     def run(
@@ -170,23 +161,50 @@ class LangGraphAgent:
         config_id: str,
     ) -> Dict[str, Any]:
         policy = AgentRuntimePolicy.from_env()
-        checkpoint = load_agent_checkpoint(actor.tenant_id, run_id)
-        if checkpoint and isinstance(checkpoint.get("state"), dict):
-            state = checkpoint["state"]
-            state["resume_node"] = str(checkpoint.get("nextNode") or "model")
-            deadline_epoch = float(
-                checkpoint.get("deadlineEpoch")
-                or (time.time() + policy.overall_timeout_seconds)
-            )
+        deadline_epoch = time.time() + policy.overall_timeout_seconds
+        graph = cls._get_graph()
+        configurable = {
+            "thread_id": run_id,
+            "tenant_id": actor.tenant_id,
+        }
+        current_execution = current_qa_execution()
+        if current_execution is not None:
+            configurable["job_id"] = current_execution[0]
+            configurable["lease_epoch"] = current_execution[1]
+        graph_config = {
+            "recursion_limit": 20,
+            "configurable": configurable,
+        }
+
+        snapshot = graph.get_state(graph_config)
+        resume_payload = cls._consume_resume_payload(actor.tenant_id, run_id)
+        if resume_payload is not None:
+            graph_input: Any = Command(resume=resume_payload)
             record_event_fn(
                 actor.tenant_id,
                 run_id,
                 "AGENT_RESUMED",
-                {"nextNode": state["resume_node"], "promptVersion": AGENT_PROMPT_VERSION},
+                {"source": "langgraph_interrupt", "promptVersion": AGENT_PROMPT_VERSION},
             )
+        elif snapshot.values and snapshot.next:
+            # Native LangGraph checkpoint resume after a transient worker/process failure.
+            graph_input = None
+            record_event_fn(
+                actor.tenant_id,
+                run_id,
+                "AGENT_RESUMED",
+                {"source": "langgraph_checkpoint", "next": list(snapshot.next), "promptVersion": AGENT_PROMPT_VERSION},
+            )
+        elif snapshot.values and not snapshot.next:
+            # A completed graph should normally have finalized the QA run already.
+            # Reuse the persisted final state if the worker is replayed after commit.
+            final_answer = snapshot.values.get("final_answer")
+            if final_answer:
+                return final_answer
+            graph_input = None
         else:
             memory = cls._conversation_memory(actor, conversation_id, run_id)
-            state: AgentState = {
+            graph_input = {
                 "messages": [
                     {
                         "role": "system",
@@ -207,11 +225,7 @@ class LangGraphAgent:
                 "warnings": [],
                 "final_answer": None,
                 "error": None,
-                "resume_node": "model",
-                "approved_tool_calls": [],
-                "rejected_tool_calls": [],
             }
-            deadline_epoch = time.time() + policy.overall_timeout_seconds
 
         context = AgentContext(
             actor=actor,
@@ -236,6 +250,7 @@ class LangGraphAgent:
                 "maxContextTokens": policy.max_context_tokens,
                 "maxTotalTokens": policy.max_total_tokens,
                 "maxModelCalls": policy.max_model_calls,
+                "checkpoint": "langgraph",
                 "promptVersion": AGENT_PROMPT_VERSION,
             },
         )
@@ -244,11 +259,26 @@ class LangGraphAgent:
             "agent.run",
             {"run.id": run_id, "tenant.id": actor.tenant_id, "agent.prompt_version": AGENT_PROMPT_VERSION},
         ):
-            final_state = cls._get_graph().invoke(
-                state,
+            final_state = graph.invoke(
+                graph_input,
                 context=context,
-                config={"recursion_limit": 20},
+                config=graph_config,
+                # Persist before advancing to the next node. This is also the
+                # correct durability choice for HITL and avoids concurrent
+                # checkpoint writes racing application DB writes.
+                durability="sync",
             )
+
+        snapshot = graph.get_state(graph_config)
+        if snapshot.interrupts:
+            pending = snapshot.interrupts[0].value
+            record_event_fn(
+                actor.tenant_id,
+                run_id,
+                "AGENT_APPROVAL_REQUIRED",
+                pending if isinstance(pending, dict) else {"request": pending},
+            )
+            raise ApiException(409, "APPROVAL_REQUIRED", "工具调用等待人工审批")
 
         if final_state.get("final_answer"):
             return final_state["final_answer"]
@@ -261,6 +291,94 @@ class LangGraphAgent:
             "evidence": final_state.get("evidence", []),
             "warnings": final_state.get("warnings", []),
         }
+
+    @staticmethod
+    def _consume_resume_payload(tenant_id: str, run_id: str) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(job_table.c.id, job_table.c.checkpoint).where(
+                    and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                    )
+                ).with_for_update()
+            ).first()
+            if not row:
+                return None
+            checkpoint = dict(row.checkpoint or {})
+            payload = checkpoint.pop("langgraphResume", None)
+            if payload is not None:
+                conn.execute(
+                    job_table.update()
+                    .where(job_table.c.id == row.id)
+                    .values(checkpoint=checkpoint, updated_at=now)
+                )
+                conn.commit()
+            return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def queue_resume(
+        cls,
+        actor: Actor,
+        run_id: str,
+        tool_call_id: str,
+        decision: str,
+    ) -> None:
+        graph_config = {
+            "configurable": {
+                "thread_id": run_id,
+                "tenant_id": actor.tenant_id,
+            }
+        }
+        snapshot = cls._get_graph().get_state(graph_config)
+        pending_values = [
+            item.value for item in snapshot.interrupts
+            if isinstance(item.value, dict)
+        ]
+        matching = next(
+            (
+                value for value in pending_values
+                if str(value.get("toolCallId") or "") == tool_call_id
+            ),
+            None,
+        )
+        if matching is None:
+            raise ApiException(409, "APPROVAL_NOT_FOUND", "待审批工具调用不存在或已变化")
+
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(job_table.c.id, job_table.c.checkpoint).where(
+                    and_(
+                        job_table.c.tenant_id == actor.tenant_id,
+                        job_table.c.kind == "QA_RUN",
+                        job_table.c.target_id == run_id,
+                    )
+                ).with_for_update()
+            ).first()
+            if not row:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "问答任务不存在")
+            checkpoint = dict(row.checkpoint or {})
+            checkpoint["langgraphResume"] = {
+                "toolCallId": tool_call_id,
+                "decision": decision,
+            }
+            conn.execute(
+                job_table.update()
+                .where(job_table.c.id == row.id)
+                .values(
+                    checkpoint=checkpoint,
+                    status="QUEUED",
+                    stage="QA",
+                    available_at=now,
+                    lease_until=None,
+                    error_code=None,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
 
     @staticmethod
     def _route_after_model(state: AgentState) -> str:
@@ -338,34 +456,16 @@ class LangGraphAgent:
             validated = validate_claims(parsed, state["evidence_map"])
             validated["evidence"] = state["evidence"]
             validated["warnings"] = state["warnings"]
-            result = {
+            return {
                 "messages": new_messages,
                 "final_answer": validated,
                 "round": state["round"],
-                "resume_node": "model",
             }
-            save_agent_checkpoint(
-                actor.tenant_id,
-                ctx.run_id,
-                state={**state, **result},
-                next_node="model",
-                deadline_epoch=ctx.deadline_epoch,
-            )
-            return result
 
-        result = {
+        return {
             "messages": new_messages,
             "round": state["round"],
-            "resume_node": "tools",
         }
-        save_agent_checkpoint(
-            actor.tenant_id,
-            ctx.run_id,
-            state={**state, **result},
-            next_node="tools",
-            deadline_epoch=ctx.deadline_epoch,
-        )
-        return result
 
     @classmethod
     def _tools_step(cls, state: AgentState, runtime: Runtime[AgentContext]) -> Dict[str, Any]:
@@ -383,8 +483,26 @@ class LangGraphAgent:
         warnings_list = list(state["warnings"])
         repeated_map = dict(state["repeated_calls"])
         calls_count = state["tool_calls_count"]
-        approved = set(state.get("approved_tool_calls") or [])
-        rejected = set(state.get("rejected_tool_calls") or [])
+        approval_decisions: Dict[str, str] = {}
+
+        # Native LangGraph HITL. Approval interrupts are collected before any tool
+        # side effects, so node re-execution after Command(resume=...) is safe.
+        for tc in tool_calls:
+            name, args = cls._tool_call_parts(tc)
+            call_id = str(tc.get("id") or "")
+            if name not in ctx.policy.approval_tools:
+                continue
+            response = interrupt({
+                "type": "tool_approval",
+                "toolCallId": call_id,
+                "name": name,
+                "args": args,
+                "allowedDecisions": ["APPROVE", "REJECT"],
+            })
+            response = response if isinstance(response, dict) else {}
+            if str(response.get("toolCallId") or call_id) != call_id:
+                raise ApiException(409, "APPROVAL_NOT_FOUND", "审批响应与当前工具调用不匹配")
+            approval_decisions[call_id] = str(response.get("decision") or "").upper()
 
         evidence_by_key = {
             cls._evidence_key(ev): ev
@@ -405,8 +523,9 @@ class LangGraphAgent:
             if repeated_map[sig] >= ctx.policy.repeated_call_limit:
                 raise ApiException(409, "REPEATED_CALLS", "重复工具调用已终止")
 
-            if name in ctx.policy.approval_tools and call_id not in approved:
-                if call_id in rejected:
+            if name in ctx.policy.approval_tools:
+                decision = approval_decisions.get(call_id)
+                if decision == "REJECT":
                     result_payload = {"status": "REJECTED", "code": "TOOL_REJECTED"}
                     new_messages.append(
                         {
@@ -416,23 +535,8 @@ class LangGraphAgent:
                         }
                     )
                     continue
-                pending = {"toolCallId": call_id, "name": name, "args": args}
-                save_agent_checkpoint(
-                    actor.tenant_id,
-                    ctx.run_id,
-                    state={
-                        **state,
-                        "messages": new_messages,
-                        "repeated_calls": repeated_map,
-                        "tool_calls_count": calls_count - 1,
-                        "resume_node": "tools",
-                    },
-                    next_node="tools",
-                    deadline_epoch=ctx.deadline_epoch,
-                    pending_approval=pending,
-                )
-                ctx.record_event_fn(actor.tenant_id, ctx.run_id, "AGENT_APPROVAL_REQUIRED", pending)
-                raise ApiException(409, "APPROVAL_REQUIRED", "工具调用等待人工审批")
+                if decision != "APPROVE":
+                    raise ApiException(409, "APPROVAL_REQUIRED", "工具调用等待人工审批")
 
             started = time.perf_counter()
             with agent_span("agent.tool", {"tool.name": name, "tool.call_id": call_id}):
@@ -600,17 +704,7 @@ class LangGraphAgent:
             "repeated_calls": repeated_map,
             "tool_calls_count": calls_count,
             "round": state["round"] + 1,
-            "resume_node": "model",
-            "approved_tool_calls": list(approved),
-            "rejected_tool_calls": list(rejected),
         }
-        save_agent_checkpoint(
-            actor.tenant_id,
-            ctx.run_id,
-            state={**state, **result},
-            next_node="model",
-            deadline_epoch=ctx.deadline_epoch,
-        )
         return result
 
     @staticmethod
