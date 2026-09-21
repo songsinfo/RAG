@@ -33,9 +33,7 @@ def get_current_actor(request: Request) -> Actor:
     session_token = request.cookies.get("RAG_SESSION")
     if not session_token:
         raise ApiException(401, "AUTH_REQUIRED", "请先登录")
-
     token_h = hash_token(session_token)
-
     with get_db_connection() as conn:
         stmt = (
             select(
@@ -51,10 +49,7 @@ def get_current_actor(request: Request) -> Actor:
                         app_user_table.c.tenant_id == auth_session_table.c.tenant_id,
                         app_user_table.c.id == auth_session_table.c.user_id,
                     ),
-                ).join(
-                    tenant_table,
-                    tenant_table.c.id == app_user_table.c.tenant_id,
-                )
+                ).join(tenant_table, tenant_table.c.id == app_user_table.c.tenant_id)
             )
             .where(
                 and_(
@@ -68,7 +63,6 @@ def get_current_actor(request: Request) -> Actor:
         row = conn.execute(stmt).first()
         if not row:
             raise ApiException(401, "AUTH_REQUIRED", "登录状态已失效")
-
         return Actor(
             tenant_id=str(row.tenant_id),
             user_id=str(row.user_id),
@@ -151,6 +145,7 @@ def get_readable_build_records(
     conn,
     actor: Actor,
     kb_ids: Optional[List[str]] = None,
+    document_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, str]]:
     user_active, kb_accessible, doc_acl_ok = _access_predicates(actor)
     stmt = (
@@ -183,6 +178,8 @@ def get_readable_build_records(
     )
     if kb_ids:
         stmt = stmt.where(document_table.c.kb_id.in_(kb_ids))
+    if document_ids:
+        stmt = stmt.where(document_table.c.id.in_(document_ids))
 
     rows = conn.execute(stmt).fetchall()
     return [
@@ -196,8 +193,8 @@ def get_readable_build_records(
     ]
 
 
-def get_readable_builds(conn, actor: Actor, kb_ids=None) -> list:
-    return [r["buildId"] for r in get_readable_build_records(conn, actor, kb_ids)]
+def get_readable_builds(conn, actor: Actor, kb_ids=None, document_ids=None) -> list:
+    return [r["buildId"] for r in get_readable_build_records(conn, actor, kb_ids, document_ids)]
 
 
 def assert_hits_still_readable(
@@ -205,10 +202,11 @@ def assert_hits_still_readable(
     actor: Actor,
     hits: List[Dict[str, Any]],
     kb_ids: Optional[List[str]] = None,
+    document_ids: Optional[List[str]] = None,
 ) -> None:
     if not hits:
         return
-    readable = get_readable_build_records(conn, actor, kb_ids)
+    readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
     allowed = {(r["buildId"], r["documentId"]) for r in readable}
     for hit in hits:
         build_id = str(hit.get("buildId") or "")

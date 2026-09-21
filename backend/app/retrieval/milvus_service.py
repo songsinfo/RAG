@@ -168,91 +168,152 @@ class MilvusHybridService:
         dense_top_k: Optional[int] = None,
         sparse_top_k: Optional[int] = None,
         fusion_top_k: Optional[int] = None,
+        mode: str = "HYBRID",
+        rrf_enabled: bool = True,
         rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
 
-        # top_k is kept for backward compatibility with callers/tests. The
-        # production pipeline passes the explicit candidate/fusion limits from
-        # the immutable Retrieval Config.
+        mode = str(mode or "HYBRID").upper()
+        if mode == "SPARSE":
+            mode = "BM25"
+        if mode not in {"DENSE", "BM25", "HYBRID"}:
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", f"不支持的检索模式: {mode}")
+        if mode == "HYBRID" and not rrf_enabled:
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", "HYBRID 模式需要 RRF 融合")
+
         if top_k is not None:
-            dense_top_k = dense_top_k or top_k * 2
-            sparse_top_k = sparse_top_k or top_k * 2
-            fusion_top_k = fusion_top_k or top_k
-        dense_top_k = dense_top_k or 30
-        sparse_top_k = sparse_top_k or 30
+            if dense_top_k is None:
+                dense_top_k = top_k * 2
+            if sparse_top_k is None:
+                sparse_top_k = top_k * 2
+            if fusion_top_k is None:
+                fusion_top_k = top_k
+        dense_top_k = 0 if dense_top_k is None and mode == "BM25" else (dense_top_k if dense_top_k is not None else 30)
+        sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
         fusion_top_k = fusion_top_k or 20
+
+        output_fields = ["kb_id", "document_id", "version_id", "build_id", "chunk_id", "text_content"]
+
+        def normalize_result(res):
+            hits = []
+            rows = res[0] if res and isinstance(res, list) and res and isinstance(res[0], list) else (res or [])
+            for item in rows:
+                entity = item.get("entity", {}) if isinstance(item, dict) else {}
+                chunk_id = entity.get("chunk_id") or (item.get("id") if isinstance(item, dict) else None)
+                hits.append({
+                    "id": chunk_id,
+                    "chunkId": chunk_id,
+                    "kbId": entity.get("kb_id"),
+                    "documentId": entity.get("document_id"),
+                    "versionId": entity.get("version_id"),
+                    "buildId": entity.get("build_id"),
+                    "text": entity.get("text_content"),
+                    "score": float(item.get("distance", item.get("score", 0.0)) or 0.0) if isinstance(item, dict) else 0.0,
+                })
+            return hits
 
         client = cls.get_client()
         if client:
             try:
-                query_emb = get_embeddings([query], dim=1024)[0]
                 build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
                 filter_expr = f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] and representation_type == "ORIGINAL"'
 
+                if mode == "DENSE":
+                    query_emb = get_embeddings([query], dim=1024)[0]
+                    res = client.search(
+                        collection_name=COLLECTION_NAME,
+                        data=[query_emb],
+                        anns_field="dense_vector",
+                        search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                        limit=max(1, dense_top_k),
+                        filter=filter_expr,
+                        output_fields=output_fields,
+                    )
+                    return normalize_result(res)[:fusion_top_k]
+
+                if mode == "BM25":
+                    res = client.search(
+                        collection_name=COLLECTION_NAME,
+                        data=[query],
+                        anns_field="sparse_vector",
+                        search_params={"metric_type": "BM25"},
+                        limit=max(1, sparse_top_k),
+                        filter=filter_expr,
+                        output_fields=output_fields,
+                    )
+                    return normalize_result(res)[:fusion_top_k]
+
+                query_emb = get_embeddings([query], dim=1024)[0]
                 dense_req = AnnSearchRequest(
                     data=[query_emb],
                     anns_field="dense_vector",
                     param={"metric_type": "COSINE", "params": {"ef": 64}},
-                    limit=dense_top_k,
+                    limit=max(1, dense_top_k),
                     expr=filter_expr,
                 )
                 sparse_req = AnnSearchRequest(
                     data=[query],
                     anns_field="sparse_vector",
                     param={"metric_type": "BM25"},
-                    limit=sparse_top_k,
+                    limit=max(1, sparse_top_k),
                     expr=filter_expr,
                 )
-
                 res = client.hybrid_search(
                     collection_name=COLLECTION_NAME,
                     reqs=[dense_req, sparse_req],
                     ranker=RRFRanker(k=rrf_k),
                     limit=fusion_top_k,
-                    output_fields=["kb_id", "document_id", "version_id", "build_id", "chunk_id", "text_content"],
+                    output_fields=output_fields,
                 )
-
-                hits = []
-                if res and len(res) > 0:
-                    for item in res[0]:
-                        entity = item.get("entity", {})
-                        chunk_id = entity.get("chunk_id") or item.get("id")
-                        hits.append({
-                            "id": chunk_id,
-                            "chunkId": chunk_id,
-                            "kbId": entity.get("kb_id"),
-                            "documentId": entity.get("document_id"),
-                            "versionId": entity.get("version_id"),
-                            "buildId": entity.get("build_id"),
-                            "text": entity.get("text_content"),
-                            "score": item.get("distance", 0.0),
-                        })
-                return hits
+                return normalize_result(res)
+            except ApiException:
+                raise
             except Exception as e:
-                logger.error("Milvus hybrid search error: %s", e)
+                logger.error("Milvus search error: %s", e)
                 if not is_test_env():
-                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 混合检索失败: {e}")
+                    raise ApiException(503, "MILVUS_UNAVAILABLE", f"Milvus 检索失败: {e}")
 
-        # In non-test environment without a live Milvus connection, fail fast
         if not is_test_env():
             raise ApiException(503, "MILVUS_UNAVAILABLE", "Milvus 检索服务不可用")
 
-        # In-memory mock fallback ONLY for unit tests (RAG_ENVIRONMENT == 'test')
         bm25_hits: List[Dict[str, Any]] = []
+        dense_hits: List[Dict[str, Any]] = []
         query_terms = [t.lower() for t in query.split() if t.strip()]
 
-        for item in cls._mock_store.values():
-            if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
-                continue
-            if item["representation_type"] != "ORIGINAL":
-                continue
+        if mode in {"BM25", "HYBRID"}:
+            for item in cls._mock_store.values():
+                if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
+                    continue
+                if item["representation_type"] != "ORIGINAL":
+                    continue
+                text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
+                score = sum(1.0 for t in query_terms if t in text_lower)
+                if score > 0:
+                    bm25_hits.append({
+                        "id": item["chunk_id"],
+                        "kbId": item["kb_id"],
+                        "documentId": item["document_id"],
+                        "versionId": item["version_id"],
+                        "buildId": item["build_id"],
+                        "chunkId": item["chunk_id"],
+                        "text": item["text_content"],
+                        "bm25_score": score,
+                        "score": score,
+                    })
+            bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
-            text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
-            score = sum(1.0 for t in query_terms if t in text_lower)
-            if score > 0:
-                bm25_hits.append({
+        if mode in {"DENSE", "HYBRID"}:
+            query_emb = get_embeddings([query], dim=1024)[0]
+            for item in cls._mock_store.values():
+                if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
+                    continue
+                if item["representation_type"] != "ORIGINAL":
+                    continue
+                v = item["dense_vector"]
+                cos_sim = sum(a * b for a, b in zip(query_emb, v))
+                dense_hits.append({
                     "id": item["chunk_id"],
                     "kbId": item["kb_id"],
                     "documentId": item["document_id"],
@@ -260,34 +321,15 @@ class MilvusHybridService:
                     "buildId": item["build_id"],
                     "chunkId": item["chunk_id"],
                     "text": item["text_content"],
-                    "bm25_score": score,
+                    "dense_score": cos_sim,
+                    "score": cos_sim,
                 })
+            dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
 
-        bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
-
-        query_emb = get_embeddings([query], dim=1024)[0]
-        dense_hits: List[Dict[str, Any]] = []
-
-        for item in cls._mock_store.values():
-            if item["tenant_id"] != tenant_id or item["build_id"] not in allowed_build_ids:
-                continue
-            if item["representation_type"] != "ORIGINAL":
-                continue
-
-            v = item["dense_vector"]
-            cos_sim = sum(a * b for a, b in zip(query_emb, v))
-            dense_hits.append({
-                "id": item["chunk_id"],
-                "kbId": item["kb_id"],
-                "documentId": item["document_id"],
-                "versionId": item["version_id"],
-                "buildId": item["build_id"],
-                "chunkId": item["chunk_id"],
-                "text": item["text_content"],
-                "dense_score": cos_sim,
-            })
-
-        dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
+        if mode == "DENSE":
+            return dense_hits[:min(dense_top_k, fusion_top_k)]
+        if mode == "BM25":
+            return bm25_hits[:min(sparse_top_k, fusion_top_k)]
 
         fused = rrf_fuse(
             [dense_hits[:dense_top_k], bm25_hits[:sparse_top_k]],
