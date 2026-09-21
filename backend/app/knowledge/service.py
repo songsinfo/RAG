@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-from sqlalchemy import select, and_, or_, exists, update
+from sqlalchemy import select, and_, or_, exists, update, delete
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.identity.deps import Actor, can_read_document
@@ -699,6 +699,73 @@ class KnowledgeService:
         }
 
     @staticmethod
+    def _lease_filter(tenant_id: str, job_id: str, lease_epoch: Optional[int]):
+        clauses = [
+            job_table.c.tenant_id == tenant_id,
+            job_table.c.id == job_id,
+        ]
+        if lease_epoch is not None:
+            clauses.extend([
+                job_table.c.status == "RUNNING",
+                job_table.c.lease_epoch == lease_epoch,
+            ])
+        return and_(*clauses)
+
+    @staticmethod
+    def _lease_is_current(conn, tenant_id: str, job_id: str, lease_epoch: Optional[int]) -> bool:
+        if lease_epoch is None:
+            return True
+        row = conn.execute(
+            select(job_table.c.id).where(
+                KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch)
+            )
+        ).first()
+        return row is not None
+
+    @staticmethod
+    def _reset_unpublished_build(conn, tenant_id: str, doc_id: str, build_id: str):
+        build = conn.execute(
+            select(index_build_table.c.status).where(
+                and_(
+                    index_build_table.c.tenant_id == tenant_id,
+                    index_build_table.c.id == build_id,
+                    index_build_table.c.document_id == doc_id,
+                )
+            )
+        ).first()
+        doc = conn.execute(
+            select(document_table.c.active_build_id).where(
+                and_(
+                    document_table.c.tenant_id == tenant_id,
+                    document_table.c.id == doc_id,
+                )
+            )
+        ).first()
+        if not build:
+            raise ApiException(404, "BUILD_NOT_FOUND", "索引构建不存在")
+        if str(build.status) == "READY" or (doc and str(doc.active_build_id or "") == build_id):
+            raise ApiException(409, "BUILD_ALREADY_PUBLISHED", "已发布构建不能作为恢复残留重建")
+
+        # Safe restart point: unpublished build data is derived from the immutable
+        # source artifact, so remove partial rows and deterministically rebuild it.
+        conn.execute(delete(representation_table).where(and_(
+            representation_table.c.tenant_id == tenant_id,
+            representation_table.c.build_id == build_id,
+        )))
+        conn.execute(delete(chunk_span_table).where(and_(
+            chunk_span_table.c.tenant_id == tenant_id,
+            chunk_span_table.c.build_id == build_id,
+        )))
+        conn.execute(delete(chunk_table).where(and_(
+            chunk_table.c.tenant_id == tenant_id,
+            chunk_table.c.build_id == build_id,
+        )))
+        conn.execute(delete(source_unit_table).where(and_(
+            source_unit_table.c.tenant_id == tenant_id,
+            source_unit_table.c.build_id == build_id,
+        )))
+
+    @staticmethod
     def _execute_ingestion_job(
         tenant_id: str,
         job_id: str,
@@ -707,21 +774,36 @@ class KnowledgeService:
         build_id: str,
         file_bytes: bytes,
         filename: str,
+        lease_epoch: Optional[int] = None,
     ):
         now = datetime.now(timezone.utc)
         try:
+            # Parse is side-effect free. Validate the lease immediately afterwards
+            # so a worker that lost ownership cannot write or publish anything.
+            raw_units = parse_document(file_bytes, filename)
+
             with get_db_connection() as conn:
+                if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                    return
+
+                # Recovery is idempotent: partial rows from a crashed attempt are
+                # removed only for an unpublished build, then rebuilt from artifact.
+                KnowledgeService._reset_unpublished_build(conn, tenant_id, doc_id, build_id)
                 conn.execute(
                     update(job_table)
-                    .where(job_table.c.id == job_id)
-                    .values(status="RUNNING", stage="PARSING", updated_at=now)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                    .values(status="RUNNING", stage="PARSING", error_code=None, updated_at=now)
                 )
                 conn.commit()
 
-            # 1. Parse
-            raw_units = parse_document(file_bytes, filename)
+            # Remove partial vectors from a previous crashed attempt as well.
+            from app.retrieval.milvus_service import MilvusHybridService
+            MilvusHybridService.delete_by_build(tenant_id, build_id)
+
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
+                if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                    return
                 for u in raw_units:
                     unit_id = str(uuid.uuid4())
                     u["id"] = unit_id
@@ -744,15 +826,17 @@ class KnowledgeService:
                     )
                 conn.execute(
                     update(job_table)
-                    .where(job_table.c.id == job_id)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
                     .values(stage="CHUNKING", updated_at=now)
                 )
                 conn.commit()
 
-            # 2. Chunk
             chunks, spans = chunk_units(raw_units)
+
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
+                if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                    return
                 for c in chunks:
                     conn.execute(
                         chunk_table.insert().values(
@@ -785,11 +869,18 @@ class KnowledgeService:
                             updated_at=now,
                         )
                     )
+                conn.execute(
+                    update(job_table)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                    .values(stage="INDEXING", updated_at=now)
+                )
+                conn.commit()
 
-                # 3. Index to Milvus
-                child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
-                if child_chunks:
-                    from app.retrieval.milvus_service import MilvusHybridService
+            child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
+            if child_chunks:
+                with get_db_connection() as conn:
+                    if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                        return
                     doc_row = conn.execute(
                         select(document_table.c.kb_id).where(
                             and_(
@@ -799,39 +890,65 @@ class KnowledgeService:
                         )
                     ).first()
                     kb_id = str(doc_row.kb_id) if doc_row else ""
-                    MilvusHybridService.upsert_chunks(
-                        tenant_id=tenant_id,
-                        build_id=build_id,
-                        chunks=child_chunks,
-                        kb_id=kb_id,
-                        doc_id=doc_id,
-                        version_id=version_id,
-                    )
+                MilvusHybridService.upsert_chunks(
+                    tenant_id=tenant_id,
+                    build_id=build_id,
+                    chunks=child_chunks,
+                    kb_id=kb_id,
+                    doc_id=doc_id,
+                    version_id=version_id,
+                )
 
-                # 4. Publish build as active
+            # Fenced publish: only the current lease owner can make the build active.
+            now = datetime.now(timezone.utc)
+            with get_db_connection() as conn:
+                if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                    return
                 conn.execute(
                     update(index_build_table)
-                    .where(index_build_table.c.id == build_id)
+                    .where(and_(
+                        index_build_table.c.tenant_id == tenant_id,
+                        index_build_table.c.id == build_id,
+                        index_build_table.c.status != "READY",
+                    ))
                     .values(status="READY", published_at=now, updated_at=now)
                 )
                 conn.execute(
                     update(document_table)
-                    .where(document_table.c.id == doc_id)
+                    .where(and_(
+                        document_table.c.tenant_id == tenant_id,
+                        document_table.c.id == doc_id,
+                    ))
                     .values(active_build_id=build_id, updated_at=now)
                 )
-                conn.execute(
+                result = conn.execute(
                     update(job_table)
-                    .where(job_table.c.id == job_id)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
                     .values(status="COMPLETED", stage="INDEXING", lease_until=None, updated_at=now)
                 )
+                if lease_epoch is not None and result.rowcount != 1:
+                    conn.rollback()
+                    return
                 conn.commit()
 
-        except Exception as e:
+        except ApiException as exc:
+            # A lease loss must never let an old worker overwrite the new owner's
+            # state. Other errors are recorded only if this worker still owns it.
+            if exc.code == "JOB_LEASE_LOST":
+                return
             with get_db_connection() as conn:
                 conn.execute(
                     update(job_table)
-                    .where(job_table.c.id == job_id)
-                    .values(status="FAILED", error_code="PARSER_FAILED", lease_until=None, updated_at=datetime.now(timezone.utc))
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                    .values(status="FAILED", error_code=exc.code, lease_until=None, updated_at=datetime.now(timezone.utc))
+                )
+                conn.commit()
+        except Exception:
+            with get_db_connection() as conn:
+                conn.execute(
+                    update(job_table)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                    .values(status="FAILED", error_code="INGEST_FAILED", lease_until=None, updated_at=datetime.now(timezone.utc))
                 )
                 conn.commit()
 
@@ -1257,8 +1374,18 @@ class KnowledgeService:
                 return {"documentId": doc_id, "status": "PURGE_PENDING", "jobId": job_id}
 
     @staticmethod
-    def _execute_purge(tenant_id: str, doc_id: str, job_id: str, del_rec_id: str):
+    def _execute_purge(
+        tenant_id: str,
+        doc_id: str,
+        job_id: str,
+        del_rec_id: str,
+        lease_epoch: Optional[int] = None,
+    ):
         now = datetime.now(timezone.utc)
+        if lease_epoch is not None:
+            with get_db_connection() as lease_conn:
+                if not KnowledgeService._lease_is_current(lease_conn, tenant_id, job_id, lease_epoch):
+                    return
         empty_hash = hashlib.sha256(b"").digest()
 
         # 1. Delete from Milvus
@@ -1267,6 +1394,8 @@ class KnowledgeService:
 
         # 2. Delete private artifact files & scrub MySQL
         with get_db_connection() as conn:
+            if lease_epoch is not None and not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                return
             artifacts = conn.execute(
                 select(artifact_table.c.storage_key).where(
                     and_(
@@ -1486,12 +1615,7 @@ class KnowledgeService:
             )
             conn.execute(
                 update(job_table)
-                .where(
-                    and_(
-                        job_table.c.tenant_id == tenant_id,
-                        job_table.c.id == job_id,
-                    )
-                )
+                .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
                 .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
             )
             conn.commit()

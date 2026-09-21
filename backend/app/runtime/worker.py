@@ -121,14 +121,16 @@ class DurableJobWorker:
         data = read_artifact(str(cp["storageKey"]))
         KnowledgeService._execute_ingestion_job(
             str(job["tenant_id"]), str(job["id"]), str(cp["documentId"]),
-            str(cp["versionId"]), str(cp["buildId"]), data, str(cp["filename"])
+            str(cp["versionId"]), str(cp["buildId"]), data, str(cp["filename"]),
+            lease_epoch=int(job["lease_epoch"]),
         )
 
     def _run_purge(self, job: Dict[str, Any]):
         from app.knowledge.service import KnowledgeService
         cp = job.get("checkpoint") or {}
         KnowledgeService._execute_purge(
-            str(job["tenant_id"]), str(job["target_id"]), str(job["id"]), str(cp["deletionRecordId"])
+            str(job["tenant_id"]), str(job["target_id"]), str(job["id"]), str(cp["deletionRecordId"]),
+            lease_epoch=int(job["lease_epoch"]),
         )
 
     def _fail(self, job: Dict[str, Any], code: str):
