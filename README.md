@@ -2,6 +2,140 @@
 
 Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（供应商 API 密钥由网关独立持有）、Docling 独立解析服务，面向运营、产品和技术共用的企业级内部知识库。前端简洁，重点是细粒度权限控制、文档全生命周期、混合检索策略、可追溯事实断言回答、自动化评测与故障恢复。旧 Java/Spring Boot/Elasticsearch 基线可通过 Git 历史标签或提交记录定位。
 
+## 系统架构与核心流程
+
+> 以下图基于当前默认分支 `feat/python-migration` 的实际 Python 实现整理。当前后端已迁移到 FastAPI + MySQL + Milvus + LiteLLM；`deploy/compose.yml` 已提供 Docling Serve，但当前 `backend/app/knowledge/parser.py` 仍使用 UTF-8 Markdown/TXT 解析器，Docling 尚未接入实际入库调用链。
+
+### 系统架构图
+
+```mermaid
+flowchart LR
+    USER[用户 / 管理员] --> FE[Vue 3 + TypeScript<br/>问答 / 资料 / 评估 / 运行管理]
+    FE --> API[FastAPI<br/>/api/v1]
+
+    subgraph APP[Python 3.12 模块化单体]
+        AUTH[identity<br/>登录 / 租户 / ACL / CSRF]
+        KB[knowledge<br/>文档 / 版本 / 生命周期 / 入库任务]
+        PARSER[parser + chunker<br/>结构解析 / Parent-Child Chunking]
+        RET[retrieval<br/>Dense + Sparse BM25 + RRF]
+        QA[qa<br/>RAG / LangGraph Agent / Claim Validation]
+        EVAL[evaluation<br/>题集 / 指标 / 消融实验]
+        MODEL[ModelGateway<br/>LangChain OpenAI Client]
+        EMB[embedding.py<br/>Embedding Client]
+    end
+
+    API --> AUTH
+    API --> KB
+    API --> RET
+    API --> QA
+    API --> EVAL
+
+    AUTH --> MYSQL[(MySQL 8.4<br/>用户 / 权限 / 文档 / Build / Run / 审计)]
+    KB --> MYSQL
+    QA --> MYSQL
+    EVAL --> MYSQL
+
+    KB --> FS[(私有文件制品)]
+    KB --> PARSER
+    PARSER --> MYSQL
+    PARSER --> RET
+
+    RET --> EMB
+    EMB --> LITELLM[LiteLLM AI Gateway]
+    RET --> MILVUS[(Milvus 2.5<br/>Dense Vector + Sparse BM25)]
+
+    QA --> RET
+    QA --> MODEL
+    MODEL --> LITELLM
+    EVAL --> QA
+
+    LITELLM --> PROVIDER[模型供应商<br/>Chat / Embedding / Judge]
+
+    MILVUS --> ETCD[(etcd)]
+    MILVUS --> MINIO[(MinIO)]
+
+    KB -. 当前代码尚未接入 .-> DOCLING[Docling Serve<br/>Compose documents profile]
+```
+
+架构中的关键约束：**MySQL 是权限与生效 Build 的权威来源**，Milvus 只保存可重建的检索索引；每次检索先从 MySQL 计算当前用户可读的 `active_build_id`，再把这些 Build ID 作为 Milvus 过滤条件，从源头避免越权召回。模型供应商密钥由 LiteLLM 独立持有，业务后端只调用内部模型别名。
+
+### 文档入库流程图
+
+```mermaid
+flowchart TD
+    A[管理员上传文档<br/>POST /admin/documents] --> B[认证 / CSRF / 25MB限制<br/>Idempotency-Key 校验]
+    B --> C[保存原始文件到私有制品目录]
+    C --> D[MySQL 创建<br/>Document / Version / Build Config / Index Build / Job]
+    D --> E[后台线程执行 INGEST Job]
+    E --> F[parse_document<br/>当前为 UTF-8 Markdown/TXT Parser]
+    F --> G[Source Units 写入 MySQL<br/>Heading / Text / Table / Code]
+    G --> H[Parent-Child Chunking<br/>Parent≈2000字符 / Child≈400字符]
+    H --> I[Chunk + Span 写入 MySQL]
+    I --> J[仅 CHILD Chunk 进入索引]
+    J --> K[embedding.py 请求 LiteLLM<br/>embedding-main / 1024维]
+    K --> L[Milvus Upsert]
+    L --> M[Dense Vector + Sparse BM25]
+    M --> N[Index Build = READY]
+    N --> O[Document.active_build_id 原子切换到新 Build]
+    O --> P[Job = COMPLETED]
+
+    F -. 待接入 .-> Q[Docling Serve<br/>PDF / DOCX / OCR 等]
+```
+
+### RAG / Agent 问答流程图
+
+```mermaid
+flowchart TD
+    A[用户提问<br/>POST /conversations/{id}/runs] --> B[输入安全校验]
+    B --> C[校验会话归属 / 幂等键 / 单会话并发]
+    C --> D[MySQL 写入 qa_run<br/>QUEUED]
+    D --> E[后台执行<br/>RUNNING]
+    E --> F{问题路由}
+
+    F -->|闲聊| G[固定回答<br/>不检索 / 不调用模型]
+    F -->|不支持请求| H[固定拒绝范围说明<br/>不检索 / 不调用模型]
+    F -->|企业知识问答| I{mode}
+
+    I -->|RAG| J[从 MySQL 读取 Segment Scope + ACL]
+    J --> K[得到当前可读 active_build_id 列表]
+    K --> L{有可读 Build?}
+    L -->|否| NOEV[NO_EVIDENCE]
+    L -->|是| M[Milvus Hybrid Search]
+
+    M --> M1[Query Embedding<br/>LiteLLM embedding-main]
+    M --> M2[Sparse BM25]
+    M1 --> M3[RRF Fusion k=60]
+    M2 --> M3
+    M3 --> N[Top-K Evidence]
+    N --> O[登记 run_source / Evidence]
+    O --> P[ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims]
+    P --> Q[Claim Validation<br/>引用范围与 Evidence 绑定]
+    Q --> R{Strict Mode?}
+    R -->|是| S[LiteLLM judge-main<br/>逐 Claim 判断 SUPPORTED]
+    R -->|否| T[Structural Validation]
+    S --> U[Output Guard]
+    T --> U
+
+    I -->|AGENT| V[LangGraph Agent]
+    V --> W[LLM 决定工具调用]
+    W --> X{工具}
+    X -->|search_knowledge| X1[ACL Scope + Milvus Hybrid Search]
+    X -->|read_section| X2[读取授权文档 Source Unit]
+    X1 --> W
+    X2 --> W
+    W -->|无 Tool Call| Y[Claim Validation + Output Guard]
+    V -. 最多6轮 / 8次工具调用<br/>同参数重复3次熔断 .-> Y
+
+    G --> Z[写入终态 Result]
+    H --> Z
+    NOEV --> Z
+    U --> Z
+    Y --> Z
+    Z --> END[前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace]
+```
+
+当前普通 RAG 主链路的检索实现是 **Dense + Sparse BM25 → RRF → Top-K**；代码中尚未接入独立 Cross-Encoder Reranker 或 MMR，因此图中没有把它们画成已实现步骤。Agent 模式使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断，防止无界循环。
+
 ## 阅读顺序
 
 1. [当前范围与交付顺序](docs/00-project-assessment.md)
