@@ -110,4 +110,9 @@ def load_retrieval_config(tenant_id: str, config_id: Optional[str]) -> Retrieval
 def validate_retrieval_payload(payload: Dict[str, Any]) -> RetrievalConfig:
     if not isinstance(payload, dict):
         raise ApiException(400, "INVALID_CONFIG", "检索配置必须是 JSON 对象")
-    return RetrievalConfig.from_payload("validation", payload)
+    config = RetrievalConfig.from_payload("validation", payload)
+    if config.final_top_k > config.fusion_top_k:
+        raise ApiException(400, "INVALID_CONFIG", "finalTopK 不能大于 fusionTopK")
+    if config.rerank_enabled and config.rerank_top_k > config.fusion_top_k:
+        raise ApiException(400, "INVALID_CONFIG", "rerank.topK 不能大于 fusionTopK")
+    return config

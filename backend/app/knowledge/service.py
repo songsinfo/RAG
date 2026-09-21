@@ -50,8 +50,10 @@ class KnowledgeService:
                     .where(
                         and_(
                             job_table.c.status == "RUNNING",
-                            job_table.c.lease_until.isnot(None),
-                            job_table.c.lease_until < now,
+                            or_(
+                                job_table.c.lease_until.is_(None),
+                                job_table.c.lease_until < now,
+                            ),
                         )
                     )
                     .values(
@@ -1490,7 +1492,7 @@ class KnowledgeService:
                         job_table.c.id == job_id,
                     )
                 )
-                .values(status="COMPLETED", stage="FINISHED", updated_at=now)
+                .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
             )
             conn.commit()
 

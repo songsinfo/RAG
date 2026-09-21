@@ -11,6 +11,7 @@ from app.db import get_db_connection
 from app.errors import ApiException
 from app.identity.deps import Actor, get_current_actor
 from app.models import config_revision_table, tenant_table, audit_event_table
+from app.retrieval.config import validate_retrieval_payload
 
 router = APIRouter(prefix="/admin/configs", tags=["admin-configs"])
 
@@ -64,6 +65,8 @@ def create_config(body: Dict[str, Any], actor: Actor = Depends(get_current_actor
 
     if kind not in VALID_KINDS or not name or len(name) > 128 or not isinstance(payload, dict):
         raise ApiException(400, "INVALID_CONFIG", "配置字段无效")
+    if kind == "RETRIEVAL":
+        validate_retrieval_payload(payload)
 
     payload_json = json.dumps(payload, ensure_ascii=False)
     if len(payload_json) > 64000 or "api_key" in payload_json.lower() or "apikey" in payload_json.lower():
