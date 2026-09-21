@@ -10,8 +10,7 @@ from app.db import get_db_connection
 from app.errors import ApiException
 from app.identity.deps import Actor, can_read_document
 from app.knowledge.artifacts import save_artifact, read_artifact, delete_artifact
-from app.knowledge.parser import parse_document
-from app.knowledge.chunker import chunk_units
+from app.knowledge.parser import parse_and_chunk_document
 from app.models import (
     knowledge_base_table,
     kb_grant_table,
@@ -778,9 +777,41 @@ class KnowledgeService:
     ):
         now = datetime.now(timezone.utc)
         try:
-            # Parse is side-effect free. Validate the lease immediately afterwards
-            # so a worker that lost ownership cannot write or publish anything.
-            raw_units = parse_document(file_bytes, filename)
+            # Reject stale workers before the potentially expensive Docling call
+            # and load the immutable build configuration used for chunking.
+            with get_db_connection() as conn:
+                if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                    return
+                cfg_row = conn.execute(
+                    select(config_revision_table.c.payload)
+                    .select_from(
+                        index_build_table.join(
+                            config_revision_table,
+                            and_(
+                                config_revision_table.c.tenant_id == index_build_table.c.tenant_id,
+                                config_revision_table.c.id == index_build_table.c.config_id,
+                            ),
+                        )
+                    )
+                    .where(and_(
+                        index_build_table.c.tenant_id == tenant_id,
+                        index_build_table.c.id == build_id,
+                    ))
+                ).first()
+                build_config = dict(cfg_row.payload or {}) if cfg_row else {}
+                conn.execute(
+                    update(job_table)
+                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                    .values(status="RUNNING", stage="PARSING", error_code=None, updated_at=now)
+                )
+                conn.commit()
+
+            # Every input format is parsed by Docling and split by HybridChunker.
+            raw_units, chunks, spans = parse_and_chunk_document(
+                file_bytes,
+                filename,
+                build_config,
+            )
 
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
@@ -789,11 +820,6 @@ class KnowledgeService:
                 # Recovery is idempotent: partial rows from a crashed attempt are
                 # removed only for an unpublished build, then rebuilt from artifact.
                 KnowledgeService._reset_unpublished_build(conn, tenant_id, doc_id, build_id)
-                conn.execute(
-                    update(job_table)
-                    .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
-                    .values(status="RUNNING", stage="PARSING", error_code=None, updated_at=now)
-                )
                 conn.commit()
 
             # Remove partial vectors from a previous crashed attempt as well.
@@ -810,7 +836,7 @@ class KnowledgeService:
                     return
                 unit_rows = []
                 for u in raw_units:
-                    unit_id = str(uuid.uuid4())
+                    unit_id = str(u.get("id") or uuid.uuid4())
                     u["id"] = unit_id
                     unit_rows.append({
                         "tenant_id": tenant_id,
@@ -835,8 +861,6 @@ class KnowledgeService:
                     .values(stage="CHUNKING", updated_at=now)
                 )
                 conn.commit()
-
-            chunks, spans = chunk_units(raw_units)
 
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:

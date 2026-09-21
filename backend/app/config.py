@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     LITELLM_MASTER_KEY: str = "sk-litellm-internal-master-key"
     DOCLING_URL: str = "http://127.0.0.1:5001"
     DOCLING_API_KEY: str = ""
+    DOCLING_CHUNK_MAX_TOKENS: int = 400
+    DOCLING_PARENT_MAX_TOKENS: int = 1200
+    DOCLING_CHUNK_TOKENIZER: str = "sentence-transformers/all-MiniLM-L6-v2"
+    DOCLING_CHUNK_MERGE_PEERS: bool = True
     RAG_EMBEDDED_WORKER: bool = True
     RAG_QA_WORKERS: int = 4
     RAG_INGEST_WORKERS: int = 2
@@ -95,6 +99,16 @@ def load_settings() -> Settings:
         LITELLM_MASTER_KEY=os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key"),
         DOCLING_URL=os.getenv("DOCLING_URL", "http://127.0.0.1:5001"),
         DOCLING_API_KEY=os.getenv("DOCLING_API_KEY", ""),
+        DOCLING_CHUNK_MAX_TOKENS=int(os.getenv("DOCLING_CHUNK_MAX_TOKENS", "400")),
+        DOCLING_PARENT_MAX_TOKENS=int(os.getenv("DOCLING_PARENT_MAX_TOKENS", "1200")),
+        DOCLING_CHUNK_TOKENIZER=os.getenv(
+            "DOCLING_CHUNK_TOKENIZER",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ),
+        DOCLING_CHUNK_MERGE_PEERS=os.getenv(
+            "DOCLING_CHUNK_MERGE_PEERS",
+            "true",
+        ).lower() in ("true", "1", "yes"),
         RAG_EMBEDDED_WORKER=os.getenv("RAG_EMBEDDED_WORKER", "true").lower() in ("true", "1", "yes"),
         RAG_QA_WORKERS=int(os.getenv("RAG_QA_WORKERS", "4")),
         RAG_INGEST_WORKERS=int(os.getenv("RAG_INGEST_WORKERS", "2")),
