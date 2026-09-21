@@ -267,3 +267,27 @@ def retry_call(
 
     assert last_exc is not None
     raise last_exc
+
+
+_NON_RETRYABLE_JOB_CODES = {
+    "CANCELLED",
+    "USER_CANCELLED",
+    "AGENT_TIMEOUT",
+    "BUDGET_EXCEEDED",
+    "REPEATED_CALLS",
+    "INVALID_INPUT",
+    "INVALID_TOOL_ARGUMENTS",
+    "UNKNOWN_TOOL",
+    "OPERATION_FORBIDDEN",
+    "SOURCE_CHANGED",
+    "VERIFICATION_FAILED",
+    "INVALID_MODEL_OUTPUT",
+    "APPROVAL_REQUIRED",
+    "REQUESTER_NOT_ACTIVE",
+}
+
+
+def is_retryable_job_code(code: Optional[str]) -> bool:
+    if not code:
+        return True
+    return str(code) not in _NON_RETRYABLE_JOB_CODES

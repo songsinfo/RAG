@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     DOCLING_URL: str = "http://127.0.0.1:5001"
     DOCLING_API_KEY: str = ""
     RAG_EMBEDDED_WORKER: bool = True
+    RAG_QA_WORKERS: int = 4
+    RAG_INGEST_WORKERS: int = 2
+    RAG_EVAL_WORKERS: int = 1
     RAG_ARTIFACT_STORE: str = "local"
     S3_ENDPOINT_URL: str = ""
     S3_BUCKET: str = "rag-artifacts"
@@ -93,6 +96,9 @@ def load_settings() -> Settings:
         DOCLING_URL=os.getenv("DOCLING_URL", "http://127.0.0.1:5001"),
         DOCLING_API_KEY=os.getenv("DOCLING_API_KEY", ""),
         RAG_EMBEDDED_WORKER=os.getenv("RAG_EMBEDDED_WORKER", "true").lower() in ("true", "1", "yes"),
+        RAG_QA_WORKERS=int(os.getenv("RAG_QA_WORKERS", "4")),
+        RAG_INGEST_WORKERS=int(os.getenv("RAG_INGEST_WORKERS", "2")),
+        RAG_EVAL_WORKERS=int(os.getenv("RAG_EVAL_WORKERS", "1")),
         RAG_ARTIFACT_STORE=os.getenv("RAG_ARTIFACT_STORE", "local"),
         S3_ENDPOINT_URL=os.getenv("S3_ENDPOINT_URL", ""),
         S3_BUCKET=os.getenv("S3_BUCKET", "rag-artifacts"),

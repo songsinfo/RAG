@@ -42,24 +42,37 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Unfinished job recovery check: {e}")
 
-    worker = None
-    worker_thread = None
+    workers = []
+    worker_threads = []
     if not is_test_env() and settings.RAG_EMBEDDED_WORKER:
         from app.runtime.worker import DurableJobWorker
-        worker = DurableJobWorker()
-        worker_thread = threading.Thread(
-            target=worker.run_forever,
-            name="rag-durable-worker",
-            daemon=True,
-        )
-        worker_thread.start()
+
+        pools = [
+            ("qa", {"QA_RUN"}, max(1, settings.RAG_QA_WORKERS)),
+            ("ingest", {"INGEST", "PURGE"}, max(1, settings.RAG_INGEST_WORKERS)),
+            ("eval", {"EVALUATE"}, max(1, settings.RAG_EVAL_WORKERS)),
+        ]
+        for pool_name, kinds, count in pools:
+            for index in range(count):
+                worker = DurableJobWorker(
+                    worker_id=f"embedded-{pool_name}-{index}",
+                    kinds=kinds,
+                )
+                thread = threading.Thread(
+                    target=worker.run_forever,
+                    name=f"rag-worker-{pool_name}-{index}",
+                    daemon=True,
+                )
+                thread.start()
+                workers.append(worker)
+                worker_threads.append(thread)
 
     yield
 
-    if worker:
+    for worker in workers:
         worker.stop()
-    if worker_thread:
-        worker_thread.join(timeout=5)
+    for thread in worker_threads:
+        thread.join(timeout=5)
 
 
 app = FastAPI(
