@@ -556,69 +556,72 @@ class QaService:
         job_id: Optional[str] = None,
         lease_epoch: Optional[int] = None,
     ):
-        with get_db_connection() as conn:
-            row = conn.execute(
-                select(qa_run_table).where(and_(
-                    qa_run_table.c.tenant_id == actor.tenant_id,
-                    qa_run_table.c.id == run_id,
-                    qa_run_table.c.owner_id == actor.user_id,
-                ))
-            ).first()
-            if not row:
-                raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
-            if str(row.status) in {"SUCCEEDED", "COMPLETED", "CANCELLED", "WAITING_APPROVAL"}:
-                return
+        with qa_execution_scope(job_id, lease_epoch):
+            with get_db_connection() as conn:
+                if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                    return
 
-            # A durable retry replays the run from its immutable request fields.
-            # Clear only derived attempt state; model_call remains as audit history.
-            if str(row.status) in {"RUNNING", "FAILED"}:
-                job_row = conn.execute(
-                    select(job_table.c.checkpoint, job_table.c.status).where(and_(
-                        job_table.c.tenant_id == actor.tenant_id,
-                        job_table.c.kind == "QA_RUN",
-                        job_table.c.target_id == run_id,
-                    ))
-                ).first()
-                checkpoint = dict(job_row.checkpoint or {}) if job_row and job_row.checkpoint else {}
-                has_agent_checkpoint = (
-                    str(row.mode) == "AGENT"
-                    and isinstance(checkpoint.get("agentRuntime"), dict)
-                )
-                if not has_agent_checkpoint:
-                    conn.execute(delete(run_source_table).where(and_(
-                        run_source_table.c.tenant_id == actor.tenant_id,
-                        run_source_table.c.run_id == run_id,
-                    )))
-                    conn.execute(delete(run_event_table).where(and_(
-                        run_event_table.c.tenant_id == actor.tenant_id,
-                        run_event_table.c.run_id == run_id,
-                    )))
-                conn.execute(
-                    update(qa_run_table)
+                row = conn.execute(
+                    select(qa_run_table)
                     .where(and_(
                         qa_run_table.c.tenant_id == actor.tenant_id,
                         qa_run_table.c.id == run_id,
+                        qa_run_table.c.owner_id == actor.user_id,
                     ))
-                    .values(
-                        status="QUEUED",
-                        stage="ROUTING",
-                        result_json=None,
-                        terminal_reason=None,
-                        started_at=None if not has_agent_checkpoint else row.started_at,
-                        finished_at=None,
-                        updated_at=datetime.now(timezone.utc),
+                    .with_for_update()
+                ).first()
+                if not row:
+                    raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
+                if str(row.status) in {"SUCCEEDED", "COMPLETED", "CANCELLED", "WAITING_APPROVAL"}:
+                    return
+
+                if str(row.status) in {"RUNNING", "FAILED"}:
+                    job_row = conn.execute(
+                        select(job_table.c.checkpoint, job_table.c.status).where(and_(
+                            job_table.c.tenant_id == actor.tenant_id,
+                            job_table.c.kind == "QA_RUN",
+                            job_table.c.target_id == run_id,
+                        ))
+                    ).first()
+                    checkpoint = dict(job_row.checkpoint or {}) if job_row and job_row.checkpoint else {}
+                    has_agent_checkpoint = (
+                        str(row.mode) == "AGENT"
+                        and isinstance(checkpoint.get("agentRuntime"), dict)
                     )
-                )
+                    if not has_agent_checkpoint:
+                        conn.execute(delete(run_source_table).where(and_(
+                            run_source_table.c.tenant_id == actor.tenant_id,
+                            run_source_table.c.run_id == run_id,
+                        )))
+                        conn.execute(delete(run_event_table).where(and_(
+                            run_event_table.c.tenant_id == actor.tenant_id,
+                            run_event_table.c.run_id == run_id,
+                        )))
+                    conn.execute(
+                        update(qa_run_table)
+                        .where(and_(
+                            qa_run_table.c.tenant_id == actor.tenant_id,
+                            qa_run_table.c.id == run_id,
+                        ))
+                        .values(
+                            status="QUEUED",
+                            stage="ROUTING",
+                            result_json=None,
+                            terminal_reason=None,
+                            started_at=None if not has_agent_checkpoint else row.started_at,
+                            finished_at=None,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+
+                conv_id = str(row.conversation_id)
+                seg_id = str(row.segment_id)
+                question = str(row.question or "")
+                mode = str(row.mode)
+                strict_mode = bool(row.strict_mode)
+                config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
                 conn.commit()
 
-            conv_id = str(row.conversation_id)
-            seg_id = str(row.segment_id)
-            question = str(row.question or "")
-            mode = str(row.mode)
-            strict_mode = bool(row.strict_mode)
-            config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
-
-        with qa_execution_scope(job_id, lease_epoch):
             QaService._execute_run(
                 actor,
                 run_id,
