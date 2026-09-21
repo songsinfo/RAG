@@ -15,6 +15,9 @@ from app.models import tenant_table, app_user_table, user_group_table, group_mem
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.telemetry import configure_telemetry
+    configure_telemetry()
+
     # Startup: ensure DB connection is reachable and seed database
     try:
         with get_db_connection() as conn:

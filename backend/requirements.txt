@@ -17,3 +17,4 @@ langgraph==1.2.11
 pytest>=8.3.4
 pytest-asyncio>=0.24.0
 boto3>=1.35.0
+opentelemetry-api>=1.27.0,<2\nopentelemetry-sdk>=1.27.0,<2\nopentelemetry-exporter-otlp-proto-http>=1.27.0,<2\n
