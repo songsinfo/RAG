@@ -638,7 +638,11 @@ class KnowledgeService:
                     build_no=v_no,
                     config_id=cfg_id,
                     status="QUEUED",
-                    capabilities={"embedding": bool(build_config.get("embedding", False))},
+                    capabilities={
+                        "embedding": bool(build_config.get("embedding", False)),
+                        "parser": "docling",
+                        "chunker": "hybrid",
+                    },
                     fence=0,
                     published_at=None,
                     created_at=now,
