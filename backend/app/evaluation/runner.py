@@ -43,14 +43,27 @@ _eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
-    """Validate RETRIEVAL_ONLY: no generative query transformation or answer model."""
+    """Verify that zero-model RETRIEVAL_ONLY stays lexical and deterministic."""
     retrieval = config.get("retrieval", {}) if isinstance(config.get("retrieval"), dict) else {}
-    mode = str(retrieval.get("mode", "HYBRID")).upper()
-    if mode not in {"DENSE", "BM25", "HYBRID", "SPARSE", "LEXICAL"}:
-        raise ApiException(409, "INVALID_CONFIG", "RETRIEVAL_ONLY 检索模式无效")
+    mode = str(retrieval.get("mode", "BM25")).upper()
     query = config.get("query", {}) if isinstance(config.get("query"), dict) else {}
-    if query.get("rewrite") or query.get("hyde") or query.get("multiQuery"):
-        raise ApiException(409, "MODEL_REQUIRED", "RETRIEVAL_ONLY 不执行生成式 Query Rewrite/HyDE/MultiQuery")
+    post = config.get("post", {}) if isinstance(config.get("post"), dict) else {}
+    rerank = config.get("rerank", {}) if isinstance(config.get("rerank"), dict) else {}
+
+    if (
+        mode not in {"BM25", "SPARSE", "LEXICAL"}
+        or query.get("rewrite")
+        or query.get("hyde")
+        or query.get("multiQuery")
+        or post.get("rerank")
+        or post.get("mmr")
+        or rerank.get("enabled")
+    ):
+        raise ApiException(
+            409,
+            "MODEL_REQUIRED",
+            "RETRIEVAL_ONLY 只运行无模型 BM25；Dense/Hybrid/Rerank 消融请使用 RETRIEVAL_PIPELINE",
+        )
 
 
 def number(v: Any) -> float:
@@ -116,7 +129,7 @@ class EvaluationRunner:
                 raise ApiException(400, "INVALID_INPUT", "重复次数1..3")
 
             mode = str(body.get("mode", "RAG")).strip().upper()
-            if mode not in {"RAG", "AGENT", "RETRIEVAL_ONLY"}:
+            if mode not in {"RAG", "AGENT", "RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 raise ApiException(400, "INVALID_INPUT", "评估模式无效")
 
             cfg_payload = obj(cfg.payload)
@@ -144,7 +157,7 @@ class EvaluationRunner:
 
             if mode == "RETRIEVAL_ONLY":
                 ceiling = 0.0
-                cost_status = "RETRIEVAL_PIPELINE"
+                cost_status = "NO_MODEL_CALLS"
             else:
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
@@ -389,7 +402,7 @@ class EvaluationRunner:
 
             start_t = time.perf_counter()
 
-            if mode == "RETRIEVAL_ONLY":
+            if mode in {"RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 try:
                     retrieval = RetrievalPipeline.retrieve(
                         actor=actor,
@@ -404,7 +417,7 @@ class EvaluationRunner:
                     metric = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, hits, hits)
                     metric["durationMs"] = round(latency_ms, 2)
                     metric["costCny"] = 0.0
-                    metric["mode"] = "RETRIEVAL_ONLY"
+                    metric["mode"] = mode
                     metric["configId"] = eval_config_id
                     metric["retrievalConfig"] = retrieval["config"]
                     hit_val = metric.get("hit")

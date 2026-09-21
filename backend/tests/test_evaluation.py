@@ -816,7 +816,7 @@ def test_single_case_failure_retention(eval_env):
                 "groupKey": "grp-f-01",
                 "split": "TEST",
                 "category": "FACT",
-                "question": {"text": "正常的问答题目？"},
+                "question": {"text": "结构化分块策略"},
                 "persona": {"loginName": "operator"},
                 "expected": {
                     "status": "ANSWER",
