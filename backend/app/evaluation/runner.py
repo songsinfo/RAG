@@ -292,7 +292,7 @@ class EvaluationRunner:
     @staticmethod
     def _execute_run(actor: Actor, run_id: str):
         """Asynchronous execution of all cases in an eval run."""
-        from app.retrieval.milvus_service import MilvusHybridService
+        from app.retrieval.pipeline import RetrievalPipeline
         from app.qa.service import QaService
 
         now = datetime.now(timezone.utc)
@@ -319,6 +319,7 @@ class EvaluationRunner:
             manifest = obj(run_row.manifest_json)
             mode = manifest.get("mode", "RAG")
             snapshot_id = str(run_row.snapshot_id)
+            eval_config_id = str(run_row.config_id)
 
             snap_docs = conn.execute(
                 select(eval_snapshot_document_table.c.document_id).where(
@@ -390,18 +391,22 @@ class EvaluationRunner:
 
             if mode == "RETRIEVAL_ONLY":
                 try:
-                    hits = MilvusHybridService.search(
-                        tenant_id=actor.tenant_id,
+                    retrieval = RetrievalPipeline.retrieve(
+                        actor=actor,
                         query=question_text,
-                        allowed_build_ids=allowed_build_ids,
-                        top_k=5,
+                        document_ids=allowed_doc_ids,
+                        config_id=eval_config_id,
+                        run_id=None,
                     )
+                    hits = retrieval["hits"]
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
 
                     metric = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, hits, hits)
                     metric["durationMs"] = round(latency_ms, 2)
                     metric["costCny"] = 0.0
                     metric["mode"] = "RETRIEVAL_ONLY"
+                    metric["configId"] = eval_config_id
+                    metric["retrievalConfig"] = retrieval["config"]
                     hit_val = metric.get("hit")
                     exp_status = expected_obj.get("status", "ANSWER")
                     if exp_status == "ABSTAIN":
@@ -446,7 +451,12 @@ class EvaluationRunner:
                     submitted = QaService.submit_run(
                         persona_actor,
                         conv_id,
-                        {"question": question_text, "mode": "RAG", "strictMode": manifest.get("strict", False)},
+                        {
+                            "question": question_text,
+                            "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
+                            "strictMode": manifest.get("strict", False),
+                            "configId": eval_config_id,
+                        },
                         idempotency_key=f"eval:{result_id}:0",
                     )
                     qa_run_id = submitted["runId"]
