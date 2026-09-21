@@ -23,7 +23,7 @@ from app.main import app
 
 
 @pytest.fixture(autouse=True)
-def setup_test_db():
+def setup_test_db(monkeypatch):
     # In-memory SQLite for fast, reproducible tests
     from app.identity.security import _login_attempts
     _login_attempts.clear()
@@ -94,6 +94,38 @@ def setup_test_db():
     # Patch app.db.engine
     orig_engine = app_db.engine
     app_db.engine = test_engine
+
+    # Ingestion tests stay hermetic while production always calls Docling.
+    # Dedicated parser tests below exercise the real HTTP contract separately.
+    from app.knowledge.chunker import adapt_docling_hybrid_chunks
+    import app.knowledge.service as knowledge_service
+
+    def fake_parse_and_chunk_document(file_bytes, filename, build_config=None):
+        try:
+            text = file_bytes.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            text = f"binary document {filename}"
+        if not text:
+            text = filename
+        items = [{
+            "filename": filename,
+            "chunk_index": 0,
+            "text": text,
+            "raw_text": text,
+            "num_tokens": max(1, len(text) // 4),
+            "headings": [],
+            "captions": [],
+            "doc_items": [f"#/texts/{filename}"],
+            "page_numbers": [1],
+            "metadata": {},
+        }]
+        return adapt_docling_hybrid_chunks(items, parent_max_tokens=1200)
+
+    monkeypatch.setattr(
+        knowledge_service,
+        "parse_and_chunk_document",
+        fake_parse_and_chunk_document,
+    )
     yield test_engine
     app_db.engine = orig_engine
 
