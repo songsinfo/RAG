@@ -342,7 +342,7 @@ CREATE TABLE job (
   PRIMARY KEY (tenant_id, id),
   UNIQUE KEY uq_job_idempotency (tenant_id,kind,idempotency_key),
   KEY ix_job_claim (status,available_at,lease_until),
-  CHECK (kind IN ('INGEST','PURGE','RESTORE','EVALUATE','EXPORT','CLEANUP')),
+  CONSTRAINT chk_job_kind CHECK (kind IN ('INGEST','PURGE','RESTORE','EVALUATE','EXPORT','CLEANUP','QA_RUN')),
   CONSTRAINT fk_40 FOREIGN KEY (tenant_id) REFERENCES tenant (id),
   CONSTRAINT fk_41 FOREIGN KEY (tenant_id,requested_by) REFERENCES app_user (tenant_id,id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

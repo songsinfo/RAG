@@ -1230,7 +1230,10 @@ class KnowledgeService:
                         for c in child_chunks
                     ]
                     b_row = conn.execute(
-                        select(index_build_table.c.version_id).where(
+                        select(
+                            index_build_table.c.version_id,
+                            index_build_table.c.fence,
+                        ).where(
                             and_(
                                 index_build_table.c.tenant_id == actor.tenant_id,
                                 index_build_table.c.id == build_id,
@@ -1238,6 +1241,7 @@ class KnowledgeService:
                         )
                     ).first()
                     version_id = str(b_row.version_id) if b_row else ""
+                    published_epoch = int(b_row.fence or 0) if b_row else 0
                     MilvusHybridService.upsert_chunks(
                         tenant_id=actor.tenant_id,
                         build_id=build_id,
@@ -1245,6 +1249,7 @@ class KnowledgeService:
                         kb_id=str(doc.kb_id),
                         doc_id=doc_id,
                         version_id=version_id,
+                        index_epoch=published_epoch,
                     )
 
                 conn.execute(
