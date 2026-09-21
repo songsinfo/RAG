@@ -98,13 +98,29 @@ def delete_artifact(storage_key: str):
     if _mode() == "s3":
         try:
             _s3_client().delete_object(Bucket=_bucket(), Key=storage_key)
-        except Exception:
-            pass
+        except Exception as exc:
+            # A purge is only complete when the private object is actually gone.
+            # Propagate storage failures so the durable job stays FAILED/retryable.
+            raise ApiException(503, "ARTIFACT_DELETE_FAILED", f"对象存储删除失败: {exc}") from exc
         return
+
     root = get_artifact_root()
     target = (root / storage_key).resolve()
     if target.is_file() and target.is_relative_to(root.resolve()):
         try:
             target.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            raise ApiException(503, "ARTIFACT_DELETE_FAILED", f"本地构件删除失败: {exc}") from exc
+        return
+
+    # Backward compatibility: old content-addressed keys were stored at
+    # tenant/sha[:2]/sha/filename while the persisted key was tenant/sha/filename.
+    parts = storage_key.split("/")
+    if len(parts) == 3:
+        tenant_id, sha_hex, filename = parts
+        legacy = (root / tenant_id / sha_hex[:2] / sha_hex / filename).resolve()
+        if legacy.is_file() and legacy.is_relative_to(root.resolve()):
+            try:
+                legacy.unlink()
+            except OSError as exc:
+                raise ApiException(503, "ARTIFACT_DELETE_FAILED", f"旧格式本地构件删除失败: {exc}") from exc

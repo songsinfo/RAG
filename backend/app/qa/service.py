@@ -773,6 +773,10 @@ class QaService:
 
             # 7. Strict Mode Verification
             if strict_mode and validated.get("claims"):
+                # Judge is another external-model boundary. Re-check sources
+                # immediately before sending evidence again.
+                with get_db_connection() as conn:
+                    assert_hits_still_readable(conn, actor, evidence, allowed_kb_ids or None)
                 judge_prompt = [
                     {
                         "role": "system",
