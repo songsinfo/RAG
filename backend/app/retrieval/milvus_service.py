@@ -257,17 +257,25 @@ class MilvusHybridService:
         if client:
             try:
                 if allowed_build_epochs:
-                    build_clauses = []
+                    grouped: Dict[int, List[str]] = {}
+                    legacy_builds: List[str] = []
                     for allowed_build_id in allowed_build_ids:
                         expected_epoch = int(allowed_build_epochs.get(allowed_build_id, 0) or 0)
                         if expected_epoch > 0:
-                            build_clauses.append(
-                                f'(build_id == "{allowed_build_id}" and index_epoch == {expected_epoch})'
-                            )
+                            grouped.setdefault(expected_epoch, []).append(allowed_build_id)
                         else:
-                            # Legacy published builds have fence=0 and may not
-                            # have an index_epoch field in an existing collection.
-                            build_clauses.append(f'build_id == "{allowed_build_id}"')
+                            legacy_builds.append(allowed_build_id)
+
+                    build_clauses = []
+                    for epoch, build_ids in grouped.items():
+                        ids_expr = ", ".join(f'"{build_id}"' for build_id in build_ids)
+                        build_clauses.append(
+                            f'(index_epoch == {epoch} and build_id in [{ids_expr}])'
+                        )
+                    if legacy_builds:
+                        ids_expr = ", ".join(f'"{build_id}"' for build_id in legacy_builds)
+                        build_clauses.append(f'build_id in [{ids_expr}]')
+
                     build_filter = " or ".join(build_clauses)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and ({build_filter}) '
