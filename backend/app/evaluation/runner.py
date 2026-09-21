@@ -38,26 +38,29 @@ from app.models import (
 )
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
+from app.retrieval.config import validate_retrieval_payload
 
 _eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
-    """Verify that zero-model RETRIEVAL_ONLY stays lexical and deterministic."""
-    retrieval = config.get("retrieval", {}) if isinstance(config.get("retrieval"), dict) else {}
-    mode = str(retrieval.get("mode", "BM25")).upper()
+    """Verify RETRIEVAL_ONLY against the same effective config used at runtime."""
+    try:
+        effective = validate_retrieval_payload(config)
+    except ApiException as exc:
+        raise ApiException(409, "INVALID_CONFIG", exc.message) from exc
+
     query = config.get("query", {}) if isinstance(config.get("query"), dict) else {}
     post = config.get("post", {}) if isinstance(config.get("post"), dict) else {}
-    rerank = config.get("rerank", {}) if isinstance(config.get("rerank"), dict) else {}
 
     if (
-        mode not in {"BM25", "SPARSE", "LEXICAL"}
+        effective.mode != "BM25"
+        or effective.rerank_enabled
         or query.get("rewrite")
         or query.get("hyde")
         or query.get("multiQuery")
         or post.get("rerank")
         or post.get("mmr")
-        or rerank.get("enabled")
     ):
         raise ApiException(
             409,

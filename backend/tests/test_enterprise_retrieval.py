@@ -136,6 +136,53 @@ def test_config_driven_rerank_parent_expansion_and_provenance():
     assert exc.value.code == "SOURCE_CHANGED"
 
 
+def test_milvus_index_epoch_isolates_stale_attempt_cleanup():
+    MilvusHybridService._mock_store.clear()
+    common = {
+        "tenant_id": "tenant-demo-1",
+        "build_id": "build-fenced",
+        "kb_id": "kb-fenced",
+        "doc_id": "doc-fenced",
+        "version_id": "ver-fenced",
+    }
+
+    MilvusHybridService.upsert_chunks(
+        **common,
+        chunks=[{"id": "child-old", "parent_id": None, "text_content": "Milvus stale attempt"}],
+        index_epoch=1,
+    )
+    MilvusHybridService.upsert_chunks(
+        **common,
+        chunks=[{"id": "child-winner", "parent_id": None, "text_content": "Milvus winning attempt"}],
+        index_epoch=2,
+    )
+
+    # A stale epoch=1 worker may resume cleanup after epoch=2 already published.
+    # Its delete must be physically scoped to its own generation.
+    MilvusHybridService.delete_by_build(
+        common["tenant_id"],
+        common["build_id"],
+        index_epoch=1,
+    )
+
+    remaining = list(MilvusHybridService._mock_store.values())
+    assert len(remaining) == 1
+    assert remaining[0]["chunk_id"] == "child-winner"
+    assert remaining[0]["index_epoch"] == 2
+
+    hits = MilvusHybridService.search(
+        tenant_id=common["tenant_id"],
+        query="Milvus",
+        allowed_build_ids=[common["build_id"]],
+        allowed_build_epochs={common["build_id"]: 2},
+        mode="BM25",
+        sparse_top_k=5,
+        fusion_top_k=5,
+    )
+    assert [h["chunkId"] for h in hits] == ["child-winner"]
+    assert hits[0]["indexEpoch"] == 2
+
+
 def test_docling_binary_parse(monkeypatch):
     from app.knowledge import parser
 

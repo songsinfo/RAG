@@ -154,6 +154,7 @@ def get_readable_build_records(
             document_table.c.id.label("document_id"),
             document_table.c.kb_id,
             index_build_table.c.version_id,
+            index_build_table.c.fence,
         )
         .select_from(
             document_table.join(
@@ -188,6 +189,7 @@ def get_readable_build_records(
             "documentId": str(r.document_id),
             "kbId": str(r.kb_id),
             "versionId": str(r.version_id),
+            "indexEpoch": int(r.fence or 0),
         }
         for r in rows
     ]
@@ -207,9 +209,16 @@ def assert_hits_still_readable(
     if not hits:
         return
     readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
-    allowed = {(r["buildId"], r["documentId"]) for r in readable}
+    allowed = {
+        (r["buildId"], r["documentId"]): int(r.get("indexEpoch") or 0)
+        for r in readable
+    }
     for hit in hits:
         build_id = str(hit.get("buildId") or "")
         document_id = str(hit.get("documentId") or "")
-        if not build_id or not document_id or (build_id, document_id) not in allowed:
+        expected_epoch = allowed.get((build_id, document_id))
+        hit_epoch = hit.get("indexEpoch")
+        if not build_id or not document_id or expected_epoch is None:
             raise ApiException(409, "SOURCE_CHANGED", "检索来源权限或生效版本已变化，请重新提问")
+        if expected_epoch > 0 and hit_epoch is not None and int(hit_epoch) != expected_epoch:
+            raise ApiException(409, "SOURCE_CHANGED", "检索索引代次已变化，请重新提问")

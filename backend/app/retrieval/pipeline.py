@@ -29,6 +29,10 @@ class RetrievalPipeline:
             readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
 
         allowed_build_ids = [row["buildId"] for row in readable]
+        allowed_build_epochs = {
+            row["buildId"]: int(row.get("indexEpoch") or 0)
+            for row in readable
+        }
         if not allowed_build_ids:
             return {
                 "hits": [],
@@ -47,6 +51,7 @@ class RetrievalPipeline:
             mode=cfg.mode,
             rrf_enabled=cfg.rrf_enabled,
             rrf_k=cfg.rrf_k,
+            allowed_build_epochs=allowed_build_epochs,
         )
 
         # Reranking is an external model boundary. Re-check every candidate

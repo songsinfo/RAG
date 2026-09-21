@@ -798,7 +798,11 @@ class KnowledgeService:
 
             # Remove partial vectors from a previous crashed attempt as well.
             from app.retrieval.milvus_service import MilvusHybridService
-            MilvusHybridService.delete_by_build(tenant_id, build_id)
+            MilvusHybridService.delete_by_build(
+                tenant_id,
+                build_id,
+                index_epoch=int(lease_epoch) if lease_epoch is not None else None,
+            )
 
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
@@ -897,6 +901,7 @@ class KnowledgeService:
                     kb_id=kb_id,
                     doc_id=doc_id,
                     version_id=version_id,
+                    index_epoch=int(lease_epoch or 0),
                 )
 
             # Fenced publish: only the current lease owner can make the build active.
@@ -911,7 +916,12 @@ class KnowledgeService:
                         index_build_table.c.id == build_id,
                         index_build_table.c.status != "READY",
                     ))
-                    .values(status="READY", published_at=now, updated_at=now)
+                    .values(
+                        status="READY",
+                        fence=int(lease_epoch or 0),
+                        published_at=now,
+                        updated_at=now,
+                    )
                 )
                 conn.execute(
                     update(document_table)

@@ -109,6 +109,12 @@ def test_retrieval_only_permits_bm25_without_model_transforms_or_reranking():
         check_no_model({"retrieval": {"mode": "DENSE"}})
     assert exc1.value.code == "MODEL_REQUIRED"
 
+    # Missing mode is normalized exactly like RetrievalConfig.from_payload:
+    # HYBRID, which uses query embeddings and therefore is not zero-model.
+    with pytest.raises(ApiException) as exc_default:
+        check_no_model({"retrieval": {"topK": 5}})
+    assert exc_default.value.code == "MODEL_REQUIRED"
+
     with pytest.raises(ApiException) as exc2:
         check_no_model({"retrieval": {"mode": "BM25"}, "query": {"rewrite": True}})
     assert exc2.value.code == "MODEL_REQUIRED"
