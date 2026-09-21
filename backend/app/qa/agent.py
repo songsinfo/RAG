@@ -27,6 +27,7 @@ from app.models import (
 )
 from app.observability import add_span_event, agent_span
 from app.qa.job_checkpointer import JobCheckpointSaver
+from app.qa.execution import current_qa_execution, qa_lease_is_current
 from app.qa.claim_validator import INSTRUCTION, validate_claims
 from app.qa.guardrails import guard_retrieved_content
 from app.qa.model_gateway import ModelGateway
@@ -162,12 +163,17 @@ class LangGraphAgent:
         policy = AgentRuntimePolicy.from_env()
         deadline_epoch = time.time() + policy.overall_timeout_seconds
         graph = cls._get_graph()
+        configurable = {
+            "thread_id": run_id,
+            "tenant_id": actor.tenant_id,
+        }
+        current_execution = current_qa_execution()
+        if current_execution is not None:
+            configurable["job_id"] = current_execution[0]
+            configurable["lease_epoch"] = current_execution[1]
         graph_config = {
             "recursion_limit": 20,
-            "configurable": {
-                "thread_id": run_id,
-                "tenant_id": actor.tenant_id,
-            },
+            "configurable": configurable,
         }
 
         snapshot = graph.get_state(graph_config)
@@ -560,6 +566,8 @@ class LangGraphAgent:
                         now = datetime.now(timezone.utc)
 
                         with get_db_connection() as conn:
+                            if not qa_lease_is_current(conn, actor.tenant_id, ctx.run_id):
+                                raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
                             for hit in retrieval["hits"]:
                                 key = cls._hit_key(hit)
                                 existing = evidence_by_key.get(key)
@@ -835,6 +843,8 @@ class LangGraphAgent:
         ev_index: int,
     ) -> Dict[str, Any]:
         with get_db_connection() as conn:
+            if not qa_lease_is_current(conn, actor.tenant_id, run_id):
+                raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
             from app.identity.deps import can_read_document
 
             if not can_read_document(conn, actor, doc_id):

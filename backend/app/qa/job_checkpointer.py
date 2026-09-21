@@ -22,13 +22,24 @@ class JobCheckpointSaver(BaseCheckpointSaver):
     _MAX_HISTORY = 64
 
     @staticmethod
-    def _cfg(config: RunnableConfig) -> tuple[str, str, str, Optional[str]]:
+    def _cfg(
+        config: RunnableConfig,
+    ) -> tuple[str, str, str, Optional[str], Optional[str], Optional[int]]:
         values = config.get("configurable", {})
         thread_id = str(values["thread_id"])
         tenant_id = str(values.get("tenant_id") or "")
         checkpoint_ns = str(values.get("checkpoint_ns") or "")
         checkpoint_id = values.get("checkpoint_id")
-        return tenant_id, thread_id, checkpoint_ns, str(checkpoint_id) if checkpoint_id else None
+        job_id = values.get("job_id")
+        lease_epoch = values.get("lease_epoch")
+        return (
+            tenant_id,
+            thread_id,
+            checkpoint_ns,
+            str(checkpoint_id) if checkpoint_id else None,
+            str(job_id) if job_id else None,
+            int(lease_epoch) if lease_epoch is not None else None,
+        )
 
     def _encode(self, value: Any) -> Dict[str, str]:
         kind, payload = self.serde.dumps_typed(value)
@@ -46,15 +57,35 @@ class JobCheckpointSaver(BaseCheckpointSaver):
     def _empty_root() -> Dict[str, Any]:
         return {"checkpoints": [], "writes": {}}
 
-    def _load_job_for_update(self, conn, tenant_id: str, thread_id: str):
-        stmt = select(job_table.c.id, job_table.c.checkpoint).where(
-            and_(
-                job_table.c.kind == "QA_RUN",
-                job_table.c.target_id == thread_id,
-            )
-        )
+    def _load_job_for_update(
+        self,
+        conn,
+        tenant_id: str,
+        thread_id: str,
+        job_id: Optional[str] = None,
+        lease_epoch: Optional[int] = None,
+    ):
+        clauses = [
+            job_table.c.kind == "QA_RUN",
+            job_table.c.target_id == thread_id,
+        ]
         if tenant_id:
-            stmt = stmt.where(job_table.c.tenant_id == tenant_id)
+            clauses.append(job_table.c.tenant_id == tenant_id)
+        if job_id is not None and lease_epoch is not None:
+            clauses.extend([
+                job_table.c.id == job_id,
+                job_table.c.status == "RUNNING",
+                job_table.c.lease_epoch == lease_epoch,
+            ])
+        else:
+            clauses.append(job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]))
+        stmt = select(
+            job_table.c.id,
+            job_table.c.tenant_id,
+            job_table.c.checkpoint,
+            job_table.c.status,
+            job_table.c.lease_epoch,
+        ).where(and_(*clauses))
         return conn.execute(stmt.with_for_update()).first()
 
     def _load_job(self, conn, tenant_id: str, thread_id: str):
@@ -69,7 +100,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
         return conn.execute(stmt).first()
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        tenant_id, thread_id, checkpoint_ns, checkpoint_id = self._cfg(config)
+        tenant_id, thread_id, checkpoint_ns, checkpoint_id, job_id, lease_epoch = self._cfg(config)
         with get_db_connection() as conn:
             row = self._load_job(conn, tenant_id, thread_id)
         if not row:
@@ -108,6 +139,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
                 "tenant_id": effective_tenant,
                 "checkpoint_ns": checkpoint_ns,
                 "checkpoint_id": cp_id,
+                **({"job_id": job_id, "lease_epoch": lease_epoch} if job_id is not None and lease_epoch is not None else {}),
             }
         }
         parent_id = match.get("parentId")
@@ -142,7 +174,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
     ) -> Iterator[CheckpointTuple]:
         if config is None:
             return
-        tenant_id, thread_id, checkpoint_ns, _ = self._cfg(config)
+        tenant_id, thread_id, checkpoint_ns, _, _, _ = self._cfg(config)
         with get_db_connection() as conn:
             row = self._load_job(conn, tenant_id, thread_id)
         if not row:
@@ -185,12 +217,12 @@ class JobCheckpointSaver(BaseCheckpointSaver):
         new_versions: Dict[str, Any],
     ) -> RunnableConfig:
         del new_versions
-        tenant_id, thread_id, checkpoint_ns, parent_id = self._cfg(config)
+        tenant_id, thread_id, checkpoint_ns, parent_id, job_id, lease_epoch = self._cfg(config)
         now = datetime.now(timezone.utc)
         cp_id = str(checkpoint["id"])
 
         with get_db_connection() as conn:
-            row = self._load_job_for_update(conn, tenant_id, thread_id)
+            row = self._load_job_for_update(conn, tenant_id, thread_id, job_id, lease_epoch)
             if not row:
                 raise RuntimeError(f"QA_RUN job not found for thread {thread_id}")
 
@@ -215,11 +247,22 @@ class JobCheckpointSaver(BaseCheckpointSaver):
             root["checkpoints"] = checkpoints
             job_cp[self._ROOT_KEY] = root
 
-            conn.execute(
+            clauses = [job_table.c.id == row.id]
+            if job_id is not None and lease_epoch is not None:
+                clauses.extend([
+                    job_table.c.status == "RUNNING",
+                    job_table.c.lease_epoch == lease_epoch,
+                ])
+            else:
+                clauses.append(job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]))
+            result = conn.execute(
                 update(job_table)
-                .where(job_table.c.id == row.id)
+                .where(and_(*clauses))
                 .values(checkpoint=job_cp, updated_at=now)
             )
+            if result.rowcount != 1:
+                conn.rollback()
+                raise RuntimeError(f"QA_RUN lease lost for checkpoint thread {thread_id}")
             conn.commit()
 
         return {
@@ -228,6 +271,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
                 "tenant_id": tenant_id,
                 "checkpoint_ns": checkpoint_ns,
                 "checkpoint_id": cp_id,
+                **({"job_id": job_id, "lease_epoch": lease_epoch} if job_id is not None and lease_epoch is not None else {}),
             }
         }
 
@@ -238,14 +282,14 @@ class JobCheckpointSaver(BaseCheckpointSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        tenant_id, thread_id, checkpoint_ns, checkpoint_id = self._cfg(config)
+        tenant_id, thread_id, checkpoint_ns, checkpoint_id, job_id, lease_epoch = self._cfg(config)
         if not checkpoint_id:
             return
         now = datetime.now(timezone.utc)
         key = f"{checkpoint_ns}:{checkpoint_id}"
 
         with get_db_connection() as conn:
-            row = self._load_job_for_update(conn, tenant_id, thread_id)
+            row = self._load_job_for_update(conn, tenant_id, thread_id, job_id, lease_epoch)
             if not row:
                 return
             job_cp = dict(row.checkpoint or {})
@@ -267,12 +311,23 @@ class JobCheckpointSaver(BaseCheckpointSaver):
             all_writes[key] = list(by_identity.values())
             root["writes"] = all_writes
             job_cp[self._ROOT_KEY] = root
-            conn.execute(
+            clauses = [job_table.c.id == row.id]
+            if job_id is not None and lease_epoch is not None:
+                clauses.extend([
+                    job_table.c.status == "RUNNING",
+                    job_table.c.lease_epoch == lease_epoch,
+                ])
+            else:
+                clauses.append(job_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]))
+            result = conn.execute(
                 update(job_table)
-                .where(job_table.c.id == row.id)
+                .where(and_(*clauses))
                 .values(checkpoint=job_cp, updated_at=now)
             )
-            conn.commit()
+            if result.rowcount == 1:
+                conn.commit()
+            else:
+                conn.rollback()
 
     def delete_thread(self, thread_id: str) -> None:
         now = datetime.now(timezone.utc)
