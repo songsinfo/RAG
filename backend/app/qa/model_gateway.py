@@ -11,6 +11,7 @@ from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
 from app.qa.model_clients import get_chat_model, get_http_client
+from app.qa.runtime import AgentRuntimePolicy, retry_call
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class ModelGateway:
         messages: List[Dict[str, str]],
         max_tokens: int = 2400,
         model_alias: str = "chat-main",
+        deadline_epoch: Optional[float] = None,
     ) -> str:
         gateway_url = os.getenv("LITELLM_BASE_URL")
         master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
@@ -55,16 +57,44 @@ class ModelGateway:
                     else:
                         lc_messages.append(AIMessage(content=content))
 
-                llm = get_chat_model(model_alias, max_tokens)
+                timeout_seconds = 30.0
+                if deadline_epoch is not None:
+                    timeout_seconds = max(1.0, min(30.0, deadline_epoch - time.time()))
+                    if deadline_epoch <= time.time():
+                        raise ApiException(408, "AGENT_TIMEOUT", "Agent 执行超过整体时间预算")
+                llm = get_chat_model(model_alias, max_tokens, timeout_seconds)
                 if llm is None:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
-                response = llm.invoke(lc_messages)
+
+                policy = AgentRuntimePolicy.from_env()
+                try:
+                    response = retry_call(
+                        f"llm:{model_alias}",
+                        lambda: llm.invoke(lc_messages),
+                        policy=policy,
+                        deadline_epoch=deadline_epoch,
+                    )
+                except Exception:
+                    fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
+                    if not fallback_alias or fallback_alias == model_alias:
+                        raise
+                    fallback = get_chat_model(fallback_alias, max_tokens, timeout_seconds)
+                    if fallback is None:
+                        raise
+                    response = retry_call(
+                        f"llm:{fallback_alias}",
+                        lambda: fallback.invoke(lc_messages),
+                        policy=policy,
+                        deadline_epoch=deadline_epoch,
+                    )
                 content = str(response.content)
 
                 # Record in model_call table
                 duration_ms = int((time.time() - start_time) * 1000)
-                input_tokens = response.response_metadata.get("token_usage", {}).get("prompt_tokens", 50)
-                output_tokens = response.response_metadata.get("token_usage", {}).get("completion_tokens", 50)
+                usage = getattr(response, "usage_metadata", None) or {}
+                token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
+                input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
+                output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
 
                 cls._record_call(
                     tenant_id=tenant_id,
@@ -181,6 +211,7 @@ class ModelGateway:
         tools: List[Dict[str, Any]],
         max_tokens: int = 1200,
         model_alias: str = "chat-main",
+        deadline_epoch: Optional[float] = None,
     ) -> Dict[str, Any]:
         call_id = str(uuid.uuid4())
         start_time = time.time()
@@ -233,12 +264,38 @@ class ModelGateway:
                                 })
                         lc_messages.append(AIMessage(content=content, tool_calls=normalized_calls))
 
-                base_model = get_chat_model(model_alias, max_tokens)
+                timeout_seconds = 30.0
+                if deadline_epoch is not None:
+                    timeout_seconds = max(1.0, min(30.0, deadline_epoch - time.time()))
+                    if deadline_epoch <= time.time():
+                        raise ApiException(408, "AGENT_TIMEOUT", "Agent 执行超过整体时间预算")
+                base_model = get_chat_model(model_alias, max_tokens, timeout_seconds)
                 if base_model is None:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
                 llm = base_model.bind_tools(tools, strict=True)
 
-                response = llm.invoke(lc_messages)
+                policy = AgentRuntimePolicy.from_env()
+                try:
+                    response = retry_call(
+                        f"llm-tools:{model_alias}",
+                        lambda: llm.invoke(lc_messages),
+                        policy=policy,
+                        deadline_epoch=deadline_epoch,
+                    )
+                except Exception:
+                    fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
+                    if not fallback_alias or fallback_alias == model_alias:
+                        raise
+                    fallback_model = get_chat_model(fallback_alias, max_tokens, timeout_seconds)
+                    if fallback_model is None:
+                        raise
+                    fallback_bound = fallback_model.bind_tools(tools, strict=True)
+                    response = retry_call(
+                        f"llm-tools:{fallback_alias}",
+                        lambda: fallback_bound.invoke(lc_messages),
+                        policy=policy,
+                        deadline_epoch=deadline_epoch,
+                    )
                 tool_calls = getattr(response, "tool_calls", [])
                 formatted_calls = [
                     {
@@ -249,7 +306,20 @@ class ModelGateway:
                     }
                     for i, tc in enumerate(tool_calls)
                 ]
-                cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias)
+                usage = getattr(response, "usage_metadata", None) or {}
+                token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
+                input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
+                output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
+                cls._record_call(
+                    tenant_id,
+                    call_id,
+                    run_id,
+                    purpose,
+                    "SUCCESS",
+                    input_tokens,
+                    output_tokens,
+                    model_alias,
+                )
                 return {
                     "role": "assistant",
                     "content": response.content or "",

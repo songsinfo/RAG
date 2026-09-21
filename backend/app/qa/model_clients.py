@@ -25,6 +25,7 @@ def _build_chat_model(
     api_key: str,
     model_alias: str,
     max_tokens: int,
+    timeout_seconds: float,
 ) -> ChatOpenAI:
     return ChatOpenAI(
         model=model_alias,
@@ -33,19 +34,24 @@ def _build_chat_model(
         max_retries=0,
         max_tokens=max_tokens,
         temperature=0.0,
-        timeout=30.0,
+        timeout=timeout_seconds,
         # LiteLLM is used as an OpenAI-compatible Chat Completions gateway.
         # Keep this explicit so model-name heuristics cannot silently switch API shape.
         use_responses_api=False,
     )
 
 
-def get_chat_model(model_alias: str, max_tokens: int) -> Optional[ChatOpenAI]:
+def get_chat_model(
+    model_alias: str,
+    max_tokens: int,
+    timeout_seconds: float = 30.0,
+) -> Optional[ChatOpenAI]:
     base_url = _base_url()
     if not base_url:
         return None
     api_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
-    return _build_chat_model(base_url, api_key, model_alias, max_tokens)
+    timeout_seconds = max(1.0, min(30.0, float(timeout_seconds)))
+    return _build_chat_model(base_url, api_key, model_alias, max_tokens, timeout_seconds)
 
 
 def get_http_client() -> httpx.Client:
