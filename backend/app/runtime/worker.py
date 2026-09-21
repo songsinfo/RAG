@@ -9,7 +9,7 @@ from sqlalchemy import and_, or_, select, update
 
 from app.db import get_db_connection
 from app.knowledge.artifacts import read_artifact
-from app.models import job_table
+from app.models import deletion_record_table, job_table
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,14 @@ class DurableJobWorker:
         job = self._claim_one()
         if not job:
             return False
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(job, heartbeat_stop),
+            name=f"job-heartbeat-{job['id']}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             if job["kind"] == "INGEST":
                 self._run_ingest(job)
@@ -49,6 +57,9 @@ class DurableJobWorker:
         except Exception:
             logger.exception("Job %s failed", job["id"])
             self._fail(job, "WORKER_EXECUTION_FAILED")
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=2)
         return True
 
     def _claim_one(self) -> Optional[Dict[str, Any]]:
@@ -69,15 +80,40 @@ class DurableJobWorker:
             if not row:
                 return None
             job = dict(row._mapping)
+            next_epoch = int(job.get("lease_epoch") or 0) + 1
             conn.execute(
                 update(job_table)
                 .where(and_(job_table.c.tenant_id == job["tenant_id"], job_table.c.id == job["id"]))
                 .values(status="RUNNING", lease_until=now + timedelta(seconds=self.lease_seconds),
-                        lease_epoch=job_table.c.lease_epoch + 1, attempt=job_table.c.attempt + 1,
+                        lease_epoch=next_epoch, attempt=job_table.c.attempt + 1,
                         error_code=None, updated_at=now)
             )
             conn.commit()
+            job["lease_epoch"] = next_epoch
             return job
+
+    def _heartbeat_loop(self, job: Dict[str, Any], stop: threading.Event):
+        interval = max(5.0, self.lease_seconds / 3.0)
+        while not stop.wait(interval):
+            now = datetime.now(timezone.utc)
+            with get_db_connection() as conn:
+                result = conn.execute(
+                    update(job_table)
+                    .where(and_(
+                        job_table.c.tenant_id == job["tenant_id"],
+                        job_table.c.id == job["id"],
+                        job_table.c.status == "RUNNING",
+                        job_table.c.lease_epoch == job["lease_epoch"],
+                    ))
+                    .values(
+                        lease_until=now + timedelta(seconds=self.lease_seconds),
+                        updated_at=now,
+                    )
+                )
+                conn.commit()
+                if result.rowcount == 0:
+                    logger.warning("Lease lost for job %s; heartbeat stopped", job["id"])
+                    return
 
     def _run_ingest(self, job: Dict[str, Any]):
         from app.knowledge.service import KnowledgeService
@@ -96,12 +132,28 @@ class DurableJobWorker:
         )
 
     def _fail(self, job: Dict[str, Any], code: str):
+        now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             conn.execute(
                 update(job_table)
-                .where(and_(job_table.c.tenant_id == job["tenant_id"], job_table.c.id == job["id"]))
-                .values(status="FAILED", error_code=code, lease_until=None, updated_at=datetime.now(timezone.utc))
+                .where(and_(
+                    job_table.c.tenant_id == job["tenant_id"],
+                    job_table.c.id == job["id"],
+                    job_table.c.lease_epoch == job.get("lease_epoch"),
+                ))
+                .values(status="FAILED", error_code=code, lease_until=None, updated_at=now)
             )
+            if job.get("kind") == "PURGE":
+                deletion_record_id = (job.get("checkpoint") or {}).get("deletionRecordId")
+                if deletion_record_id:
+                    conn.execute(
+                        update(deletion_record_table)
+                        .where(and_(
+                            deletion_record_table.c.tenant_id == job["tenant_id"],
+                            deletion_record_table.c.id == deletion_record_id,
+                        ))
+                        .values(status="FAILED", updated_at=now)
+                    )
             conn.commit()
 
 
