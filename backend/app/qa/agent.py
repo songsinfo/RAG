@@ -58,7 +58,6 @@ class AgentFinalResponse(BaseModel):
     claims: List[AgentClaim] = Field(default_factory=list)
     gaps: List[Any] = Field(default_factory=list)
     conflicts: List[Any] = Field(default_factory=list)
-    answer: str = ""
 
 
 AGENT_TOOLS = [

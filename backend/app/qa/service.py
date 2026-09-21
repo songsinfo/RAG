@@ -1012,6 +1012,8 @@ class QaService:
             "AGENT_APPROVAL_RESOLVED",
             {"toolCallId": tool_call_id, "decision": decision, "actorId": actor.user_id},
         )
+        if is_test_env():
+            QaService.execute_queued_run(actor, run_id)
         return {"runId": run_id, "status": "QUEUED", "decision": decision}
 
     @staticmethod

@@ -72,75 +72,88 @@ def compact_messages(
     messages: List[Dict[str, Any]],
     max_tokens: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    if message_tokens(messages) <= max_tokens:
-        return list(messages), {"trimmed": False, "droppedMessages": 0, "estimatedTokens": message_tokens(messages)}
+    original_tokens = message_tokens(messages)
+    if original_tokens <= max_tokens:
+        return list(messages), {
+            "trimmed": False,
+            "droppedMessages": 0,
+            "estimatedTokens": original_tokens,
+        }
 
-    prefix: List[Dict[str, Any]] = []
-    rest = list(messages)
-    for _ in range(min(2, len(rest))):
-        prefix.append(rest.pop(0))
+    source = [dict(message) for message in messages]
+    system = next((m for m in source if m.get("role") == "system"), None)
+    user_indexes = [i for i, m in enumerate(source) if m.get("role") == "user"]
+    current_user_index = user_indexes[-1] if user_indexes else 0
+    current_user = source[current_user_index] if source else {"role": "user", "content": ""}
 
+    # Previous conversation turns are the first candidates for compaction. The
+    # current user request and newest assistant/tool exchanges are preserved.
+    tail = source[current_user_index + 1:]
     groups: List[List[Dict[str, Any]]] = []
     current: List[Dict[str, Any]] = []
-    for message in rest:
-        role = str(message.get("role") or "")
-        if role == "assistant" and current:
+    for message in tail:
+        if message.get("role") == "assistant" and current:
             groups.append(current)
             current = []
         current.append(message)
     if current:
         groups.append(current)
 
+    mandatory = ([system] if system else []) + [current_user]
     kept_groups: List[List[Dict[str, Any]]] = []
     dropped_groups: List[List[Dict[str, Any]]] = []
-    current_messages = list(prefix)
     for group in reversed(groups):
-        candidate = prefix + [item for g in reversed([group] + kept_groups) for item in g]
+        candidate_groups = [group] + kept_groups
+        candidate = mandatory + [item for g in candidate_groups for item in g]
         if message_tokens(candidate) <= max_tokens:
             kept_groups.insert(0, group)
         else:
             dropped_groups.insert(0, group)
 
-    dropped_messages = [item for group in dropped_groups for item in group]
+    # Everything before the current user plus any old tool interaction groups
+    # becomes a non-factual execution summary.
+    dropped_messages = source[:current_user_index] + [
+        item for group in dropped_groups for item in group
+    ]
+    if system and dropped_messages and dropped_messages[0] is system:
+        dropped_messages = dropped_messages[1:]
+
     tool_names: List[str] = []
     evidence_ids: List[str] = []
     for message in dropped_messages:
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or []:
-                name = call.get("name")
-                if name:
-                    tool_names.append(str(name))
+                if call.get("name"):
+                    tool_names.append(str(call["name"]))
         if message.get("role") == "tool":
             try:
                 payload = json.loads(str(message.get("content") or "{}"))
                 for evidence in payload.get("evidence") or []:
-                    evidence_id = evidence.get("evidenceId")
-                    if evidence_id:
-                        evidence_ids.append(str(evidence_id))
+                    if evidence.get("evidenceId"):
+                        evidence_ids.append(str(evidence["evidenceId"]))
             except Exception:
                 pass
 
     summary = {
         "role": "system",
         "content": (
-            "Earlier agent steps were compacted to stay within the context budget. "
+            "Earlier conversation/agent steps were compacted for context budget. "
             f"Dropped messages={len(dropped_messages)}; "
             f"tools={sorted(set(tool_names))}; evidenceIds={sorted(set(evidence_ids))}. "
-            "Do not assume facts from this summary; use retained evidence IDs or call tools again if needed."
+            "This is execution metadata, not factual evidence."
         ),
     }
-    compacted = prefix + ([summary] if dropped_messages else []) + [
+    compacted = ([system] if system else []) + [summary, current_user] + [
         item for group in kept_groups for item in group
     ]
 
-    # If even the retained tail is too large, shrink tool payloads without
-    # breaking assistant/tool-call pairing.
+    # Bound giant tool payloads while preserving assistant/tool pairing.
     if message_tokens(compacted) > max_tokens:
         for message in compacted:
             if message.get("role") == "tool":
                 content = str(message.get("content") or "")
-                if len(content) > 1200:
-                    message["content"] = content[:1200] + "...<trimmed>"
+                if len(content) > 1000:
+                    message["content"] = content[:1000] + "...<trimmed>"
             if message_tokens(compacted) <= max_tokens:
                 break
 
