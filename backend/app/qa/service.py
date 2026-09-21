@@ -1259,6 +1259,35 @@ class QaService:
         return QaService.get_run(actor, run_id)
 
     @staticmethod
+    def get_event_snapshot(actor: Actor, run_id: str, after_sequence: int = 0) -> Dict[str, Any]:
+        run = QaService.get_run(actor, run_id)
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(run_event_table)
+                .where(and_(
+                    run_event_table.c.tenant_id == actor.tenant_id,
+                    run_event_table.c.run_id == run_id,
+                    run_event_table.c.sequence_no > after_sequence,
+                ))
+                .order_by(run_event_table.c.sequence_no.asc())
+                .limit(100)
+            ).fetchall()
+        return {
+            "status": run.get("status"),
+            "events": [
+                {
+                    "sequenceNo": int(row.sequence_no),
+                    "stage": str(row.stage),
+                    "durationMs": int(row.duration_ms or 0),
+                    "payload": row.payload or {},
+                    "errorCode": row.error_code,
+                    "createdAt": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ],
+        }
+
+    @staticmethod
     def get_evidence(actor: Actor, run_id: str, evidence_id: str) -> Dict[str, Any]:
         with get_db_connection() as conn:
             rs = conn.execute(

@@ -1,5 +1,8 @@
+import json
+import time
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends, Header, Response, status
+from fastapi.responses import StreamingResponse
 from app.identity.deps import Actor, get_current_actor
 from app.qa.service import QaService
 
@@ -82,6 +85,49 @@ def cancel_run(
     actor: Actor = Depends(get_current_actor),
 ):
     return QaService.cancel_run(actor, run_id)
+
+@router.post("/runs/{run_id}/approvals")
+def resolve_tool_approval(
+    run_id: str,
+    body: Dict[str, Any],
+    actor: Actor = Depends(get_current_actor),
+):
+    return QaService.resolve_tool_approval(actor, run_id, body)
+
+
+@router.get("/runs/{run_id}/events")
+def stream_run_events(
+    run_id: str,
+    actor: Actor = Depends(get_current_actor),
+):
+    # Authorization is checked before streaming begins.
+    QaService.get_run(actor, run_id)
+
+    def event_stream():
+        last_sequence = 0
+        terminal = {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"}
+        idle_after_terminal = 0
+        while True:
+            snapshot = QaService.get_event_snapshot(actor, run_id, last_sequence)
+            for event in snapshot["events"]:
+                last_sequence = max(last_sequence, int(event["sequenceNo"]))
+                yield "event: run_event\n"
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+            if snapshot["status"] in terminal:
+                if not snapshot["events"]:
+                    idle_after_terminal += 1
+                if idle_after_terminal >= 2:
+                    yield "event: done\n"
+                    yield "data: " + json.dumps({"status": snapshot["status"]}) + "\n\n"
+                    return
+            time.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 
 
 @router.get("/runs/{run_id}/evidence/{evidence_id}")
