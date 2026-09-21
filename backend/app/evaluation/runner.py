@@ -5,7 +5,6 @@ import math
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 
@@ -39,8 +38,6 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
-
-_eval_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def check_no_model(config: Dict[str, Any]):
@@ -300,9 +297,9 @@ class EvaluationRunner:
 
         if is_test_env():
             EvaluationRunner._execute_run(actor, run_id)
-        else:
-            _eval_executor.submit(EvaluationRunner._execute_run, actor, run_id)
 
+        # Non-test environments leave the durable EVALUATE job queued for
+        # app.runtime.worker, so process restarts do not lose long evaluations.
         return {"runId": run_id, "jobId": job_id, "status": "QUEUED"}
 
     @staticmethod

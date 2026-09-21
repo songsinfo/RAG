@@ -9,7 +9,7 @@ from sqlalchemy import and_, or_, select, update
 
 from app.db import get_db_connection
 from app.knowledge.artifacts import read_artifact
-from app.models import deletion_record_table, job_table
+from app.models import app_user_table, deletion_record_table, job_table
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,8 @@ class DurableJobWorker:
                 self._run_ingest(job)
             elif job["kind"] == "PURGE":
                 self._run_purge(job)
+            elif job["kind"] == "EVALUATE":
+                self._run_evaluate(job)
             else:
                 self._fail(job, "UNSUPPORTED_JOB_KIND")
         except Exception:
@@ -76,7 +78,7 @@ class DurableJobWorker:
             row = conn.execute(
                 select(job_table)
                 .where(and_(
-                    job_table.c.kind.in_(["INGEST", "PURGE"]),
+                    job_table.c.kind.in_(["INGEST", "PURGE", "EVALUATE"]),
                     job_table.c.available_at <= now,
                     or_(job_table.c.status == "QUEUED",
                         and_(job_table.c.status == "RUNNING", job_table.c.lease_until.isnot(None), job_table.c.lease_until < now)),
@@ -140,6 +142,33 @@ class DurableJobWorker:
             str(job["tenant_id"]), str(job["target_id"]), str(job["id"]), str(cp["deletionRecordId"]),
             lease_epoch=int(job["lease_epoch"]),
         )
+
+    def _run_evaluate(self, job: Dict[str, Any]):
+        from app.evaluation.runner import EvaluationRunner
+        from app.identity.deps import Actor
+
+        with get_db_connection() as conn:
+            user = conn.execute(
+                select(
+                    app_user_table.c.id,
+                    app_user_table.c.is_admin,
+                    app_user_table.c.status,
+                ).where(and_(
+                    app_user_table.c.tenant_id == job["tenant_id"],
+                    app_user_table.c.id == job["requested_by"],
+                ))
+            ).first()
+        if not user or str(user.status) != "ACTIVE":
+            self._fail(job, "REQUESTER_NOT_ACTIVE")
+            return
+
+        actor = Actor(
+            tenant_id=str(job["tenant_id"]),
+            user_id=str(user.id),
+            admin=bool(user.is_admin),
+            security_epoch=0,
+        )
+        EvaluationRunner._execute_run(actor, str(job["target_id"]))
 
     def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
         with get_db_connection() as conn:
