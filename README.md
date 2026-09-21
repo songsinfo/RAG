@@ -86,52 +86,52 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[用户提问<br/>POST /conversations/{id}/runs] --> B[输入安全校验]
-    B --> C[校验会话归属 / 幂等键 / 单会话并发]
-    C --> D[MySQL 写入 qa_run<br/>QUEUED]
-    D --> E[后台执行<br/>RUNNING]
-    E --> F{问题路由}
+    A["用户提问<br/>POST /conversations/{id}/runs"] --> B["输入安全校验"]
+    B --> C["校验会话归属 / 幂等键 / 单会话并发"]
+    C --> D["MySQL 写入 qa_run<br/>QUEUED"]
+    D --> E["后台执行<br/>RUNNING"]
+    E --> F{"问题路由"}
 
-    F -->|闲聊| G[固定回答<br/>不检索 / 不调用模型]
-    F -->|不支持请求| H[固定拒绝范围说明<br/>不检索 / 不调用模型]
-    F -->|企业知识问答| I{mode}
+    F -->|闲聊| G["固定回答<br/>不检索 / 不调用模型"]
+    F -->|不支持请求| H["固定拒绝范围说明<br/>不检索 / 不调用模型"]
+    F -->|企业知识问答| I{"mode"}
 
-    I -->|RAG| J[从 MySQL 读取 Segment Scope + ACL]
-    J --> K[得到当前可读 active_build_id 列表]
-    K --> L{有可读 Build?}
-    L -->|否| NOEV[NO_EVIDENCE]
-    L -->|是| M[Milvus Hybrid Search]
+    I -->|RAG| J["从 MySQL 读取 Segment Scope + ACL"]
+    J --> K["得到当前可读 active_build_id 列表"]
+    K --> L{"有可读 Build?"}
+    L -->|否| NOEV["NO_EVIDENCE"]
+    L -->|是| M["Milvus Hybrid Search"]
 
-    M --> M1[Query Embedding<br/>LiteLLM embedding-main]
-    M --> M2[Sparse BM25]
-    M1 --> M3[RRF Fusion k=60]
+    M --> M1["Query Embedding<br/>LiteLLM embedding-main"]
+    M --> M2["Sparse BM25"]
+    M1 --> M3["RRF Fusion k=60"]
     M2 --> M3
-    M3 --> N[Top-K Evidence]
-    N --> O[登记 run_source / Evidence]
-    O --> P[ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims]
-    P --> Q[Claim Validation<br/>引用范围与 Evidence 绑定]
-    Q --> R{Strict Mode?}
-    R -->|是| S[LiteLLM judge-main<br/>逐 Claim 判断 SUPPORTED]
-    R -->|否| T[Structural Validation]
-    S --> U[Output Guard]
+    M3 --> N["Top-K Evidence"]
+    N --> O["登记 run_source / Evidence"]
+    O --> P["ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims"]
+    P --> Q["Claim Validation<br/>引用范围与 Evidence 绑定"]
+    Q --> R{"Strict Mode?"}
+    R -->|是| S["LiteLLM judge-main<br/>逐 Claim 判断 SUPPORTED"]
+    R -->|否| T["Structural Validation"]
+    S --> U["Output Guard"]
     T --> U
 
-    I -->|AGENT| V[LangGraph Agent]
-    V --> W[LLM 决定工具调用]
-    W --> X{工具}
-    X -->|search_knowledge| X1[ACL Scope + Milvus Hybrid Search]
-    X -->|read_section| X2[读取授权文档 Source Unit]
+    I -->|AGENT| V["LangGraph Agent"]
+    V --> W["LLM 决定工具调用"]
+    W --> X{"工具"}
+    X -->|search_knowledge| X1["ACL Scope + Milvus Hybrid Search"]
+    X -->|read_section| X2["读取授权文档 Source Unit"]
     X1 --> W
     X2 --> W
-    W -->|无 Tool Call| Y[Claim Validation + Output Guard]
-    V -. 最多6轮 / 8次工具调用<br/>同参数重复3次熔断 .-> Y
+    W -->|无 Tool Call| Y["Claim Validation + Output Guard"]
+    V -. "最多6轮 / 8次工具调用<br/>同参数重复3次熔断" .-> Y
 
-    G --> Z[写入终态 Result]
+    G --> Z["写入终态 Result"]
     H --> Z
     NOEV --> Z
     U --> Z
     Y --> Z
-    Z --> END[前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace]
+    Z --> FINAL["前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace"]
 ```
 
 当前普通 RAG 主链路的检索实现是 **Dense + Sparse BM25 → RRF → Top-K**；代码中尚未接入独立 Cross-Encoder Reranker 或 MMR，因此图中没有把它们画成已实现步骤。Agent 模式使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断，防止无界循环。
