@@ -39,3 +39,17 @@ def test_embedding_batches_large_requests(monkeypatch):
     result = embedding.get_embeddings(["a", "b", "c", "d", "e"], dim=4)
     assert len(result) == 5
     assert [len(batch) for batch in calls] == [2, 2, 1]
+
+
+def test_langchain_v1_chat_model_and_tool_binding(monkeypatch):
+    from app.qa.agent import AGENT_TOOLS
+    from app.qa.model_clients import _build_chat_model, get_chat_model
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://gateway")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key")
+    _build_chat_model.cache_clear()
+
+    model = get_chat_model("chat-main", 512)
+    assert model is not None
+    bound = model.bind_tools(AGENT_TOOLS, strict=True)
+    assert bound is not None
