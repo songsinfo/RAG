@@ -139,3 +139,12 @@ def test_agent_hitl_checkpoint_and_resume(client, monkeypatch):
         assert completed["terminalReason"] == "COMPLETED"
     finally:
         ModelGateway._agent_mock_handler = None
+
+
+def test_agent_uses_langgraph_native_checkpointer():
+    from app.qa.agent import LangGraphAgent
+    from app.qa.job_checkpointer import JobCheckpointSaver
+
+    LangGraphAgent._graph = None
+    graph = LangGraphAgent._get_graph()
+    assert isinstance(graph.checkpointer, JobCheckpointSaver)
