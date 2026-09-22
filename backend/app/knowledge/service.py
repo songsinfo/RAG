@@ -1012,11 +1012,6 @@ class KnowledgeService:
                     for rep in reps:
                         representation_items.append({"chunk_id": chunk_id, **rep})
 
-                if not KnowledgeService._lease_is_current(
-                    get_db_connection().__enter__(), tenant_id, job_id, lease_epoch
-                ) if False else False:
-                    return
-
                 vectors = get_embeddings(
                     [item["text_content"] for item in representation_items],
                     dim=1024,
