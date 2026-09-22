@@ -12,6 +12,8 @@ from app.models import (
     budget_reservation_table,
     config_revision_table,
     tenant_budget_table,
+    qa_run_table,
+    job_table,
 )
 
 
@@ -83,15 +85,35 @@ class BudgetService:
         input_upper_bound: int,
         output_upper_bound: int,
         caller_environment: str | None = None,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         pricing = cls.pricing(tenant_id, model_alias)
         amount = cls.estimate(pricing, input_upper_bound, output_upper_bound)
         now = datetime.now(timezone.utc)
         month = now.strftime("%Y-%m")
-        environment = caller_environment or os.getenv("RAG_ENVIRONMENT", "demo")
+        base_environment = caller_environment or os.getenv("RAG_ENVIRONMENT", "demo")
         monthly_limit = cls._decimal(os.getenv("RAG_MONTHLY_BUDGET_CNY", "100"), "RAG_MONTHLY_BUDGET_CNY")
 
         with get_db_connection() as conn:
+            batch_job_id = None
+            if run_id:
+                run_row = conn.execute(
+                    select(qa_run_table.c.budget_json).where(
+                        and_(
+                            qa_run_table.c.tenant_id == tenant_id,
+                            qa_run_table.c.id == run_id,
+                        )
+                    )
+                ).first()
+                budget_json = run_row.budget_json if run_row and isinstance(run_row.budget_json, dict) else {}
+                batch_job_id = str(budget_json.get("evaluationJobId") or "") or None
+
+            environment = (
+                f"{base_environment}|eval:{batch_job_id}"
+                if batch_job_id
+                else base_environment
+            )
+
             existing = conn.execute(
                 select(budget_reservation_table).where(
                     and_(
@@ -146,6 +168,50 @@ class BudgetService:
                     )
                     .with_for_update()
                 ).first()
+
+            if batch_job_id:
+                batch_job = conn.execute(
+                    select(job_table)
+                    .where(
+                        and_(
+                            job_table.c.tenant_id == tenant_id,
+                            job_table.c.id == batch_job_id,
+                            job_table.c.kind == "EVALUATE",
+                        )
+                    )
+                    .with_for_update()
+                ).first()
+                if not batch_job or str(batch_job.status) in {"FAILED", "CANCELLED"}:
+                    raise ApiException(409, "BATCH_NOT_RUNNING", "评测批次已停止")
+
+                checkpoint = batch_job.checkpoint if isinstance(batch_job.checkpoint, dict) else {}
+                max_cost = cls._decimal(checkpoint.get("maxCostCny", 10), "maxCostCny")
+                max_calls = int(checkpoint.get("maxModelCalls", 1000))
+
+                batch_rows = conn.execute(
+                    select(
+                        budget_reservation_table.c.status,
+                        budget_reservation_table.c.reserved_amount,
+                        budget_reservation_table.c.settled_amount,
+                    ).where(
+                        and_(
+                            budget_reservation_table.c.tenant_id == tenant_id,
+                            budget_reservation_table.c.caller_environment == environment,
+                        )
+                    )
+                ).fetchall()
+                if len(batch_rows) >= max_calls:
+                    raise ApiException(429, "BUDGET_EXCEEDED", "后台批次模型调用次数上限已达到")
+                batch_amount = Decimal("0")
+                for row in batch_rows:
+                    if str(row.status) == "NOT_SENT":
+                        continue
+                    if str(row.status) == "SETTLED" and row.settled_amount is not None:
+                        batch_amount += Decimal(str(row.settled_amount))
+                    else:
+                        batch_amount += Decimal(str(row.reserved_amount or 0))
+                if batch_amount + amount > max_cost:
+                    raise ApiException(429, "BUDGET_EXCEEDED", "后台批次费用上限已达到")
 
             in_flight = conn.execute(
                 select(func.count()).select_from(budget_reservation_table).where(
@@ -295,13 +361,11 @@ class BudgetService:
         input_tokens: int,
         output_tokens: int,
     ) -> Dict[str, Any]:
-        environment = os.getenv("RAG_ENVIRONMENT", "demo")
         with get_db_connection() as conn:
             row = conn.execute(
                 select(budget_reservation_table).where(
                     and_(
                         budget_reservation_table.c.tenant_id == tenant_id,
-                        budget_reservation_table.c.caller_environment == environment,
                         budget_reservation_table.c.caller_call_id == call_id,
                     )
                 )
