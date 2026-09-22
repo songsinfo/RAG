@@ -86,6 +86,14 @@ def _docling_hybrid_chunks(
             "DOCLING_INVALID_RESPONSE",
             "Docling HybridChunker 未返回有效 chunks",
         )
+
+    warnings = payload.get("warnings") if isinstance(payload, dict) else None
+    if isinstance(warnings, list) and warnings:
+        first = dict(chunks[0])
+        metadata = dict(first.get("metadata") or {})
+        metadata["doclingWarnings"] = warnings[:100]
+        first["metadata"] = metadata
+        chunks = [first, *chunks[1:]]
     return chunks
 
 
