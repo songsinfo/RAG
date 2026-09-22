@@ -327,8 +327,9 @@ class RetrievalPipeline:
         tenant_id: str,
         hits: List[Dict[str, Any]],
         cfg: RetrievalConfig,
-        warnings: List[str],
+        warnings: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
+        warnings = warnings if warnings is not None else []
         child_ids = [str(h.get("chunkId")) for h in hits if h.get("chunkId")]
         if not child_ids:
             return hits
