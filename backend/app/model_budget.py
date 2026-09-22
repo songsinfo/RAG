@@ -82,12 +82,13 @@ class BudgetService:
         model_alias: str,
         input_upper_bound: int,
         output_upper_bound: int,
+        caller_environment: str | None = None,
     ) -> Dict[str, Any]:
         pricing = cls.pricing(tenant_id, model_alias)
         amount = cls.estimate(pricing, input_upper_bound, output_upper_bound)
         now = datetime.now(timezone.utc)
         month = now.strftime("%Y-%m")
-        environment = os.getenv("RAG_ENVIRONMENT", "demo")
+        environment = caller_environment or os.getenv("RAG_ENVIRONMENT", "demo")
         monthly_limit = cls._decimal(os.getenv("RAG_MONTHLY_BUDGET_CNY", "100"), "RAG_MONTHLY_BUDGET_CNY")
 
         with get_db_connection() as conn:
