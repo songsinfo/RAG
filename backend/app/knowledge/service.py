@@ -1015,6 +1015,7 @@ class KnowledgeService:
                 vectors = get_embeddings(
                     [item["text_content"] for item in representation_items],
                     dim=1024,
+                    tenant_id=tenant_id,
                 )
                 now = datetime.now(timezone.utc)
                 rep_rows = []
