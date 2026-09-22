@@ -62,7 +62,7 @@ def get_embeddings(
             resp = client.post(
                 endpoint,
                 headers={"Authorization": f"Bearer {master_key}"},
-                json={"model": "embedding-main", "input": batch},
+                json={"model": "embedding-main", "input": batch, "dimensions": dim},
                 timeout=30.0,
             )
             if resp.status_code != 200:
@@ -73,18 +73,40 @@ def get_embeddings(
                 return [generate_deterministic_embedding(t, dim) for t in texts]
 
             data = resp.json().get("data", [])
-            batch_vectors = [item.get("embedding") for item in data]
-            if len(batch_vectors) != len(batch):
+            if not isinstance(data, list) or len(data) != len(batch):
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回数量与输入批次不一致")
 
-            for vector in batch_vectors:
-                if not isinstance(vector, list) or len(vector) != dim or not any(x != 0 for x in vector):
+            rows = []
+            seen_indexes = set()
+            for item in data:
+                if not isinstance(item, dict):
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回项格式无效")
+                index = item.get("index")
+                if not isinstance(index, int) or index < 0 or index >= len(batch) or index in seen_indexes:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回 index 缺失、越界或重复")
+                seen_indexes.add(index)
+                rows.append((index, item.get("embedding")))
+
+            rows.sort(key=lambda item: item[0])
+            batch_vectors = []
+            for expected_index, (actual_index, vector) in enumerate(rows):
+                if actual_index != expected_index:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回 index 不连续")
+                if not isinstance(vector, list) or len(vector) != dim:
                     actual = len(vector) if isinstance(vector, list) else 0
                     raise ApiException(
                         502,
                         "INVALID_MODEL_OUTPUT",
                         f"模型生成的嵌入向量维度不符 (预期 {dim}, 得到 {actual})",
                     )
+                try:
+                    numeric = [float(value) for value in vector]
+                except (TypeError, ValueError) as exc:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 包含非数值元素") from exc
+                if not all(math.isfinite(value) for value in numeric) or not any(value != 0.0 for value in numeric):
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 包含 NaN/Inf 或零向量")
+                batch_vectors.append(numeric)
+
             vectors.extend(batch_vectors)
 
         return vectors
