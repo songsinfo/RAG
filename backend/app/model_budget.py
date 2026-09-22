@@ -320,6 +320,9 @@ class BudgetService:
             actual = cls.estimate(pricing, input_tokens, output_tokens)
             cls.settle(tenant_id, str(row.id), "SETTLED", actual)
             settled = actual
+        elif call_status == "NOT_SENT":
+            cls.settle(tenant_id, str(row.id), "NOT_SENT", Decimal("0"))
+            settled = Decimal("0")
         else:
             cls.settle(tenant_id, str(row.id), "UNKNOWN", None)
             settled = None
