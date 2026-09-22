@@ -1261,6 +1261,115 @@ class KnowledgeService:
             return KnowledgeService.list_jobs(actor, job_id)
 
     @staticmethod
+    def get_artifact(actor: Actor, doc_id: str, artifact_id: str) -> bytes:
+        if not can_read_document(actor, doc_id):
+            raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(artifact_table.c.storage_key).where(
+                    and_(
+                        artifact_table.c.tenant_id == actor.tenant_id,
+                        artifact_table.c.document_id == doc_id,
+                        artifact_table.c.id == artifact_id,
+                        artifact_table.c.status == "READY",
+                    )
+                )
+            ).first()
+        if not row:
+            raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
+        return read_artifact(str(row.storage_key))
+
+    @staticmethod
+    def accept_warnings(actor: Actor, build_id: str, reason: str) -> Dict[str, Any]:
+        if not actor.admin:
+            raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
+        reason = str(reason or "").strip()
+        if not reason or len(reason) > 2000:
+            raise ApiException(400, "INVALID_INPUT", "reason 必填且不能超过2000字符")
+        now = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            build = conn.execute(
+                select(
+                    index_build_table.c.document_id,
+                    index_build_table.c.status,
+                ).where(
+                    and_(
+                        index_build_table.c.tenant_id == actor.tenant_id,
+                        index_build_table.c.id == build_id,
+                    )
+                ).with_for_update()
+            ).first()
+            if not build:
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "构建不存在")
+            if not can_read_document(actor, str(build.document_id)):
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "构建不存在")
+            if str(build.status) != "NEEDS_REVIEW":
+                raise ApiException(409, "INVALID_STATE", "构建不在待审查状态")
+
+            jobs = conn.execute(
+                select(job_table.c.id, job_table.c.checkpoint, job_table.c.status).where(
+                    and_(
+                        job_table.c.tenant_id == actor.tenant_id,
+                        job_table.c.kind == "INGEST",
+                    )
+                )
+            ).fetchall()
+            job = next(
+                (
+                    row for row in jobs
+                    if isinstance(row.checkpoint, dict)
+                    and str(row.checkpoint.get("buildId") or "") == build_id
+                ),
+                None,
+            )
+            if not job:
+                raise ApiException(409, "INVALID_STATE", "未找到对应摄取任务")
+
+            conn.execute(
+                update(index_build_table)
+                .where(
+                    and_(
+                        index_build_table.c.tenant_id == actor.tenant_id,
+                        index_build_table.c.id == build_id,
+                    )
+                )
+                .values(status="CHUNKING", review_reason=reason, updated_at=now)
+            )
+            conn.execute(
+                update(job_table)
+                .where(
+                    and_(
+                        job_table.c.tenant_id == actor.tenant_id,
+                        job_table.c.id == job.id,
+                    )
+                )
+                .values(
+                    status="QUEUED",
+                    stage="CHUNKING",
+                    available_at=now,
+                    lease_until=None,
+                    error_code=None,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                audit_event_table.insert().values(
+                    tenant_id=actor.tenant_id,
+                    id=str(uuid.uuid4()),
+                    actor_id=actor.user_id,
+                    action="WARNINGS_ACCEPTED",
+                    object_type="BUILD",
+                    object_id=build_id,
+                    outcome="SUCCESS",
+                    metadata_json={"reason": reason},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.commit()
+        return {"buildId": build_id, "status": "QUEUED"}
+
+    @staticmethod
     def get_preview(actor: Actor, doc_id: str, version_id: str) -> Dict[str, Any]:
         with get_db_connection() as conn:
             build = conn.execute(
