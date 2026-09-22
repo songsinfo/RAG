@@ -236,14 +236,39 @@ class DemoSeed:
             }
             for config_id, alias in model_configs.items():
                 exists_row = conn.execute(
-                    select(config_revision_table.c.id).where(
+                    select(config_revision_table.c.id, config_revision_table.c.payload).where(
                         config_revision_table.c.tenant_id == tenant_id,
                         config_revision_table.c.id == config_id,
                     )
                 ).first()
+                payload = {
+                    "modelAlias": alias,
+                    "currency": "CNY",
+                    "inputPricePerMillion": 0,
+                    "outputPricePerMillion": 0,
+                }
                 if exists_row:
+                    current_payload = dict(exists_row.payload or {})
+                    if (
+                        "inputPricePerMillion" not in current_payload
+                        or "outputPricePerMillion" not in current_payload
+                        or str(current_payload.get("currency", "CNY")).upper() != "CNY"
+                    ):
+                        merged = {**current_payload, **payload}
+                        payload_str = json.dumps(merged, sort_keys=True)
+                        conn.execute(
+                            config_revision_table.update()
+                            .where(
+                                config_revision_table.c.tenant_id == tenant_id,
+                                config_revision_table.c.id == config_id,
+                            )
+                            .values(
+                                payload=merged,
+                                sha256=hashlib.sha256(payload_str.encode("utf-8")).digest(),
+                                updated_at=now,
+                            )
+                        )
                     continue
-                payload = {"modelAlias": alias}
                 conn.execute(
                     config_revision_table.insert().values(
                         tenant_id=tenant_id,
