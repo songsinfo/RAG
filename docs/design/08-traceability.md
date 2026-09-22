@@ -1,5 +1,8 @@
 # PRD 验收追踪表
 
+> **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 版本：1.0 · 状态：设计覆盖检查，不是测试通过报告。下表每项未来用例 ID 采用 IT-加 AC 编号，例如 IT-01-01；实现阶段在报告中填写真实测试位置、命令与结果。API 集成测试是主入口，数学口径用小型确定性用例补充。
 
 ## PRD-00
