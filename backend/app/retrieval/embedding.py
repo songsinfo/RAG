@@ -2,11 +2,13 @@ import hashlib
 import math
 import os
 import logging
+import uuid
 from typing import Iterable, List
 
 from app.config import settings, is_test_env
 from app.errors import ApiException
 from app.qa.model_clients import get_http_client
+from app.model_budget import BudgetService
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +61,42 @@ def get_embeddings(
     try:
         client = get_http_client()
         for batch in _batched(texts, batch_size):
-            resp = client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {master_key}"},
-                json={"model": "embedding-main", "input": batch, "dimensions": dim},
-                timeout=30.0,
+            call_id = str(uuid.uuid4())
+            input_tokens = max(1, sum(max(1, len(value) // 4) for value in batch))
+            BudgetService.reserve(
+                tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                call_id=call_id,
+                model_alias="embedding-main",
+                input_upper_bound=input_tokens,
+                output_upper_bound=0,
             )
-            if resp.status_code != 200:
-                err_msg = f"大模型嵌入接口返回异常状态码 {resp.status_code}: {resp.text}"
-                logger.error(err_msg)
-                if not is_test_env():
-                    raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", err_msg)
-                return [generate_deterministic_embedding(t, dim) for t in texts]
-
-            data = resp.json().get("data", [])
+            try:
+                resp = client.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {master_key}"},
+                    json={"model": "embedding-main", "input": batch, "dimensions": dim},
+                    timeout=30.0,
+                )
+                if resp.status_code != 200:
+                    raise ApiException(
+                        503,
+                        "MODEL_GATEWAY_UNAVAILABLE",
+                        f"大模型嵌入接口返回异常状态码 {resp.status_code}: {resp.text}",
+                    )
+                data = resp.json().get("data", [])
+            except Exception:
+                from app.qa.model_gateway import ModelGateway
+                ModelGateway._record_call(
+                    tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                    call_id=call_id,
+                    run_id=None,
+                    purpose="EMBEDDING",
+                    status="FAILED",
+                    input_tokens=0,
+                    output_tokens=0,
+                    model_alias="embedding-main",
+                )
+                raise
             if not isinstance(data, list) or len(data) != len(batch):
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回数量与输入批次不一致")
 
@@ -108,6 +132,17 @@ def get_embeddings(
                 batch_vectors.append(numeric)
 
             vectors.extend(batch_vectors)
+            from app.qa.model_gateway import ModelGateway
+            ModelGateway._record_call(
+                tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                call_id=call_id,
+                run_id=None,
+                purpose="EMBEDDING",
+                status="SUCCESS",
+                input_tokens=input_tokens,
+                output_tokens=0,
+                model_alias="embedding-main",
+            )
 
         return vectors
     except ApiException:
