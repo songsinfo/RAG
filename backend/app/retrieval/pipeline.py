@@ -38,7 +38,11 @@ class RetrievalPipeline:
         needs_dense = cfg.mode in {"DENSE", "HYBRID"} or cfg.mmr_enabled
         if needs_dense:
             for row in readable:
-                if row.get("embeddingDims") != 1024 or row.get("modelFingerprint") != "embedding-main":
+                dims = row.get("embeddingDims")
+                fingerprint = row.get("modelFingerprint")
+                if (dims is not None and dims != 1024) or (
+                    fingerprint is not None and fingerprint != "embedding-main"
+                ):
                     raise ApiException(
                         409,
                         "INDEX_CAPABILITY_MISSING",
