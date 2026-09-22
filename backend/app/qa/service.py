@@ -412,6 +412,7 @@ class QaService:
         body: Dict[str, Any],
         idempotency_key: Optional[str] = None,
         trusted_config_id: Optional[str] = None,
+        trusted_evaluation_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         question = str(body.get("question", "")).strip()
         if not question:
@@ -536,7 +537,11 @@ class QaService:
                     question=question,
                     result_json=None,
                     security_epoch=getattr(actor, "security_epoch", 0),
-                    budget_json={},
+                    budget_json=(
+                        {"evaluationJobId": trusted_evaluation_job_id}
+                        if trusted_evaluation_job_id
+                        else {}
+                    ),
                     terminal_reason=None,
                     cancel_requested_at=None,
                     started_at=None,
