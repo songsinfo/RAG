@@ -1120,6 +1120,7 @@ class KnowledgeService:
                         "representations": sorted(
                             {rep["kind"] for reps in representation_map.values() for rep in reps}
                         ),
+                        "vision": bool(build_config.get("vision", False)),
                     }
                     conn.execute(
                         update(index_build_table)
