@@ -77,15 +77,12 @@ def test_claim_validator_logic():
     assert validated["status"] == "COMPLETED"
     assert "Milvus支持混合检索 [E1]" in validated["answer"]
 
-    # Model-generated Unicode offsets can be inaccurate; retain the valid
-    # evidence reference and normalize it to the complete chunk.
+    # Java baseline contract: invalid offsets are rejected rather than
+    # silently widened to the complete evidence chunk.
     payload["claims"][0]["evidence"][0] = {"evidenceId": "E1", "start": 50, "end": 500}
-    validated = validate_claims(payload, evidence_map)
-    assert validated["claims"][0]["evidence"][0] == {
-        "evidenceId": "E1",
-        "start": 0,
-        "end": len(evidence_map["E1"]),
-    }
+    with pytest.raises(ApiException) as exc:
+        validate_claims(payload, evidence_map)
+    assert exc.value.code == "INVALID_MODEL_EVIDENCE"
 
     # Invalid evidence id
     payload_bad_id = {
