@@ -4,7 +4,7 @@ Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（�
 
 ## 系统架构与核心流程
 
-> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown/TXT 走本地结构解析，PDF/DOCX 等二进制文档通过 Docling Serve 转换后进入统一 Parent-Child 切块流程。后台 INGEST/PURGE 使用 MySQL 持久化 Job + Lease Worker，可在单机内嵌运行，也可独立启动 Worker。
+> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一通过 Docling Serve 的 `/v1/chunk/hybrid/file` 完成文档解析与 HybridChunker 语义切块，后端再将 Docling Hybrid Chunks 适配为 Parent-Child 结构并保留标题、页码、来源位置等 provenance 信息。后台 INGEST/PURGE 使用 MySQL 持久化 Job + Lease Worker，可在单机内嵌运行，也可独立启动 Worker。
 
 ### 系统架构图
 
@@ -16,7 +16,7 @@ flowchart LR
     subgraph APP[Python 3.12 模块化单体]
         AUTH[identity<br/>登录 / 租户 / ACL / CSRF]
         KB[knowledge<br/>文档 / 版本 / 生命周期 / 入库任务]
-        PARSER[parser + chunker<br/>结构解析 / Parent-Child Chunking]
+        PARSER[Docling Adapter<br/>Hybrid Chunks → Parent-Child + Provenance]
         RET[retrieval<br/>Dense + Sparse BM25 + RRF<br/>Reranker + Parent Expansion]
         QA[qa<br/>RAG / LangGraph Agent / Claim Validation]
         EVAL[evaluation<br/>题集 / 指标 / 消融实验]
@@ -55,7 +55,8 @@ flowchart LR
     MILVUS --> ETCD[(etcd)]
     MILVUS --> MINIO[(MinIO)]
 
-    PARSER -->|PDF / DOCX / Office / OCR| DOCLING[Docling Serve<br/>/v1/convert/file]
+    PARSER -->|所有支持格式| DOCLING[Docling Serve<br/>/v1/chunk/hybrid/file<br/>Parser + HybridChunker]
+    DOCLING -->|Hybrid Chunks| PARSER
 ```
 
 架构中的关键约束：**MySQL 是权限与生效 Build 的权威来源**，Milvus 只保存可重建的检索索引；每次检索先从 MySQL 计算当前用户可读的 `active_build_id`，再把这些 Build ID 作为 Milvus 过滤条件，从源头避免越权召回。模型供应商密钥由 LiteLLM 独立持有，业务后端只调用内部模型别名。
@@ -68,21 +69,18 @@ flowchart TD
     B --> C[保存原始文件到私有制品目录]
     C --> D[MySQL 创建<br/>Document / Version / Build Config / Index Build / Job]
     D --> E[Durable Worker Claim<br/>MySQL Lease / Retry / Recovery]
-    E --> F{文件类型}
-    F -->|Markdown / TXT| F1[本地结构解析]
-    F -->|PDF / DOCX / Office 等| F2[Docling Serve<br/>OCR / Table Structure]
-    F1 --> G
-    F2 --> G
-    F --> G[Source Units 写入 MySQL<br/>Heading / Text / Table / Code]
-    G --> H[Parent-Child Chunking<br/>Parent≈2000字符 / Child≈400字符]
-    H --> I[Chunk + Span 写入 MySQL]
-    I --> J[仅 CHILD Chunk 进入索引]
-    J --> K[embedding.py 请求 LiteLLM<br/>embedding-main / 1024维]
-    K --> L[Milvus Upsert]
-    L --> M[Dense Vector + Sparse BM25]
-    M --> N[Index Build = READY]
-    N --> O[Document.active_build_id 原子切换到新 Build]
-    O --> P[Job = COMPLETED]
+    E --> F[Docling Serve<br/>/v1/chunk/hybrid/file<br/>所有支持格式统一入口]
+    F --> G[Docling Parser<br/>结构解析 / OCR / Table Structure]
+    G --> H[Docling HybridChunker<br/>语义切块 / Child 默认上限 400 tokens]
+    H --> I[adapt_docling_hybrid_chunks<br/>组织 Parent 默认上限 1200 tokens<br/>保留 Heading / Page / Location Provenance]
+    I --> J[Source Units + Parent/Child Chunk + Span<br/>写入 MySQL]
+    J --> K[仅 CHILD Chunk 进入索引]
+    K --> L[embedding.py 请求 LiteLLM<br/>embedding-main / 1024维]
+    L --> M[Milvus Upsert]
+    M --> N[Dense Vector + Sparse BM25]
+    N --> O[Index Build = READY]
+    O --> P[Document.active_build_id 原子切换到新 Build]
+    P --> Q[Job = COMPLETED]
 
 ```
 
@@ -154,7 +152,7 @@ flowchart TD
 - **完整 Evidence Provenance**：Milvus Hit 返回真实 `kbId/documentId/versionId/buildId/chunkId`，并关联 `source_unit/location`；不再用 `allowed_build_ids[0]` 猜测来源。
 - **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
 - **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
-- **Docling 已接入**：Markdown/TXT 本地解析；PDF/DOCX/Office 等通过 Docling `/v1/convert/file` 转 Markdown，再进入统一结构解析与切块。
+- **统一 Docling + HybridChunker 入库**：Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一调用 Docling `/v1/chunk/hybrid/file`；Docling 负责解析与 HybridChunker 子块切分，后端通过 `adapt_docling_hybrid_chunks()` 组织 Parent-Child 结构，并保留 Heading、Page、Doc Item、Location 等 provenance。默认 Child 上限为 400 tokens、Parent 上限为 1200 tokens，均可通过构建配置或环境变量调整。
 - **Durable Job Worker**：INGEST/PURGE 从进程内 ThreadPool 升级为 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
 - **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
 - **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文裁剪使用 LangChain `trim_messages` / `count_tokens_approximately`，不再维护平行的自研 checkpoint/resume 协议。
