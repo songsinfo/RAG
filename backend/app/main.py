@@ -126,6 +126,7 @@ from app.retrieval.router import router as retrieval_router
 from app.qa.router import router as qa_router
 from app.admin.config_router import router as config_router
 from app.evaluation.router import router as eval_router
+from app.model_budget_router import router as budget_router
 from app.identity.security import verify_csrf_token
 
 # Include routers
@@ -136,6 +137,7 @@ app.include_router(retrieval_router, prefix="/api/v1")
 app.include_router(qa_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(eval_router, prefix="/api/v1")
+app.include_router(budget_router, prefix="/api/v1")
 
 
 @app.exception_handler(Exception)
