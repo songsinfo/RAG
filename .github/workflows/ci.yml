@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["feat/enterprise-rag-retrieval", "feat/langchain-v1-performance", "feat/agent-runtime-hardening", "feat/langchain-prebuilt-agent", "feat/docling-hybrid-chunking"]
+    branches: ["main"]
   pull_request:
-    branches: ["feat/python-migration"]
+    branches: ["main"]
 
 jobs:
   backend:
