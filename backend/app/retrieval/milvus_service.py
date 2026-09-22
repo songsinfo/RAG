@@ -93,6 +93,7 @@ class MilvusHybridService:
         doc_id: str,
         version_id: str,
         index_epoch: Optional[int] = None,
+        representations: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ):
         if not chunks:
             return
@@ -101,21 +102,49 @@ class MilvusHybridService:
         batch_size = max(1, min(512, int(os.getenv("MILVUS_UPSERT_BATCH_SIZE", "128"))))
         client = cls.get_client()
 
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start:start + batch_size]
-            texts = [c["text_content"] for c in batch]
+        representations = representations or {}
+        items: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            chunk_id = str(chunk["id"])
+            reps = representations.get(chunk_id) or [
+                {"kind": "ORIGINAL", "ordinal": 0, "text_content": chunk["text_content"]}
+            ]
+            for rep in reps:
+                kind = str(rep.get("kind") or "ORIGINAL").upper()
+                if kind not in {"ORIGINAL", "SUMMARY", "QUESTION"}:
+                    continue
+                items.append(
+                    {
+                        "chunk": chunk,
+                        "chunk_id": chunk_id,
+                        "kind": kind,
+                        "ordinal": int(rep.get("ordinal") or 0),
+                        "text_content": str(rep.get("text_content") or ""),
+                    }
+                )
+
+        for start in range(0, len(items), batch_size):
+            batch = items[start:start + batch_size]
+            texts = [item["text_content"] for item in batch]
             embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size)
             records = []
 
-            for chunk, emb in zip(batch, embeddings):
-                chunk_id = str(chunk["id"])
-                norm = normalize_terms(chunk["text_content"])
+            for item, emb in zip(batch, embeddings):
+                chunk = item["chunk"]
+                chunk_id = item["chunk_id"]
+                kind = item["kind"]
+                ordinal = item["ordinal"]
+                text_content = item["text_content"]
+                norm = normalize_terms(text_content)
+                record_key = f"{chunk_id}:{kind}:{ordinal}"
                 if epoch > 0:
                     record_id = hashlib.sha256(
-                        f"{tenant_id}:{build_id}:{epoch}:{chunk_id}".encode("utf-8")
+                        f"{tenant_id}:{build_id}:{epoch}:{record_key}".encode("utf-8")
                     ).hexdigest()
                 else:
-                    record_id = f"{tenant_id}:{build_id}:{chunk_id}"
+                    record_id = hashlib.sha256(
+                        f"{tenant_id}:{build_id}:{record_key}".encode("utf-8")
+                    ).hexdigest()
                 record = {
                     "id": record_id,
                     "parent_id": str(chunk.get("parent_id") or ""),
@@ -126,8 +155,9 @@ class MilvusHybridService:
                     "build_id": build_id,
                     "index_epoch": epoch,
                     "chunk_id": chunk_id,
-                    "representation_type": "ORIGINAL",
-                    "text_content": chunk["text_content"],
+                    "representation_type": kind,
+                    "representation_ordinal": ordinal,
+                    "text_content": text_content,
                     "normalized_terms": norm,
                     "dense_vector": emb,
                 }
@@ -254,10 +284,19 @@ class MilvusHybridService:
                     "versionId": entity.get("version_id"),
                     "buildId": entity.get("build_id"),
                     "indexEpoch": int(entity.get("index_epoch") or 0),
+                    "representationType": entity.get("representation_type") or "ORIGINAL",
                     "text": entity.get("text_content"),
                     "score": float(item.get("distance", item.get("score", 0.0)) or 0.0) if isinstance(item, dict) else 0.0,
                 })
-            return hits
+            deduped = []
+            seen_chunks = set()
+            for hit in hits:
+                chunk_id = str(hit.get("chunkId") or "")
+                if not chunk_id or chunk_id in seen_chunks:
+                    continue
+                seen_chunks.add(chunk_id)
+                deduped.append(hit)
+            return deduped
 
         client = cls.get_client()
         if client:
