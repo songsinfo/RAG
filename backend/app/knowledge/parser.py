@@ -22,6 +22,7 @@ def _docling_hybrid_chunks(
     max_tokens: int,
     tokenizer: str,
     merge_peers: bool,
+    vision: bool,
 ) -> List[Dict[str, Any]]:
     """Parse and chunk every supported input through Docling HybridChunker."""
     base_url = (os.getenv("DOCLING_URL") or settings.DOCLING_URL).rstrip("/")
@@ -38,6 +39,8 @@ def _docling_hybrid_chunks(
         "convert_table_mode": "accurate",
         "convert_abort_on_error": "true",
         "convert_do_pdf_heading_hierarchy": "true",
+        "convert_do_picture_classification": _bool_form(vision),
+        "convert_do_picture_description": _bool_form(vision),
         # HybridChunker options.
         "chunking_use_markdown_tables": "true",
         "chunking_include_raw_text": "true",
@@ -134,6 +137,7 @@ def parse_and_chunk_document(
         max_tokens=max_tokens,
         tokenizer=tokenizer,
         merge_peers=merge_peers,
+        vision=bool(cfg.get("vision", False)),
     )
     return adapt_docling_hybrid_chunks(
         docling_chunks,
