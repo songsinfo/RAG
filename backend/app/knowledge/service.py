@@ -479,7 +479,10 @@ class KnowledgeService:
 
         now = datetime.now(timezone.utc)
         scoped_idempotency = f"{actor.user_id}:{idempotency_key}"
-        req_hash = hashlib.sha256(f"{kb_id}:{document_id}:{filename}:{len(file_bytes)}:{json.dumps(build_config, sort_keys=True)}".encode("utf-8")).digest()
+        source_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        req_hash = hashlib.sha256(
+            f"{kb_id}:{document_id}:{filename}:{source_sha256}:{json.dumps(build_config, sort_keys=True)}".encode("utf-8")
+        ).digest()
 
         with get_db_connection() as conn:
             # 1. Check idempotency
@@ -550,14 +553,20 @@ class KnowledgeService:
                 )
             else:
                 existing_doc = conn.execute(
-                    select(document_table.c.id).where(
+                    select(
+                        document_table.c.id,
+                        document_table.c.kb_id,
+                        document_table.c.status,
+                    )
+                    .where(
                         and_(
                             document_table.c.tenant_id == actor.tenant_id,
                             document_table.c.id == doc_id,
                         )
                     )
+                    .with_for_update()
                 ).first()
-                if not existing_doc:
+                if not existing_doc or str(existing_doc.status) != "LIVE" or str(existing_doc.kb_id) != kb_id:
                     raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
             # 4. Save Artifact
