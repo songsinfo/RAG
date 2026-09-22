@@ -23,7 +23,7 @@ def _prepare_docling_source(file_bytes: bytes, filename: str) -> tuple[bytes, st
             text = file_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ApiException(422, "ENCODING_INVALID", "文本文件必须为 UTF-8") from exc
-        return text.encode("utf-8"), f"{Path(filename).stem}.md"
+        return text.encode("utf-8"), filename
 
     if lower.endswith(".jsonl"):
         try:
