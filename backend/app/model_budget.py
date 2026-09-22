@@ -284,6 +284,57 @@ class BudgetService:
             conn.commit()
             return settled_amount
 
+    @classmethod
+    def settle_call(
+        cls,
+        tenant_id: str,
+        call_id: str,
+        model_alias: str,
+        call_status: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> Dict[str, Any]:
+        environment = os.getenv("RAG_ENVIRONMENT", "demo")
+        with get_db_connection() as conn:
+            row = conn.execute(
+                select(budget_reservation_table).where(
+                    and_(
+                        budget_reservation_table.c.tenant_id == tenant_id,
+                        budget_reservation_table.c.caller_environment == environment,
+                        budget_reservation_table.c.caller_call_id == call_id,
+                    )
+                )
+            ).first()
+        if not row:
+            return {
+                "reservedAmount": Decimal("0"),
+                "settledAmount": Decimal("0") if call_status == "SUCCESS" else None,
+                "pricing": {"rate": "unreserved"},
+                "reservationId": None,
+                "authority": "NONE",
+            }
+
+        pricing = cls.pricing(tenant_id, model_alias)
+        if call_status == "SUCCESS":
+            actual = cls.estimate(pricing, input_tokens, output_tokens)
+            cls.settle(tenant_id, str(row.id), "SETTLED", actual)
+            settled = actual
+        else:
+            cls.settle(tenant_id, str(row.id), "UNKNOWN", None)
+            settled = None
+        return {
+            "reservedAmount": Decimal(str(row.reserved_amount)),
+            "settledAmount": settled,
+            "pricing": {
+                "currency": "CNY",
+                "inputPricePerMillion": str(pricing["inputPricePerMillion"]),
+                "outputPricePerMillion": str(pricing["outputPricePerMillion"]),
+                "modelAlias": model_alias,
+            },
+            "reservationId": str(row.id),
+            "authority": "LOCAL_MONTHLY_BUDGET",
+        }
+
     @staticmethod
     def summary(tenant_id: str):
         with get_db_connection() as conn:
