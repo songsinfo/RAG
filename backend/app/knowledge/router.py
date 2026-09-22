@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status
 from pydantic import BaseModel
 
 from app.identity.deps import Actor, get_current_actor, require_admin
+from app.errors import ApiException
 from app.knowledge.service import KnowledgeService
 
 router = APIRouter(tags=["knowledge"])
@@ -76,21 +77,23 @@ async def upload_document(
     file: UploadFile = File(...),
     kbId: str = Form(...),
     buildConfig: str = Form(default="{}"),
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
     content = await file.read()
     try:
         cfg = json.loads(buildConfig) if buildConfig else {}
-    except Exception:
-        cfg = {}
+    except Exception as exc:
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是合法 JSON") from exc
+    if not isinstance(cfg, dict):
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是 JSON 对象")
     return KnowledgeService.upload_document(
         actor=actor,
         kb_id=kbId,
         document_id=None,
         filename=file.filename or "uploaded.txt",
         file_bytes=content,
-        idempotency_key=idempotency_key or str(uuid.uuid4()),
+        idempotency_key=idempotency_key,
         build_config=cfg,
     )
 
@@ -100,22 +103,24 @@ async def upload_document_version(
     doc_id: str,
     file: UploadFile = File(...),
     buildConfig: str = Form(default="{}"),
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
     doc = KnowledgeService.get_document(actor, doc_id)
     content = await file.read()
     try:
         cfg = json.loads(buildConfig) if buildConfig else {}
-    except Exception:
-        cfg = {}
+    except Exception as exc:
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是合法 JSON") from exc
+    if not isinstance(cfg, dict):
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是 JSON 对象")
     return KnowledgeService.upload_document(
         actor=actor,
         kb_id=doc["kbId"],
         document_id=doc_id,
         filename=file.filename or "uploaded.txt",
         file_bytes=content,
-        idempotency_key=idempotency_key or str(uuid.uuid4()),
+        idempotency_key=idempotency_key,
         build_config=cfg,
     )
 
