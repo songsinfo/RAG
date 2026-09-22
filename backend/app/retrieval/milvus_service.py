@@ -1,13 +1,14 @@
 import hashlib
 import os
 import logging
+import struct
 from typing import List, Dict, Any, Optional
 from pymilvus import DataType, Function, FunctionType, AnnSearchRequest, RRFRanker, CollectionSchema, FieldSchema
 from sqlalchemy import select, and_, or_, exists
 from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.models import chunk_table, index_build_table, document_table, kb_grant_table, document_grant_table
+from app.models import chunk_table, index_build_table, document_table, kb_grant_table, document_grant_table, representation_table
 from app.retrieval.normalizer import normalize_terms
 from app.retrieval.ranking import rrf_fuse
 from app.retrieval.embedding import get_embeddings
@@ -464,6 +465,20 @@ class MilvusHybridService:
                 })
             dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
 
+        def dedupe_canonical(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            output = []
+            seen = set()
+            for hit in items:
+                chunk_id = str(hit.get("chunkId") or "")
+                if not chunk_id or chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                output.append(hit)
+            return output
+
+        dense_hits = dedupe_canonical(dense_hits)
+        bm25_hits = dedupe_canonical(bm25_hits)
+
         if mode == "DENSE":
             return dense_hits[:min(dense_top_k, fusion_top_k)]
         if mode == "BM25":
@@ -528,6 +543,34 @@ class MilvusHybridService:
                     }
                     for c in chunks
                 ]
+                rep_rows = conn.execute(
+                    select(
+                        representation_table.c.chunk_id,
+                        representation_table.c.kind,
+                        representation_table.c.ordinal,
+                        representation_table.c.text_content,
+                        representation_table.c.vector_bytes,
+                        representation_table.c.dims,
+                    ).where(
+                        and_(
+                            representation_table.c.tenant_id == tenant_id,
+                            representation_table.c.build_id == b.active_build_id,
+                        )
+                    )
+                ).fetchall()
+                representation_map: Dict[str, List[Dict[str, Any]]] = {}
+                for rep in rep_rows:
+                    item = {
+                        "kind": str(rep.kind),
+                        "ordinal": int(rep.ordinal or 0),
+                        "text_content": str(rep.text_content or ""),
+                    }
+                    if rep.vector_bytes and rep.dims:
+                        item["dense_vector"] = list(
+                            struct.unpack(f"<{int(rep.dims)}f", bytes(rep.vector_bytes))
+                        )
+                    representation_map.setdefault(str(rep.chunk_id), []).append(item)
+
                 cls.upsert_chunks(
                     tenant_id=tenant_id,
                     build_id=str(b.active_build_id),
@@ -536,4 +579,5 @@ class MilvusHybridService:
                     doc_id=str(b.document_id),
                     version_id=str(b.version_id),
                     index_epoch=int(b.fence or 0),
+                    representations=representation_map or None,
                 )
