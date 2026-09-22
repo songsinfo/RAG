@@ -173,6 +173,7 @@ flowchart TD
 8. [PRD-06 运行管理与交付](docs/prd/PRD-06-operations-delivery.md)
 9. [PRD-07 Agent 深入问答](docs/prd/PRD-07-agent-deep-qa.md)
 10. [B0-B3 检索消融实验运行手册](docs/delivery/2026-09-13-retrieval-ablation-runbook.md)
+11. [RAG 评估完整说明：方法、指标、执行流程与当前实现](docs/rag-evaluation-guide.md)
 
 上述 PRD 按 to-spec 模板组织：问题、方案、用户故事、实现决定、测试决定、范围外事项及备注。它们综合已确认访谈，不代表已实现，也没有发布到外部 Issue Tracker。
 
