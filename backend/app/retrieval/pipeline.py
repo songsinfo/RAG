@@ -35,6 +35,24 @@ class RetrievalPipeline:
         with get_db_connection() as conn:
             readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
 
+        needs_dense = cfg.mode in {"DENSE", "HYBRID"} or cfg.mmr_enabled
+        if needs_dense:
+            for row in readable:
+                if row.get("embeddingDims") != 1024 or row.get("modelFingerprint") != "embedding-main":
+                    raise ApiException(
+                        409,
+                        "INDEX_CAPABILITY_MISSING",
+                        "当前生效构建的 Embedding 模型或维度与检索配置不兼容，请重新构建索引",
+                    )
+                capabilities = row.get("capabilities") or {}
+                available_reps = set(capabilities.get("representations") or ["ORIGINAL"])
+                if not set(cfg.representations).issubset(available_reps):
+                    raise ApiException(
+                        409,
+                        "INDEX_CAPABILITY_MISSING",
+                        "当前生效构建缺少检索所需 representation，请重新构建索引",
+                    )
+
         allowed_build_ids = [row["buildId"] for row in readable]
         allowed_build_epochs = {
             row["buildId"]: int(row.get("indexEpoch") or 0)
@@ -123,7 +141,7 @@ class RetrievalPipeline:
             hits = cls._mmr_select(actor.tenant_id, independent_query, hits, cfg.final_top_k, cfg.mmr_lambda)
 
         if cfg.parent_expansion_enabled and hits:
-            hits = cls._expand_parents(actor.tenant_id, hits, cfg)
+            hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
 
         hits = cls._attach_provenance(actor.tenant_id, hits)
         final_limit = cfg.final_top_k
@@ -305,6 +323,7 @@ class RetrievalPipeline:
         tenant_id: str,
         hits: List[Dict[str, Any]],
         cfg: RetrievalConfig,
+        warnings: List[str],
     ) -> List[Dict[str, Any]]:
         child_ids = [str(h.get("chunkId")) for h in hits if h.get("chunkId")]
         if not child_ids:
@@ -355,11 +374,16 @@ class RetrievalPipeline:
                 parent = parent_map.get(str(child.parent_id))
                 if parent and str(parent.build_id) == str(hit.get("buildId")):
                     parent_text = str(parent.text_content or "")
-                    item["matchedText"] = str(hit.get("text") or "")
-                    item["parentChunkId"] = str(parent.id)
-                    item["text"] = parent_text[: cfg.parent_max_chars]
-                    item["parentTruncated"] = len(parent_text) > cfg.parent_max_chars
-                    context_key = (str(hit.get("buildId")), str(parent.id))
+                    if len(parent_text) <= cfg.parent_max_chars:
+                        item["matchedText"] = str(hit.get("text") or "")
+                        item["parentChunkId"] = str(parent.id)
+                        item["text"] = parent_text
+                        item["parentTruncated"] = False
+                        context_key = (str(hit.get("buildId")), str(parent.id))
+                    else:
+                        warnings.append("PARENT_TRIMMED")
+                        item["parentTruncated"] = True
+                        context_key = (str(hit.get("buildId")), str(hit.get("chunkId")))
                 else:
                     context_key = (str(hit.get("buildId")), str(hit.get("chunkId")))
             else:
