@@ -120,16 +120,29 @@ class MilvusHybridService:
                         "kind": kind,
                         "ordinal": int(rep.get("ordinal") or 0),
                         "text_content": str(rep.get("text_content") or ""),
+                        "dense_vector": rep.get("dense_vector"),
                     }
                 )
 
         for start in range(0, len(items), batch_size):
             batch = items[start:start + batch_size]
-            texts = [item["text_content"] for item in batch]
-            embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size)
+            missing_indexes = [i for i, item in enumerate(batch) if not item.get("dense_vector")]
+            generated = []
+            if missing_indexes:
+                generated = get_embeddings(
+                    [batch[i]["text_content"] for i in missing_indexes],
+                    dim=1024,
+                    batch_size=batch_size,
+                )
+            generated_by_index = {
+                idx: vector for idx, vector in zip(missing_indexes, generated)
+            }
             records = []
 
-            for item, emb in zip(batch, embeddings):
+            for batch_index, item in enumerate(batch):
+                emb = item.get("dense_vector") or generated_by_index.get(batch_index)
+                if emb is None:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "缺少 representation embedding")
                 chunk = item["chunk"]
                 chunk_id = item["chunk_id"]
                 kind = item["kind"]
