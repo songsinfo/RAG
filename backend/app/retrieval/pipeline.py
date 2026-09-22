@@ -120,7 +120,7 @@ class RetrievalPipeline:
             warnings.extend(rerank_warnings)
 
         if cfg.mmr_enabled and hits:
-            hits = cls._mmr_select(independent_query, hits, cfg.final_top_k, cfg.mmr_lambda)
+            hits = cls._mmr_select(actor.tenant_id, independent_query, hits, cfg.final_top_k, cfg.mmr_lambda)
 
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg)
@@ -261,11 +261,11 @@ class RetrievalPipeline:
         return independent, variants, hyde_text
 
     @staticmethod
-    def _mmr_select(query: str, hits: List[Dict[str, Any]], count: int, lambda_value: float) -> List[Dict[str, Any]]:
+    def _mmr_select(tenant_id: str, query: str, hits: List[Dict[str, Any]], count: int, lambda_value: float) -> List[Dict[str, Any]]:
         if len(hits) <= 1:
             return hits[:count]
         texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
-        vectors = get_embeddings([query] + texts, dim=1024)
+        vectors = get_embeddings([query] + texts, dim=1024, tenant_id=tenant_id)
         query_vector = vectors[0]
         doc_vectors = vectors[1:]
 
