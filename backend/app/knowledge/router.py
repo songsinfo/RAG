@@ -1,6 +1,6 @@
 import json
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status
+from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status, Response
 from pydantic import BaseModel
 
 from app.identity.deps import Actor, get_current_actor, require_admin
@@ -98,6 +98,40 @@ async def upload_document(
     )
 
 
+@router.post("/admin/documents/batch")
+async def upload_documents_batch(
+    files: List[UploadFile] = File(...),
+    kbId: str = Form(...),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    actor: Actor = Depends(require_admin),
+):
+    if not files or len(files) > 100:
+        raise ApiException(413, "INPUT_TOO_LARGE", "批量上传最多100个文件")
+    results = []
+    for index, file in enumerate(files):
+        try:
+            results.append(
+                KnowledgeService.upload_document(
+                    actor=actor,
+                    kb_id=kbId,
+                    document_id=None,
+                    filename=file.filename or f"uploaded-{index}.txt",
+                    file_bytes=await file.read(),
+                    idempotency_key=f"{idempotency_key}-{index}",
+                    build_config={},
+                )
+            )
+        except ApiException as exc:
+            results.append(
+                {
+                    "fileName": file.filename or f"uploaded-{index}.txt",
+                    "status": "FAILED",
+                    "errorCode": exc.code,
+                }
+            )
+    return results
+
+
 @router.post("/admin/documents/{doc_id}/versions", status_code=status.HTTP_202_ACCEPTED)
 async def upload_document_version(
     doc_id: str,
@@ -150,6 +184,33 @@ def cancel_job(job_id: str, actor: Actor = Depends(require_admin)):
 @router.get("/documents/{doc_id}/versions/{version_id}/preview")
 def get_preview(doc_id: str, version_id: str, actor: Actor = Depends(get_current_actor)):
     return KnowledgeService.get_preview(actor, doc_id, version_id)
+
+
+@router.get("/documents/{doc_id}/artifacts/{artifact_id}")
+def download_artifact(
+    doc_id: str,
+    artifact_id: str,
+    actor: Actor = Depends(get_current_actor),
+):
+    data = KnowledgeService.get_artifact(actor, doc_id, artifact_id)
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": 'attachment; filename="source.bin"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.post("/admin/builds/{build_id}/accept-warnings")
+def accept_build_warnings(
+    build_id: str,
+    body: Dict[str, Any],
+    actor: Actor = Depends(require_admin),
+):
+    return KnowledgeService.accept_warnings(actor, build_id, body.get("reason", ""))
 
 
 # Document ACL endpoints
