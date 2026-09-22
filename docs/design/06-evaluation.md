@@ -1,5 +1,8 @@
 # 评估系统与可复现实验
 
+> **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 对应 PRD-05；安全、成本与工程测试遵循 PRD-01/06。产品模块包含题集管理、冻结、批量执行、配对对照、逐题诊断、裁判和人工复核，不是最后手工跑一次脚本。
 
 ## 1. 数据集与金标准
