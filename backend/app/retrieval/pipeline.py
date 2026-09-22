@@ -1,3 +1,5 @@
+import json
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, select
@@ -8,6 +10,10 @@ from app.models import chunk_span_table, chunk_table, source_unit_table
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
 from app.retrieval.milvus_service import MilvusHybridService
 from app.retrieval.reranker import rerank_hits
+from app.retrieval.ranking import rrf_fuse
+from app.retrieval.embedding import get_embeddings
+from app.qa.model_gateway import ModelGateway
+from app.errors import ApiException
 
 
 class RetrievalPipeline:
@@ -22,6 +28,7 @@ class RetrievalPipeline:
         config_id: Optional[str] = None,
         run_id: Optional[str] = None,
         limit_override: Optional[int] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         cfg = load_retrieval_config(actor.tenant_id, config_id)
 
@@ -41,36 +48,77 @@ class RetrievalPipeline:
                 "allowedBuildCount": 0,
             }
 
-        hits = MilvusHybridService.search(
-            tenant_id=actor.tenant_id,
+        warnings: List[str] = []
+        independent_query, query_variants, hyde_text = cls._prepare_queries(
+            actor=actor,
             query=query,
-            allowed_build_ids=allowed_build_ids,
-            dense_top_k=cfg.dense_top_k,
-            sparse_top_k=cfg.sparse_top_k,
-            fusion_top_k=cfg.fusion_top_k,
-            mode=cfg.mode,
-            rrf_enabled=cfg.rrf_enabled,
-            rrf_k=cfg.rrf_k,
-            allowed_build_epochs=allowed_build_epochs,
+            history=history or [],
+            cfg=cfg,
+            run_id=run_id,
+            warnings=warnings,
         )
+
+        ranked_lists: List[List[Dict[str, Any]]] = []
+        for query_variant in query_variants:
+            ranked_lists.append(
+                MilvusHybridService.search(
+                    tenant_id=actor.tenant_id,
+                    query=query_variant,
+                    allowed_build_ids=allowed_build_ids,
+                    dense_top_k=cfg.dense_top_k,
+                    sparse_top_k=cfg.sparse_top_k,
+                    fusion_top_k=cfg.fusion_top_k,
+                    mode=cfg.mode,
+                    rrf_enabled=cfg.rrf_enabled,
+                    rrf_k=cfg.rrf_k,
+                    allowed_build_epochs=allowed_build_epochs,
+                    representations=list(cfg.representations),
+                )
+            )
+        if hyde_text:
+            ranked_lists.append(
+                MilvusHybridService.search(
+                    tenant_id=actor.tenant_id,
+                    query=hyde_text,
+                    allowed_build_ids=allowed_build_ids,
+                    dense_top_k=cfg.dense_top_k,
+                    sparse_top_k=0,
+                    fusion_top_k=cfg.fusion_top_k,
+                    mode="DENSE",
+                    rrf_enabled=False,
+                    rrf_k=cfg.rrf_k,
+                    allowed_build_epochs=allowed_build_epochs,
+                    representations=list(cfg.representations),
+                )
+            )
+
+        ranked_lists = [items for items in ranked_lists if items]
+        if not ranked_lists:
+            hits = []
+        elif len(ranked_lists) == 1:
+            hits = ranked_lists[0][:cfg.fusion_top_k]
+        else:
+            hits = rrf_fuse(ranked_lists, rrf_k=cfg.rrf_k)[:cfg.fusion_top_k]
 
         # Reranking is an external model boundary. Re-check every candidate
         # before any candidate text can leave the application process.
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, hits, kb_ids, document_ids)
 
-        warnings: List[str] = []
         if cfg.rerank_enabled and hits:
             hits, rerank_warnings = rerank_hits(
                 tenant_id=actor.tenant_id,
                 run_id=run_id,
-                query=query,
+                query=independent_query,
                 hits=hits,
                 model_alias=cfg.rerank_model,
                 top_k=cfg.rerank_top_k,
                 fail_open=cfg.rerank_fail_open,
             )
             warnings.extend(rerank_warnings)
+
+        if cfg.mmr_enabled and hits:
+            hits = cls._mmr_select(independent_query, hits, cfg.final_top_k, cfg.mmr_lambda)
 
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg)
@@ -90,6 +138,138 @@ class RetrievalPipeline:
             "config": cfg.as_dict(),
             "allowedBuildCount": len(allowed_build_ids),
         }
+
+    @staticmethod
+    def _prepare_queries(
+        actor: Actor,
+        query: str,
+        history: List[Dict[str, str]],
+        cfg: RetrievalConfig,
+        run_id: Optional[str],
+        warnings: List[str],
+    ) -> Tuple[str, List[str], Optional[str]]:
+        independent = query.strip()
+        if cfg.rewrite_enabled and history:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "结合历史对话把当前追问改写成不依赖上下文的独立检索问题。不得添加新事实。只输出 JSON {\"query\":\"...\"}。",
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"history": history[-8:], "question": query}, ensure_ascii=False),
+                },
+            ]
+            try:
+                raw = ModelGateway.chat(
+                    actor.tenant_id,
+                    run_id,
+                    "REWRITE",
+                    messages,
+                    max_tokens=300,
+                    model_alias="chat-main",
+                )
+                parsed = json.loads(raw)
+                rewritten = str(parsed.get("query", "")).strip()
+                if not rewritten:
+                    raise ValueError("empty rewritten query")
+                independent = rewritten
+            except Exception:
+                if not cfg.allow_rewrite_fallback:
+                    raise
+                warnings.append("REWRITE_SKIPPED")
+
+        variants = [independent]
+        if cfg.multi_query_enabled:
+            try:
+                raw = ModelGateway.chat(
+                    actor.tenant_id,
+                    run_id,
+                    "MULTI_QUERY",
+                    [
+                        {
+                            "role": "system",
+                            "content": "为检索生成最多两个不改变约束条件的等价问法。只输出 JSON {\"queries\":[\"...\"]}。",
+                        },
+                        {"role": "user", "content": independent},
+                    ],
+                    max_tokens=400,
+                    model_alias="chat-main",
+                )
+                parsed = json.loads(raw)
+                queries = parsed.get("queries", [])
+                if isinstance(queries, list):
+                    for item in queries[:2]:
+                        value = str(item).strip()
+                        if value and value not in variants:
+                            variants.append(value)
+            except Exception:
+                warnings.append("MULTI_QUERY_SKIPPED")
+
+        hyde_text: Optional[str] = None
+        if cfg.hyde_enabled:
+            try:
+                hyde_text = ModelGateway.chat(
+                    actor.tenant_id,
+                    run_id,
+                    "HYDE",
+                    [
+                        {
+                            "role": "system",
+                            "content": "生成一个不超过300 token的假想资料段落，只用于向量检索。不得声称其为事实。",
+                        },
+                        {"role": "user", "content": independent},
+                    ],
+                    max_tokens=300,
+                    model_alias="chat-main",
+                ).strip()
+                if not hyde_text:
+                    hyde_text = None
+            except Exception:
+                warnings.append("HYDE_SKIPPED")
+                hyde_text = None
+
+        return independent, variants, hyde_text
+
+    @staticmethod
+    def _mmr_select(query: str, hits: List[Dict[str, Any]], count: int, lambda_value: float) -> List[Dict[str, Any]]:
+        if len(hits) <= 1:
+            return hits[:count]
+        texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
+        vectors = get_embeddings([query] + texts, dim=1024)
+        query_vector = vectors[0]
+        doc_vectors = vectors[1:]
+
+        def cosine(left: List[float], right: List[float]) -> float:
+            dot = sum(a * b for a, b in zip(left, right))
+            left_norm = math.sqrt(sum(a * a for a in left))
+            right_norm = math.sqrt(sum(b * b for b in right))
+            if left_norm == 0.0 or right_norm == 0.0:
+                return 0.0
+            return dot / (left_norm * right_norm)
+
+        selected: List[int] = []
+        remaining = set(range(len(hits)))
+        target = min(max(1, count), len(hits))
+        while remaining and len(selected) < target:
+            best_index = None
+            best_score = float("-inf")
+            for idx in remaining:
+                relevance = cosine(query_vector, doc_vectors[idx])
+                redundancy = max(
+                    (cosine(doc_vectors[idx], doc_vectors[chosen]) for chosen in selected),
+                    default=0.0,
+                )
+                score = lambda_value * relevance - (1.0 - lambda_value) * redundancy
+                if score > best_score:
+                    best_score = score
+                    best_index = idx
+            if best_index is None:
+                break
+            selected.append(best_index)
+            remaining.remove(best_index)
+
+        return [hits[index] for index in selected]
 
     @staticmethod
     def _expand_parents(
