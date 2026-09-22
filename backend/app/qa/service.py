@@ -728,6 +728,8 @@ class QaService:
                 )
                 conn.commit()
 
+            history = QaService._rag_history(actor.tenant_id, seg_id, run_id)
+
             # 1. Routing
             decision = classify_question(question)
             QaService._record_event(actor.tenant_id, run_id, "ROUTED", {"route": decision.route.value, "reason": decision.reason})
@@ -825,6 +827,7 @@ class QaService:
                 kb_ids=allowed_kb_ids or None,
                 config_id=config_id,
                 run_id=run_id,
+                history=history,
             )
             hits = retrieval["hits"]
             QaService._record_event(
@@ -922,7 +925,13 @@ class QaService:
             QaService._record_event(actor.tenant_id, run_id, "GENERATING")
             messages = [
                 {"role": "system", "content": INSTRUCTION},
-                {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"history": history, "question": question, "evidence": evidence},
+                        ensure_ascii=False,
+                    ),
+                },
             ]
             raw_answer = ModelGateway.chat(
                 tenant_id=actor.tenant_id,
@@ -1227,6 +1236,47 @@ class QaService:
             )
             conn.commit()
             return True
+
+    @staticmethod
+    def _rag_history(tenant_id: str, segment_id: str, current_run_id: str) -> List[Dict[str, str]]:
+        with get_db_connection() as conn:
+            current_turn = conn.execute(
+                select(qa_run_table.c.turn_no).where(
+                    and_(
+                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.id == current_run_id,
+                    )
+                )
+            ).scalar()
+            if current_turn is None:
+                return []
+            rows = conn.execute(
+                select(
+                    qa_run_table.c.question,
+                    qa_run_table.c.result_json,
+                )
+                .where(
+                    and_(
+                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.segment_id == segment_id,
+                        qa_run_table.c.turn_no < int(current_turn),
+                        qa_run_table.c.status.in_(["COMPLETED", "SUCCEEDED", "PARTIAL", "CONFLICT"]),
+                    )
+                )
+                .order_by(qa_run_table.c.turn_no.desc())
+                .limit(4)
+            ).fetchall()
+
+        messages: List[Dict[str, str]] = []
+        for row in reversed(rows):
+            question = str(row.question or "").strip()
+            result = row.result_json if isinstance(row.result_json, dict) else {}
+            answer = str(result.get("answer") or "").strip()
+            if question:
+                messages.append({"role": "user", "content": question[:2000]})
+            if answer:
+                messages.append({"role": "assistant", "content": answer[:4000]})
+        return messages
 
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
