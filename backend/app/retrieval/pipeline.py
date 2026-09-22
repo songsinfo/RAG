@@ -100,6 +100,8 @@ class RetrievalPipeline:
         else:
             hits = rrf_fuse(ranked_lists, rrf_k=cfg.rrf_k)[:cfg.fusion_top_k]
 
+        hits = cls._hydrate_original_chunks(actor.tenant_id, hits)
+
         # Reranking is an external model boundary. Re-check every candidate
         # before any candidate text can leave the application process.
         with get_db_connection() as conn:
@@ -138,6 +140,33 @@ class RetrievalPipeline:
             "config": cfg.as_dict(),
             "allowedBuildCount": len(allowed_build_ids),
         }
+
+    @staticmethod
+    def _hydrate_original_chunks(tenant_id: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        chunk_ids = [str(hit.get("chunkId")) for hit in hits if hit.get("chunkId")]
+        if not chunk_ids:
+            return hits
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(chunk_table.c.id, chunk_table.c.text_content).where(
+                    and_(
+                        chunk_table.c.tenant_id == tenant_id,
+                        chunk_table.c.id.in_(chunk_ids),
+                        chunk_table.c.kind == "CHILD",
+                    )
+                )
+            ).fetchall()
+        original = {str(row.id): str(row.text_content or "") for row in rows}
+        hydrated = []
+        for hit in hits:
+            item = dict(hit)
+            chunk_id = str(item.get("chunkId") or "")
+            if item.get("representationType") not in {None, "ORIGINAL"}:
+                item["matchedRepresentationText"] = str(item.get("text") or "")
+            if chunk_id in original:
+                item["text"] = original[chunk_id]
+            hydrated.append(item)
+        return hydrated
 
     @staticmethod
     def _prepare_queries(
