@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.identity.deps import Actor, get_current_actor, require_admin
 from app.errors import ApiException
 from app.knowledge.service import KnowledgeService
+from app.knowledge.imports import create_import_preview, consume_import_preview, split_wiki_package
 
 router = APIRouter(tags=["knowledge"])
 
@@ -157,6 +158,85 @@ async def upload_document_version(
         idempotency_key=idempotency_key,
         build_config=cfg,
     )
+
+
+@router.post("/admin/import-previews")
+def preview_directory_import(
+    body: Dict[str, Any],
+    actor: Actor = Depends(require_admin),
+):
+    root_alias = str(body.get("rootAlias") or "")
+    if root_alias and root_alias != "default":
+        raise ApiException(400, "INVALID_INPUT", "rootAlias 无效")
+    return create_import_preview(
+        actor.tenant_id,
+        actor.user_id,
+        str(body.get("relativePath") or ""),
+    )
+
+
+@router.post("/admin/imports")
+def execute_directory_import(
+    body: Dict[str, Any],
+    actor: Actor = Depends(require_admin),
+):
+    estimate_id = str(body.get("estimateId") or "")
+    kb_id = str(body.get("kbId") or "")
+    selected = body.get("files")
+    if not estimate_id or not kb_id or not isinstance(selected, list):
+        raise ApiException(400, "INVALID_INPUT", "estimateId、kbId、files 必填")
+    files = consume_import_preview(
+        actor.tenant_id,
+        actor.user_id,
+        estimate_id,
+        [str(value) for value in selected],
+    )
+    results = []
+    for index, item in enumerate(files):
+        results.append(
+            KnowledgeService.upload_document(
+                actor=actor,
+                kb_id=kb_id,
+                document_id=None,
+                filename=item["filename"],
+                file_bytes=item["bytes"],
+                idempotency_key=f"{estimate_id}-{index}",
+                build_config={},
+            )
+        )
+    return results
+
+
+@router.post("/admin/wiki-imports")
+async def import_wiki_package(
+    file: UploadFile = File(...),
+    kbId: str = Form(...),
+    buildConfig: str = Form(default="{}"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    actor: Actor = Depends(require_admin),
+):
+    try:
+        cfg = json.loads(buildConfig) if buildConfig else {}
+    except Exception as exc:
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是合法 JSON") from exc
+    if not isinstance(cfg, dict):
+        raise ApiException(400, "INVALID_CONFIG", "buildConfig 必须是 JSON 对象")
+
+    pages = split_wiki_package(await file.read())
+    results = []
+    for index, page in enumerate(pages):
+        results.append(
+            KnowledgeService.upload_document(
+                actor=actor,
+                kb_id=kbId,
+                document_id=None,
+                filename=page["filename"],
+                file_bytes=page["bytes"],
+                idempotency_key=f"{idempotency_key}-{index}",
+                build_config=cfg,
+            )
+        )
+    return results
 
 
 # Job polling endpoints
