@@ -12,6 +12,7 @@ from app.errors import ApiException
 from app.models import model_call_table
 from app.qa.model_clients import get_chat_model, get_http_client
 from app.qa.runtime import AgentRuntimePolicy, estimate_tokens, retry_call
+from app.model_budget import BudgetService
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,13 @@ class ModelGateway:
 
         # Attempt to call LiteLLM Gateway via langchain_openai if configured
         if gateway_url:
+            BudgetService.reserve(
+                tenant_id,
+                call_id,
+                model_alias,
+                max(1, estimate_tokens(messages)),
+                max_tokens,
+            )
             try:
                 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -112,6 +120,16 @@ class ModelGateway:
                 )
                 return content
             except ApiException:
+                cls._record_call(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    run_id=run_id,
+                    purpose=purpose,
+                    status="FAILED",
+                    input_tokens=0,
+                    output_tokens=0,
+                    model_alias=model_alias,
+                )
                 raise
             except Exception as e:
                 # Failure終态 - record failed call and raise
@@ -228,6 +246,13 @@ class ModelGateway:
             return result
 
         if gateway_url:
+            BudgetService.reserve(
+                tenant_id,
+                call_id,
+                model_alias,
+                max(1, estimate_tokens(messages)),
+                max_tokens,
+            )
             try:
                 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -334,6 +359,7 @@ class ModelGateway:
                     "tool_calls": formatted_calls,
                 }
             except ApiException:
+                cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
                 raise
             except Exception as e:
                 cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
@@ -397,6 +423,13 @@ class ModelGateway:
         master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
 
         if gateway_url:
+            BudgetService.reserve(
+                tenant_id,
+                call_id,
+                model_alias,
+                max(1, (len(query) + sum(len(d) for d in documents)) // 4),
+                0,
+            )
             base = gateway_url.rstrip("/")
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
             try:
@@ -503,6 +536,15 @@ class ModelGateway:
     ):
         try:
             now = datetime.now(timezone.utc)
+            budget = BudgetService.settle_call(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                model_alias=model_alias,
+                call_status=status,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            persisted_status = "SETTLED" if status == "SUCCESS" and budget.get("reservationId") else status
             with get_db_connection() as conn:
                 conn.execute(
                     model_call_table.insert().values(
@@ -513,20 +555,24 @@ class ModelGateway:
                         purpose=purpose,
                         model_config_id=MODEL_CONFIG_IDS.get(model_alias, model_alias),
                         attempt_no=1,
-                        status=status,
-                        reserved_amount="0.000000",
-                        settled_amount="0.000000",
+                        status=persisted_status,
+                        reserved_amount=str(budget.get("reservedAmount") or "0"),
+                        settled_amount=(
+                            str(budget.get("settledAmount"))
+                            if budget.get("settledAmount") is not None
+                            else None
+                        ),
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         provider_request_id=f"req-{call_id[:8]}",
-                        pricing_snapshot={"rate": "fixed"},
+                        pricing_snapshot=budget.get("pricing") or {},
                         usage_detail={"model": model_alias},
-                        reservation_authority="INTERNAL",
-                        reservation_id=None,
+                        reservation_authority=budget.get("authority") or "NONE",
+                        reservation_id=budget.get("reservationId"),
                         created_at=now,
                         updated_at=now,
                     )
                 )
                 conn.commit()
         except Exception:
-            logger.exception("Failed to persist model call %s", call_id)
+            logger.exception("Failed to settle/persist model call %s", call_id)
