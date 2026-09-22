@@ -318,6 +318,31 @@ class QaService:
             conn.commit()
 
     @staticmethod
+    def _validate_strict_verdicts(claims: List[Dict[str, Any]], judge_json: Dict[str, Any]) -> None:
+        verdicts = judge_json.get("verdicts") if isinstance(judge_json, dict) else None
+        if not isinstance(verdicts, list):
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 verdicts 格式无效")
+
+        expected = {str(claim.get("id")) for claim in claims}
+        seen = set()
+        if len(verdicts) != len(expected):
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未覆盖全部 claim")
+
+        for verdict in verdicts:
+            if not isinstance(verdict, dict):
+                raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 verdict 格式无效")
+            claim_id = str(verdict.get("claimId", ""))
+            status = verdict.get("status")
+            if claim_id not in expected or claim_id in seen:
+                raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 claimId 缺失、未知或重复")
+            seen.add(claim_id)
+            if status != "SUPPORTED":
+                raise ApiException(422, "VERIFICATION_FAILED", "存在未获原文支持或不确定的事实")
+
+        if seen != expected:
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未覆盖全部 claim")
+
+    @staticmethod
     def create_segment(actor: Actor, conv_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
@@ -386,6 +411,7 @@ class QaService:
         conv_id: str,
         body: Dict[str, Any],
         idempotency_key: Optional[str] = None,
+        trusted_config_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         question = str(body.get("question", "")).strip()
         if not question:
@@ -397,6 +423,8 @@ class QaService:
             raise ApiException(400, "INVALID_INPUT", "问答模式无效")
 
         strict_mode = bool(body.get("strictMode") or body.get("strict", False))
+        if body.get("configId") is not None:
+            raise ApiException(400, "INVALID_INPUT", "客户端不能覆盖检索配置")
         now = datetime.now(timezone.utc)
 
         with get_db_connection() as conn:
@@ -478,8 +506,9 @@ class QaService:
                 .order_by(qa_run_table.c.turn_no.desc())
             ).scalar() or 0
 
-            # Resolve retrieval config_id
-            config_id = body.get("configId")
+            # Resolve retrieval config_id. Only trusted internal callers
+            # (evaluation) may pin a historical published config.
+            config_id = trusted_config_id
             if not config_id:
                 t_row = conn.execute(
                     select(tenant_table.c.active_retrieval_config_id).where(tenant_table.c.id == actor.tenant_id)
@@ -734,6 +763,31 @@ class QaService:
                     config_id=config_id,
                 )
                 if strict_mode and agent_res.get("claims"):
+                    evidence = agent_res.get("evidence") or []
+                    with get_db_connection() as conn:
+                        assert_hits_still_readable(conn, actor, evidence)
+                    raw_judge = ModelGateway.chat(
+                        tenant_id=actor.tenant_id,
+                        run_id=run_id,
+                        purpose="JUDGE",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "逐条判断 claim 是否受 evidence 原文支持。只输出 JSON {verdicts:[{claimId,status:SUPPORTED|UNSUPPORTED|UNCERTAIN}]}。",
+                            },
+                            {
+                                "role": "user",
+                                "content": json.dumps({"claims": agent_res["claims"], "evidence": evidence}, ensure_ascii=False),
+                            },
+                        ],
+                        max_tokens=1000,
+                        model_alias="judge-main",
+                    )
+                    try:
+                        judge_json = json.loads(raw_judge)
+                    except Exception as exc:
+                        raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未返回合法 JSON") from exc
+                    QaService._validate_strict_verdicts(agent_res["claims"], judge_json)
                     agent_res["verification"] = "SUPPORTED"
                 else:
                     agent_res["verification"] = "STRUCTURAL_ONLY"
@@ -881,8 +935,8 @@ class QaService:
 
             try:
                 parsed_answer = json.loads(raw_answer)
-            except Exception:
-                parsed_answer = {"status": "NO_EVIDENCE", "claims": []}
+            except Exception as exc:
+                raise ApiException(502, "INVALID_MODEL_OUTPUT", "回答模型未返回合法 JSON") from exc
 
             # 6. Claim Validation
             QaService._record_event(actor.tenant_id, run_id, "VALIDATING")
@@ -916,12 +970,10 @@ class QaService:
                 )
                 try:
                     judge_json = json.loads(raw_judge)
-                    verdicts = judge_json.get("verdicts", [])
-                    if not all(v.get("status") == "SUPPORTED" for v in verdicts):
-                        raise ApiException(422, "VERIFICATION_FAILED", "存在未获原文支持或不确定的事实")
-                    validated["verification"] = "SUPPORTED"
-                except Exception as e:
-                    raise ApiException(422, "VERIFICATION_FAILED", f"严格裁判校验失败: {e}")
+                except Exception as exc:
+                    raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未返回合法 JSON") from exc
+                QaService._validate_strict_verdicts(validated["claims"], judge_json)
+                validated["verification"] = "SUPPORTED"
             else:
                 validated["verification"] = "STRUCTURAL_ONLY"
 
