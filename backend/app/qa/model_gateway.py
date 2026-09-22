@@ -51,6 +51,7 @@ class ModelGateway:
                 max(1, estimate_tokens(messages)),
                 max_tokens,
             )
+            sent = False
             try:
                 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -76,6 +77,7 @@ class ModelGateway:
 
                 policy = AgentRuntimePolicy.from_env()
                 try:
+                    sent = True
                     response = retry_call(
                         f"llm:{model_alias}",
                         lambda: llm.invoke(lc_messages),
@@ -125,7 +127,7 @@ class ModelGateway:
                     call_id=call_id,
                     run_id=run_id,
                     purpose=purpose,
-                    status="FAILED",
+                    status="FAILED" if sent else "NOT_SENT",
                     input_tokens=0,
                     output_tokens=0,
                     model_alias=model_alias,
@@ -138,7 +140,7 @@ class ModelGateway:
                     call_id=call_id,
                     run_id=run_id,
                     purpose=purpose,
-                    status="FAILED",
+                    status="FAILED" if sent else "NOT_SENT",
                     input_tokens=0,
                     output_tokens=0,
                     model_alias=model_alias,
@@ -253,6 +255,7 @@ class ModelGateway:
                 max(1, estimate_tokens(messages)),
                 max_tokens,
             )
+            sent = False
             try:
                 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -305,6 +308,7 @@ class ModelGateway:
 
                 policy = AgentRuntimePolicy.from_env()
                 try:
+                    sent = True
                     response = retry_call(
                         f"llm-tools:{model_alias}",
                         lambda: llm.invoke(lc_messages),
@@ -359,10 +363,16 @@ class ModelGateway:
                     "tool_calls": formatted_calls,
                 }
             except ApiException:
-                cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
+                cls._record_call(
+                    tenant_id, call_id, run_id, purpose,
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                )
                 raise
             except Exception as e:
-                cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
+                cls._record_call(
+                    tenant_id, call_id, run_id, purpose,
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                )
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"Agent大模型网关调用失败: {e}")
 
         if not is_test_env():
@@ -432,7 +442,9 @@ class ModelGateway:
             )
             base = gateway_url.rstrip("/")
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
+            sent = False
             try:
+                sent = True
                 response = get_http_client().post(
                     endpoint,
                     headers={"Authorization": f"Bearer {master_key}"},
@@ -482,12 +494,14 @@ class ModelGateway:
                 return normalized
             except ApiException:
                 cls._record_call(
-                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                    tenant_id, call_id, run_id, "RERANK",
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
                 )
                 raise
             except Exception as exc:
                 cls._record_call(
-                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                    tenant_id, call_id, run_id, "RERANK",
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
                 )
                 raise ApiException(503, "RERANK_UNAVAILABLE", f"Reranker 网关调用失败: {exc}")
 
