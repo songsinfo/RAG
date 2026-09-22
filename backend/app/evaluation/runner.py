@@ -477,9 +477,9 @@ class EvaluationRunner:
                             "question": question_text,
                             "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
                             "strictMode": manifest.get("strict", False),
-                            "configId": eval_config_id,
                         },
                         idempotency_key=f"eval:{result_id}:0",
+                        trusted_config_id=eval_config_id,
                     )
                     qa_run_id = submitted["runId"]
 
