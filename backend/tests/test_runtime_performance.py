@@ -25,7 +25,7 @@ def test_embedding_batches_large_requests(monkeypatch):
         def json(self):
             return {
                 "data": [
-                    {"embedding": [float(i + 1)] * 4}
+                    {"index": i, "embedding": [float(i + 1)] * 4}
                     for i, _ in enumerate(self.batch)
                 ]
             }
