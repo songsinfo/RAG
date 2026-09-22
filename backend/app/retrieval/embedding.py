@@ -43,6 +43,7 @@ def get_embeddings(
     texts: List[str],
     dim: int = 1024,
     batch_size: int | None = None,
+    tenant_id: str | None = None,
 ) -> List[List[float]]:
     if not texts:
         return []
@@ -64,7 +65,7 @@ def get_embeddings(
             call_id = str(uuid.uuid4())
             input_tokens = max(1, sum(max(1, len(value) // 4) for value in batch))
             BudgetService.reserve(
-                tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                 call_id=call_id,
                 model_alias="embedding-main",
                 input_upper_bound=input_tokens,
@@ -87,7 +88,7 @@ def get_embeddings(
             except Exception:
                 from app.qa.model_gateway import ModelGateway
                 ModelGateway._record_call(
-                    tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                    tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                     call_id=call_id,
                     run_id=None,
                     purpose="EMBEDDING",
@@ -134,7 +135,7 @@ def get_embeddings(
             vectors.extend(batch_vectors)
             from app.qa.model_gateway import ModelGateway
             ModelGateway._record_call(
-                tenant_id=os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                 call_id=call_id,
                 run_id=None,
                 purpose="EMBEDDING",
