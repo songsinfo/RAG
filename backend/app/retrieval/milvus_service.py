@@ -209,6 +209,7 @@ class MilvusHybridService:
         rrf_enabled: bool = True,
         rrf_k: int = 60,
         allowed_build_epochs: Optional[Dict[str, int]] = None,
+        representations: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
@@ -232,7 +233,12 @@ class MilvusHybridService:
         sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
         fusion_top_k = fusion_top_k or 20
 
-        output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "text_content"]
+        representations = [str(value).upper() for value in (representations or ["ORIGINAL"])]
+        if not representations or not set(representations).issubset({"ORIGINAL", "SUMMARY", "QUESTION"}):
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", "representation 类型无效")
+        rep_expr = ", ".join(f'"{value}"' for value in representations)
+
+        output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "representation_type", "text_content"]
 
         def normalize_result(res):
             hits = []
@@ -279,13 +285,13 @@ class MilvusHybridService:
                     build_filter = " or ".join(build_clauses)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and ({build_filter}) '
-                        'and representation_type == "ORIGINAL"'
+                        f'and representation_type in [{rep_expr}]'
                     )
                 else:
                     build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] '
-                        'and representation_type == "ORIGINAL"'
+                        f'and representation_type in [{rep_expr}]'
                     )
 
                 if mode == "DENSE":
@@ -364,7 +370,7 @@ class MilvusHybridService:
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
-                if item["representation_type"] != "ORIGINAL":
+                if item["representation_type"] not in representations:
                     continue
                 text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
                 score = sum(1.0 for t in query_terms if t in text_lower)
@@ -388,7 +394,7 @@ class MilvusHybridService:
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
-                if item["representation_type"] != "ORIGINAL":
+                if item["representation_type"] not in representations:
                     continue
                 v = item["dense_vector"]
                 cos_sim = sum(a * b for a, b in zip(query_emb, v))
