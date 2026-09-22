@@ -34,6 +34,13 @@ from app.models import (
     feedback_table,
     audit_event_table,
     deletion_record_table,
+    eval_dataset_version_table,
+    eval_case_table,
+    eval_gold_table,
+    eval_snapshot_table,
+    eval_snapshot_document_table,
+    eval_result_table,
+    eval_review_table,
 )
 
 
@@ -1568,6 +1575,153 @@ class KnowledgeService:
                     )
                     .values(comment_text=None, resolution_text=None, updated_at=now)
                 )
+
+            # Scrub evaluation data derived from the purged source.
+            gold_rows = conn.execute(
+                select(eval_gold_table.c.case_id).where(
+                    and_(
+                        eval_gold_table.c.origin_tenant_id == tenant_id,
+                        eval_gold_table.c.origin_document_id == doc_id,
+                    )
+                )
+            ).fetchall()
+            case_ids = sorted({str(row.case_id) for row in gold_rows})
+            if case_ids:
+                dataset_rows = conn.execute(
+                    select(eval_case_table.c.dataset_version_id).where(
+                        and_(
+                            eval_case_table.c.tenant_id == tenant_id,
+                            eval_case_table.c.id.in_(case_ids),
+                        )
+                    )
+                ).fetchall()
+                dataset_ids = sorted({str(row.dataset_version_id) for row in dataset_rows})
+
+                result_rows = conn.execute(
+                    select(eval_result_table.c.id).where(
+                        and_(
+                            eval_result_table.c.tenant_id == tenant_id,
+                            eval_result_table.c.case_id.in_(case_ids),
+                        )
+                    )
+                ).fetchall()
+                result_ids = [str(row.id) for row in result_rows]
+                if result_ids:
+                    conn.execute(
+                        update(eval_review_table)
+                        .where(
+                            and_(
+                                eval_review_table.c.tenant_id == tenant_id,
+                                eval_review_table.c.result_id.in_(result_ids),
+                            )
+                        )
+                        .values(labels_json={}, reason_text=None, updated_at=now)
+                    )
+                    conn.execute(
+                        update(eval_result_table)
+                        .where(
+                            and_(
+                                eval_result_table.c.tenant_id == tenant_id,
+                                eval_result_table.c.id.in_(result_ids),
+                            )
+                        )
+                        .values(status="PURGED", metrics_json=None, judge_json=None, updated_at=now)
+                    )
+
+                conn.execute(
+                    update(eval_case_table)
+                    .where(
+                        and_(
+                            eval_case_table.c.tenant_id == tenant_id,
+                            eval_case_table.c.id.in_(case_ids),
+                        )
+                    )
+                    .values(
+                        question_json={},
+                        expected_json={},
+                        annotation_status="PURGED",
+                        updated_at=now,
+                    )
+                )
+                conn.execute(
+                    update(eval_gold_table)
+                    .where(
+                        and_(
+                            eval_gold_table.c.tenant_id == tenant_id,
+                            eval_gold_table.c.case_id.in_(case_ids),
+                        )
+                    )
+                    .values(anchor_json={}, version_hash=empty_hash, updated_at=now)
+                )
+                if dataset_ids:
+                    conn.execute(
+                        update(eval_dataset_version_table)
+                        .where(
+                            and_(
+                                eval_dataset_version_table.c.tenant_id == tenant_id,
+                                eval_dataset_version_table.c.id.in_(dataset_ids),
+                            )
+                        )
+                        .values(status="PURGED", updated_at=now)
+                    )
+
+            snapshot_rows = conn.execute(
+                select(
+                    eval_snapshot_document_table.c.snapshot_id,
+                    eval_snapshot_document_table.c.document_id,
+                ).where(
+                    and_(
+                        eval_snapshot_document_table.c.origin_tenant_id == tenant_id,
+                        eval_snapshot_document_table.c.origin_document_id == doc_id,
+                    )
+                )
+            ).fetchall()
+            snapshot_ids = sorted({str(row.snapshot_id) for row in snapshot_rows})
+            if snapshot_ids:
+                conn.execute(
+                    update(eval_snapshot_table)
+                    .where(
+                        and_(
+                            eval_snapshot_table.c.tenant_id == tenant_id,
+                            eval_snapshot_table.c.id.in_(snapshot_ids),
+                        )
+                    )
+                    .values(status="PURGED", manifest_json={}, manifest_hash=empty_hash, updated_at=now)
+                )
+
+            # Evaluation results can also point at QA runs that referenced the source.
+            affected_run_ids = [str(ar.id) for ar in affected_runs]
+            if affected_run_ids:
+                eval_result_rows = conn.execute(
+                    select(eval_result_table.c.id).where(
+                        and_(
+                            eval_result_table.c.tenant_id == tenant_id,
+                            eval_result_table.c.qa_run_id.in_(affected_run_ids),
+                        )
+                    )
+                ).fetchall()
+                eval_result_ids = [str(row.id) for row in eval_result_rows]
+                if eval_result_ids:
+                    conn.execute(
+                        update(eval_review_table)
+                        .where(
+                            and_(
+                                eval_review_table.c.tenant_id == tenant_id,
+                                eval_review_table.c.result_id.in_(eval_result_ids),
+                            )
+                        )
+                        .values(labels_json={}, reason_text=None, updated_at=now)
+                    )
+                    conn.execute(
+                        update(eval_result_table)
+                        .where(
+                            and_(
+                                eval_result_table.c.tenant_id == tenant_id,
+                                eval_result_table.c.id.in_(eval_result_ids),
+                            )
+                        )
+                        .values(status="PURGED", metrics_json=None, judge_json=None, updated_at=now)
+                    )
 
             # Scrub source_units
             conn.execute(
