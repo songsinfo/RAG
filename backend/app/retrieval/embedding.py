@@ -63,6 +63,8 @@ def get_embeddings(
         client = get_http_client()
         for batch in _batched(texts, batch_size):
             call_id = str(uuid.uuid4())
+            sent = False
+            recorded = False
             input_tokens = max(1, sum(max(1, len(value) // 4) for value in batch))
             BudgetService.reserve(
                 tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
@@ -72,6 +74,7 @@ def get_embeddings(
                 output_upper_bound=0,
             )
             try:
+                sent = True
                 resp = client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {master_key}"},
@@ -92,11 +95,12 @@ def get_embeddings(
                     call_id=call_id,
                     run_id=None,
                     purpose="EMBEDDING",
-                    status="FAILED",
+                    status="FAILED" if sent else "NOT_SENT",
                     input_tokens=0,
                     output_tokens=0,
                     model_alias="embedding-main",
                 )
+                recorded = True
                 raise
             if not isinstance(data, list) or len(data) != len(batch):
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "Embedding 返回数量与输入批次不一致")
@@ -144,9 +148,25 @@ def get_embeddings(
                 output_tokens=0,
                 model_alias="embedding-main",
             )
+            recorded = True
 
         return vectors
     except ApiException:
+        if "call_id" in locals() and "recorded" in locals() and not recorded:
+            try:
+                from app.qa.model_gateway import ModelGateway
+                ModelGateway._record_call(
+                    tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                    call_id=call_id,
+                    run_id=None,
+                    purpose="EMBEDDING",
+                    status="FAILED" if ("sent" in locals() and sent) else "NOT_SENT",
+                    input_tokens=0,
+                    output_tokens=0,
+                    model_alias="embedding-main",
+                )
+            except Exception:
+                logger.exception("Failed to reconcile embedding budget after validation error")
         raise
     except Exception as exc:
         logger.error("大模型嵌入网关连接失败: %s", exc)
