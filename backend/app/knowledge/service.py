@@ -1428,7 +1428,11 @@ class KnowledgeService:
     def get_preview(actor: Actor, doc_id: str, version_id: str) -> Dict[str, Any]:
         with get_db_connection() as conn:
             build = conn.execute(
-                select(index_build_table.c.id).where(
+                select(
+                    index_build_table.c.id,
+                    index_build_table.c.quality_warnings,
+                    index_build_table.c.review_reason,
+                ).where(
                     and_(
                         index_build_table.c.tenant_id == actor.tenant_id,
                         index_build_table.c.document_id == doc_id,
@@ -1462,7 +1466,8 @@ class KnowledgeService:
             return {
                 "units": [{"id": str(u.id), "key": u.key, "kind": u.kind, "text": u.text, "location": u.location} for u in units],
                 "chunks": [{"id": str(c.id), "kind": c.kind, "parentId": str(c.parentId) if c.parentId else None, "ordinal": c.ordinal, "text": c.text} for c in chunks],
-                "warnings": [],
+                "warnings": build.quality_warnings or [],
+                "reviewReason": build.review_reason,
             }
 
     @staticmethod
