@@ -112,11 +112,9 @@ def test_document_upload_and_preview(client):
     assert len(preview["units"]) > 0
     assert len(preview["chunks"]) > 0
 
-    # Verify structural units have headings, text, code
+    # Source units now come directly from Docling HybridChunker provenance.
     kinds = {u["kind"] for u in preview["units"]}
-    assert "HEADING" in kinds
-    assert "TEXT" in kinds
-    assert "CODE" in kinds
+    assert kinds == {"TEXT"}
 
     # Verify parent and child chunks exist
     chunk_kinds = {c["kind"] for c in preview["chunks"]}

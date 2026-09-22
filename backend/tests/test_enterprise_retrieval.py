@@ -183,13 +183,42 @@ def test_milvus_index_epoch_isolates_stale_attempt_cleanup():
     assert hits[0]["indexEpoch"] == 2
 
 
-def test_docling_binary_parse(monkeypatch):
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("guide.pdf", "application/pdf"),
+        ("guide.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("guide.md", "text/markdown"),
+        ("guide.txt", "text/plain"),
+    ],
+)
+def test_all_document_formats_use_docling_hybrid_chunker(monkeypatch, filename, content_type):
     from app.knowledge import parser
+
+    calls = []
 
     class FakeResponse:
         status_code = 200
+        text = ""
         def json(self):
-            return {"document": {"md_content": "# PDF 标题\n\n来自 Docling 的正文。"}}
+            return {
+                "chunks": [
+                    {
+                        "filename": filename,
+                        "chunk_index": 0,
+                        "text": "PDF 标题\n来自 Docling HybridChunker 的正文。",
+                        "raw_text": "来自 Docling HybridChunker 的正文。",
+                        "num_tokens": 18,
+                        "headings": ["PDF 标题"],
+                        "captions": [],
+                        "doc_items": ["#/texts/0"],
+                        "page_numbers": [1],
+                        "metadata": {},
+                    }
+                ],
+                "documents": [],
+                "processing_time": 0.01,
+            }
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -198,13 +227,28 @@ def test_docling_binary_parse(monkeypatch):
             return self
         def __exit__(self, *args):
             return False
-        def post(self, *args, **kwargs):
-            assert args[0].endswith("/v1/convert/file")
-            assert "files" in kwargs
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs))
             return FakeResponse()
 
     monkeypatch.setenv("DOCLING_URL", "http://docling:5001")
     monkeypatch.setattr(parser.httpx, "Client", FakeClient)
-    units = parser.parse_document(b"%PDF-fake", "guide.pdf")
-    assert any(u["kind"] == "HEADING" and u["text_content"] == "PDF 标题" for u in units)
-    assert any("来自 Docling" in u["text_content"] for u in units)
+
+    units, chunks, spans = parser.parse_and_chunk_document(b"fake-content", filename)
+    assert calls
+    url, kwargs = calls[0]
+    assert url.endswith("/v1/chunk/hybrid/file")
+    assert kwargs["files"]["files"][2] == content_type
+    assert kwargs["data"]["chunking_max_tokens"] == "400"
+    assert kwargs["data"]["chunking_merge_peers"] == "true"
+    assert kwargs["data"]["chunking_include_raw_text"] == "true"
+    assert kwargs["data"]["convert_do_table_structure"] == "true"
+
+    assert len(units) == 1
+    assert units[0]["kind"] == "TEXT"
+    assert units[0]["location"]["headings"] == ["PDF 标题"]
+    children = [c for c in chunks if c["kind"] == "CHILD"]
+    assert len(children) == 1
+    assert children[0]["token_count"] == 18
+    assert "Docling HybridChunker" in children[0]["text_content"]
+    assert spans[0]["unit_id"] == units[0]["id"]
