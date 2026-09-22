@@ -1,0 +1,641 @@
+# RAG 项目源码导读：从上传文件到回答与评估
+
+这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
+
+核对基线：2026-09-22，`feat/python-migration`，提交 `de2b2cf`。本文只补充文档，不修改业务行为。代码片段为原源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+
+**阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
+
+阅读导航：[项目地图](#1-先认识项目再确定阅读顺序) → [贯穿示例](#2-用一个例子贯穿所有流程) → [启动与任务](#3-启动与入口请求和后台任务如何衔接) → [文档入库](#4-文档入库文件如何变成可以检索的内容) → [检索](#5-检索问题如何找到当前用户可用的证据) → [普通 RAG](#6-普通-rag证据如何变成用户看到的答案) → [Agent 与评估](#7-agent-与评估在普通-rag-主线上的扩展) → [失败排查](#8-第二遍阅读追踪权限状态和失败) → [测试跟读](#9-跑测试读源码一个可操作的学习路线)。
+
+## 1. 先认识项目，再确定阅读顺序
+
+这个项目是企业内部知识问答系统：先把文件转换为可检索内容，再在当前用户可读范围内检索，把证据交给模型，最后校验并展示带引用的答案。Agent 模式允许模型决定后续检索动作，评估模块则批量执行并检查这些流程。
+
+| 组件 | 在本项目中的工作 | 源码入口 |
+| --- | --- | --- |
+| Vue 前端 | 上传、提问、轮询结果、查看引用 | [Chat.vue](../frontend/src/Chat.vue)、[Documents.vue](../frontend/src/Documents.vue) |
+| FastAPI | HTTP 路由、认证依赖、CSRF、错误响应 | [main.py](../backend/app/main.py) |
+| MySQL | 用户权限、文档版本、生效构建、任务和运行记录 | [models.py](../backend/app/models.py)、[db.py](../backend/app/db.py) |
+| Worker | 从数据库领取并执行耗时任务 | [worker.py](../backend/app/runtime/worker.py) |
+| Docling | 将 PDF/DOCX 等转换为 Markdown | [parser.py](../backend/app/knowledge/parser.py) |
+| Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
+| LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
+| LangGraph | Agent 的 model/tools 循环和断点恢复 | [agent.py](../backend/app/qa/agent.py) |
+
+第一遍按第 2～7 节看成功主线。第二遍看第 8 节的权限、租约和失败分支。第三遍运行第 9 节的测试，观察变量。不要一开始从 `models.py` 第一行一路读到底；先遇到哪个对象，就回头找它对应的表。
+
+## 2. 用一个例子贯穿所有流程
+
+假设上传 UTF-8 文件 `retry.md`：
+
+```markdown
+# 订单重试规则
+
+订单重试前必须检查幂等键。
+
+重试前应确认尚未达到重试次数上限。
+
+重试前需核对补偿日志，避免重复补偿。
+```
+
+用户提问：“订单重试前需要检查哪些事项？”
+
+整个过程可以概括为：
+
+```mermaid
+flowchart TD
+    A[retry.md 文件字节] --> B[上传接口：保存原件并创建 INGEST job]
+    B --> C[Worker：解析 source_unit]
+    C --> D[切块：PARENT / CHILD / chunk_span]
+    D --> E[CHILD 写入 Milvus]
+    E --> F[MySQL 发布 active_build_id]
+    Q[用户问题] --> R[创建 qa_run 和 QA_RUN job]
+    R --> S[Worker 执行普通 RAG 或 Agent]
+    F --> T[MySQL 筛选可读生效 build]
+    S --> T
+    T --> U[Milvus 检索、可选重排和父块扩展]
+    U --> V[证据 E1、E2 等]
+    V --> W[模型输出 claims 和引用范围]
+    W --> X[校验并渲染 answer]
+    X --> Y[保存结果，前端轮询读取]
+    Y --> Z[评估执行器对照标准事实评分]
+```
+
+先记住这些对象的区别：
+
+| 对象 | 含义 | 为什么单独存在 |
+| --- | --- | --- |
+| `document` | 逻辑文档 | 文件更新后仍属于同一份资料 |
+| `document_version` | 某次上传的版本 | 保留原件和版本身份 |
+| `index_build` | 某次解析与索引构建 | 新构建完成后才切换生效指针 |
+| `source_unit` | 标题、段落、表格、代码等原文单元 | 保存来源位置 |
+| `chunk` | 为检索或上下文准备的文本块 | 组织不同粒度内容 |
+| `chunk_span` | 子块与原文单元及偏移的关系 | 让检索结果可以追溯到原文 |
+| `hit` | 某次查询返回的候选记录 | 有分数、build、chunk 等信息 |
+| `evidence` | 某次问答登记的证据 | 分配运行内编号，例如 E1 |
+| `claim` | 模型给出的一条事实断言 | 必须关联本次 evidence |
+| `answer` | 程序根据 claims 渲染的展示文本 | 保持正文和引用的对应关系 |
+
+例如 `E1` 不是全局文档 ID，而是本次问答的证据编号。另一轮问答的 E1 可以指向完全不同的资料。
+
+## 3. 启动与入口：请求和后台任务如何衔接
+
+### 3.1 从哪里开始读
+
+打开 [main.py](../backend/app/main.py)，先定位 `lifespan()`，再看 `csrf_middleware()` 和 `app.include_router(...)`。
+
+```python
+app.include_router(knowledge_router, prefix="/api/v1")
+app.include_router(retrieval_router, prefix="/api/v1")
+app.include_router(qa_router, prefix="/api/v1")
+app.include_router(config_router, prefix="/api/v1")
+app.include_router(eval_router, prefix="/api/v1")
+```
+
+路由文件里的路径还要加 `/api/v1`。例如 `qa/router.py` 中的 `/conversations`，最终是 `/api/v1/conversations`。
+
+`lifespan()` 检查数据库，初始化种子数据并处理未完成任务恢复；非测试环境且启用内嵌 Worker 时，启动三组工作线程：
+
+- `qa` 领取 `QA_RUN`。
+- `ingest` 领取 `INGEST / PURGE`。
+- `eval` 领取 `EVALUATE`。
+
+Worker 也有独立入口。学习时先理解“数据库里的 job 被谁领取”，再研究部署在哪个进程。
+
+### 3.2 HTTP 层负责什么
+
+阅读 [api.ts](../frontend/src/api.ts) 的 `api()`：请求地址加 `/api/v1`，携带会话 Cookie，写请求处理 CSRF，普通对象转换为 JSON，上传使用 FormData。
+
+后端 [identity/deps.py](../backend/app/identity/deps.py) 的 `get_current_actor()` 从 `RAG_SESSION` 查会话、用户和租户，构造：
+
+```python
+@dataclass(frozen=True)
+class Actor:
+    tenant_id: str
+    user_id: str
+    admin: bool
+    security_epoch: int = 0
+```
+
+`Actor` 是后续权限判断的身份上下文。不能从客户端 JSON 里的用户 ID 推断当前身份。`require_admin()` 检查维护资格，文档阅读权限则由另一组函数判断。
+
+### 3.3 为什么请求返回了，任务还没完成
+
+本项目采用“接收请求 → 写任务 → Worker 执行”的结构。HTTP 202 表示接收，并不表示文件已入库或答案已生成。
+
+在 [worker.py](../backend/app/runtime/worker.py) 按下面顺序读：
+
+```text
+run_forever()
+  → run_once()
+      → _claim_one()                 领取可执行或租约过期的任务
+      → _heartbeat_loop()           执行期间续租
+      → 按 kind 分派给 _run_*()
+      → _requeue_failed_if_retryable()
+```
+
+`_claim_one()` 使用行锁与 `skip_locked=True`，领取时增加 `lease_epoch`。这表示“当前第几代执行者”。旧 Worker 即使恢复运行，也不应覆盖新 Worker 的结果，后面的发布与终态写入会检查租约。
+
+**测试环境不同：** 入库、问答、评估的一些入口会直接同步执行。因此测试里 POST 完就能读到结果，不能据此推断生产请求也在 HTTP 线程里完成全部工作。
+
+## 4. 文档入库：文件如何变成可以检索的内容
+
+### 4.1 完整调用链
+
+```text
+Documents.vue::upload()
+  → POST /api/v1/admin/documents
+  → knowledge/router.py::upload_document()
+  → KnowledgeService.upload_document()
+      → 保存原件和版本、构建记录
+      → 写 job(kind=INGEST, status=QUEUED)
+  → DurableJobWorker._run_ingest()
+      → read_artifact(storageKey)
+      → KnowledgeService._execute_ingestion_job()
+          → parse_document()
+          → source_unit 入库
+          → chunk_units()
+          → chunk / chunk_span 入库
+          → MilvusHybridService.upsert_chunks()
+          → index_build READY + document.active_build_id 切换
+```
+
+阅读入口：[knowledge/router.py](../backend/app/knowledge/router.py)、[knowledge/service.py](../backend/app/knowledge/service.py)、[artifacts.py](../backend/app/knowledge/artifacts.py)。
+
+`upload_document()` 接收文件字节、知识库 ID、幂等键和构建配置，完成权限及请求检查，并保存原始文件和数据库记录。返回 `documentId / versionId / buildId / jobId` 后，客户端可通过任务接口查看进度。
+
+**这四个 ID 不要混用。** 查文件生命周期看 document；查上传原件看 version；查解析和索引内容看 build；查执行进度看 job。
+
+### 4.2 解析：字节 → source_unit
+
+打开 [parser.py](../backend/app/knowledge/parser.py) 的 `parse_document()`：
+
+```python
+suffix = Path(filename).suffix.lower()
+if suffix in _TEXT_EXTENSIONS:
+    return parse_markdown(decode_utf8(file_bytes))
+```
+
+`.md / .markdown / .txt` 走 UTF-8 解码和本地 Markdown 解析。其他格式通过 `_docling_markdown()` 调 Docling `/v1/convert/file`，拿到 `document.md_content` 后也进入 `parse_markdown()`。
+
+所以当前二进制文档走的是“Docling → Markdown → 本地单元解析”。解析得到的 Markdown 行号不自动等同于 PDF 原始页码或版面坐标；不能仅凭 `location` 字段存在，就认为完整保留了原文件布局。
+
+`parse_markdown()` 会识别 `HEADING / TEXT / TABLE / CODE`。本例第一条数据形状类似：
+
+```json
+{
+  "unit_key": "h_1",
+  "kind": "HEADING",
+  "text_content": "订单重试规则",
+  "location": {"line": 1, "level": 1}
+}
+```
+
+后面三段分别成为 TEXT。真实对象还包含内容 hash；执行入库时为每个单元生成 `id` 并写入 `source_unit`。
+
+### 4.3 切块：source_unit → PARENT / CHILD / span
+
+打开 [chunker.py](../backend/app/knowledge/chunker.py)，依次看 `chunk_units()`、内部 `flush_parent_and_children()`、`append_child()` 和 `_split_text()`。
+
+```python
+def chunk_units(
+    units: List[Dict[str, Any]],
+    max_parent_chars: int = 2000,
+    max_child_chars: int = 400,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+```
+
+参数单位是字符，不是 tokenizer token。父块按标题和累计长度组织，子块限制长度；过长单元由 `_split_text()` 尽量沿句子、换行或空格切开，并保留单元内偏移。
+
+本例很短，默认参数下会形成一个父块和一个子块。父块连接单元时用双换行，子块组装时用单换行；因此不能假定两者文本逐字相同。
+
+子块数据形状：
+
+```json
+{
+  "id": "child-1",
+  "parent_id": "parent-1",
+  "kind": "CHILD",
+  "ordinal": 1,
+  "text_content": "订单重试规则\n订单重试前必须检查幂等键。\n重试前应确认尚未达到重试次数上限。\n重试前需核对补偿日志，避免重复补偿。"
+}
+```
+
+对应的 `chunk_span` 不只是“这个 chunk 来自哪份文件”，还记录它覆盖的 `unit_id`、`start_cp`、`end_cp` 和位置。这里的偏移属于原文单元，不能直接拿来当模型最终 evidence 的偏移。
+
+两个实现细节：`max_parent_chars` 不是对单个超长原文单元的严格硬限制；`token_count` 使用字符长度近似估算，不是精确 tokenizer 结果。入库执行器当前直接调用 `chunk_units(raw_units)`，不要认为上传任意构建参数都会自动影响这两个默认长度。
+
+### 4.4 建索引与发布：有向量不等于已生效
+
+在 `_execute_ingestion_job()` 看这一段：
+
+```python
+child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
+```
+
+只有 CHILD 传给 `MilvusHybridService.upsert_chunks()`。PARENT 留在关系数据里，检索后可扩展为上下文。
+
+在 [milvus_service.py](../backend/app/retrieval/milvus_service.py) 看 `upsert_chunks()`，继续追到 [embedding.py](../backend/app/retrieval/embedding.py) 的 `get_embeddings()`。文档文本转换为 dense 向量，真实 Milvus 集合还通过 BM25 function 生成 sparse 表示。索引携带租户、文档、版本、build、chunk 和索引代次等字段，便于过滤和溯源。
+
+最后回到入库执行器的发布事务：将 `index_build.status` 更新为 `READY`，将 `document.active_build_id` 指向该 build，并完成任务。
+
+```text
+旧 active_build_id → 仍是当前可检索版本
+新 build 正在解析/切块/写索引 → 尚未成为当前版本
+发布事务成功 → active_build_id 指向新 build
+```
+
+这也是“Milvus 不是版本权威”的含义：数据库生效指针决定哪些索引记录可以参与当前检索。
+
+**对应测试：** [test_ingestion.py](../backend/tests/test_ingestion.py) 中 `test_document_upload_and_preview()`。重点看上传响应、任务状态、preview 中的 units/chunks，以及新版本上传后的变化。
+
+## 5. 检索：问题如何找到当前用户可用的证据
+
+### 5.1 先读短函数，再读底层实现
+
+先完整阅读 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`，再进入 [milvus_service.py](../backend/app/retrieval/milvus_service.py) 的 `search()`。
+
+```text
+retrieve(actor, query, kb_ids, document_ids, config_id, run_id)
+  → load_retrieval_config()
+  → get_readable_build_records()
+  → MilvusHybridService.search()
+  → assert_hits_still_readable()
+  → 可选 rerank_hits()
+  → 可选 _expand_parents()
+  → _attach_provenance()
+  → 按 final_top_k 截取
+  → 再次 assert_hits_still_readable()
+  → 返回 hits / warnings / config / allowedBuildCount
+```
+
+### 5.2 权限过滤先于检索
+
+```python
+with get_db_connection() as conn:
+    readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
+
+allowed_build_ids = [row["buildId"] for row in readable]
+```
+
+在 [identity/deps.py](../backend/app/identity/deps.py) 定位 `get_readable_build_records()`：检查租户、用户有效性、知识库授权、文档 ACL、文档 LIVE、当前 build READY，再应用可选知识库/文档范围。
+
+没有可读 build 就直接返回空结果。管理员维护资格也不会在这段逻辑里自动绕过正文授权。
+
+允许列表和 `indexEpoch` 传入 Milvus。检索后再次检查，是为了应对“检索期间撤权或切换了版本”；尤其不能在将候选发送给外部 Reranker 后才第一次检查权限。
+
+### 5.3 BM25、Dense 和 Hybrid 在哪里分支
+
+`search()` 根据有效配置选择路线：
+
+| 模式 | 核心操作 | 阅读时关注 |
+| --- | --- | --- |
+| BM25 | 搜索 sparse 字段 | 查询词与文档词项匹配 |
+| DENSE | 问题 embedding → dense 向量搜索 | 查询与索引维度一致 |
+| HYBRID | 两路检索，通过 RRF 融合 | 两路候选数量和融合排名 |
+
+真实服务分支中 Hybrid 使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`。RRF 的直觉是“综合各路线里的名次”，不是直接把两种不可比的原始分数相加。
+
+测试环境另有内存检索和确定性 embedding 路径。它们适合验证过滤和执行逻辑，不能代表真实向量的语义质量，也不能用其表现估计生产 Milvus 性能。
+
+### 5.4 重排、父块扩展与来源映射
+
+`rerank_hits()` 使用问题和候选文本重新排序；是否启用、保留多少条、失败是否允许降级，由有效配置决定。阅读 [config.py](../backend/app/retrieval/config.py) 的 `RetrievalConfig.from_payload()`，不要只看配置 JSON 的名字就认为某个开关已被执行。
+
+`_expand_parents()` 找到命中 CHILD 对应的 PARENT，将较完整的父文本放进 `hit.text`，原命中文本留在 `matchedText`，并增加 `parentChunkId`。同父块去重，过长父文本按 `parent_max_chars` 截取。
+
+因此：
+
+```text
+chunkId        = 用来定位检索命中的子块
+parentChunkId  = 实际扩展使用的父块（如果启用）
+matchedText    = 子块命中文本（发生父扩展时）
+text           = 后续用于上下文的文本
+```
+
+`_attach_provenance()` 通过 `chunk_span → source_unit` 补充来源。能在当前上下文找到完整单元时，设置 `contextMapped=true` 并保存上下文偏移；找不到时仍保留来源信息，不能把 `contextMapped=false` 解释为已有精确上下文映射。
+
+当前 `retrieve()` 的直接执行链没有 Rewrite、HyDE、Multi-Query、MMR 调用。设计或实验配置里出现这些名称，不等于本函数已经执行了这些策略。
+
+**对应测试：** [test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`；[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()`。
+
+## 6. 普通 RAG：证据如何变成用户看到的答案
+
+### 6.1 前端提交与后端接收
+
+从 [Chat.vue](../frontend/src/Chat.vue) 的 `submit()` 和 `poll()` 开始：提交后保存 run ID，再反复 GET `/runs/{id}`。当前页面使用轮询；后端提供 SSE events 接口，不意味着页面已在使用 SSE 或逐 token 输出。
+
+```text
+Chat.vue::submit()
+  → POST /api/v1/conversations/{id}/runs
+  → qa/router.py::submit_run()
+  → QaService.submit_run()
+      → 输入检查、会话归属、上下文分段、幂等与并发检查
+      → 写 qa_run(QUEUED) 和 job(QA_RUN)
+  → Worker._run_qa()
+  → QaService.execute_queued_run()
+  → QaService._execute_run()
+```
+
+主要文件：[qa/router.py](../backend/app/qa/router.py)、[qa/service.py](../backend/app/qa/service.py)。在长文件中先按函数名搜索，不要从所有会话管理接口开始逐行阅读。
+
+`conversation` 表示会话，`context_segment` 表示该会话的一段范围上下文，`qa_run` 表示一次问题执行，`job` 表示驱动它的后台任务。这几个对象有联系但不是同一条记录。
+
+### 6.2 `_execute_run()` 的九步主线
+
+| 顺序 | 代码位置或调用 | 本例发生什么 |
+| --- | --- | --- |
+| 1 | `classify_question()` | 本例归为知识问答 |
+| 2 | 读取 segment 范围 | 确定知识库范围 |
+| 3 | `RetrievalPipeline.retrieve()` | 找到订单规则的 hit |
+| 4 | 创建 evidence / evidence_map | 为正文分配 E1 等编号 |
+| 5 | 写 `run_source` | 记录本次运行依赖的文档与来源 |
+| 6 | `ModelGateway.chat()` | 将问题与 evidence 交给 chat-main |
+| 7 | `validate_claims()` | 核对结构、引用编号和区间 |
+| 8 | strict 分支与 `validate_output()` | 可选语义检查、输出规则检查 |
+| 9 | `_finalize_run()` | 保存结果及任务终态 |
+
+问题路由见 [question_router.py](../backend/app/qa/question_router.py)：当前是正则规则。问候语和少数不支持请求返回固定文本，不需要检索和模型；其余默认进入知识问答。
+
+如果检索无命中，直接构造 `NO_EVIDENCE` 业务结果：“当前可访问资料不足以回答。”这不是模型凭记忆尝试回答。
+
+### 6.3 hit → evidence：哪些材料真正交给模型
+
+核心节选：
+
+```python
+eid = f"E{idx}"
+evidence.append(ev_item)
+evidence_map[eid] = h["text"]
+```
+
+`ev_item` 保存 evidenceId、文档/版本/build/chunk、位置、文本和分数；`evidence_map` 是编号到文本的映射，供后续引用校验。
+
+随后构造模型输入：
+
+```python
+messages = [
+    {"role": "system", "content": INSTRUCTION},
+    {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
+]
+```
+
+本例的 user 内容是“问题 + 本次证据”，不是把整个数据库都发给模型。普通 RAG 这段生成 messages 也没有直接拼接完整历史对话；有会话存储并不等于每次生成都使用全部历史。
+
+实际材料大小主要受检索条数、父段截断等影响。这条普通 RAG 路径没有展示设计文档中那套完整的 token 级上下文装箱流程。
+
+### 6.4 模型输出 → claims → answer
+
+打开 [claim_validator.py](../backend/app/qa/claim_validator.py)，先看 `INSTRUCTION`，再读 `validate_claims()`。模型被要求输出结构化对象，而不是自行提供 `answer` 自由文本。
+
+为了直观看引用区间，假设某次证据 `E1` 只有“检查幂等键”五个字，一个合法形状的教学输出是：
+
+```json
+{
+  "status": "COMPLETED",
+  "claims": [{
+    "id": "C1",
+    "text": "重试前需要检查幂等键。",
+    "evidence": [{"evidenceId": "E1", "start": 0, "end": 5}]
+  }],
+  "gaps": [],
+  "conflicts": []
+}
+```
+
+区间为 Unicode code point 半开区间 `[start, end)`，在 Python 中对应 `text[start:end]`。真实本例若 evidence 是完整父块，偏移必须按那个实际文本计算，不能复用上述 0..5。
+
+`validate_claims()` 检查允许字段、状态、claims 数量、claim ID、引用编号、引用格式和冲突对，并渲染：
+
+```python
+rendered_claims.append(f"{text} [{', '.join(ev_labels)}]")
+```
+
+最终用户看到的文本类似“重试前需要检查幂等键。 [E1]”。真实问题要求三项事实，仅给出这一项不代表内容完整，即使结构校验通过。
+
+**注意当前代码的实际行为：** 引用编号不存在会报错，但整数区间越界、倒置等情况会被改成覆盖整条 evidence，而非一律拒绝。结构通过只表示格式与来源约束通过，不证明证据在语义上支持断言。
+
+### 6.5 模型网关做什么
+
+顺着 `ModelGateway.chat()` 到 [model_clients.py](../backend/app/qa/model_clients.py) 的 `get_chat_model()`，可以看到 LangChain 消息适配与模型客户端。网关使用内部别名调用 LiteLLM，记录 `model_call`，并使用运行策略进行有限重试。
+
+如果没有真实网关配置，测试环境可以走可控替身；非测试环境会返回网关不可用，不能把单元测试的生成文本当成真实模型效果。Embedding 还有独立的 `get_embeddings()` HTTP 路径，不能仅凭 ModelGateway 存在就推断所有调用都具有相同账本覆盖。
+
+### 6.6 保存状态与读取结果不是同一件事
+
+`_finalize_run()` 保存数据库运行状态和 `result_json`。成功执行的数据库状态可为 `SUCCEEDED`，而 `result_json.status` 可为 `COMPLETED / PARTIAL / NO_EVIDENCE / CONFLICT` 等业务状态。
+
+在 `get_run()` 中：
+
+```python
+if r.result_json:
+    base.update(r.result_json)
+```
+
+因此对外响应中的 `status` 可能被业务结果覆盖。调试时应一起查看数据库运行状态、`terminalReason` 和响应内容，不能把所有 `status` 当成同一层枚举。
+
+`get_run()` 还检查来源当前是否可读，不可读则返回 `visibility=HIDDEN`；对旧 build 的 evidence 增加 `isCurrent`。历史答案不会因为过去生成过就永远可展示。
+
+**对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()`、`test_qa_no_evidence_handling()`、`test_claim_validator_logic()`。
+
+## 7. Agent 与评估：在普通 RAG 主线上的扩展
+
+### 7.1 Agent 增加了什么决策
+
+普通 RAG 由程序固定执行一次检索再生成；Agent 让模型根据已有信息选择工具、检索内容和停止时机。它不是把普通 RAG 固定重复若干次。
+
+在 `_execute_run()` 的 `mode == "AGENT"` 分支进入 [agent.py](../backend/app/qa/agent.py) 的 `LangGraphAgent.run()`。按这个顺序阅读：
+
+```text
+run()：准备输入、历史、策略、截止时间和 checkpoint/resume
+  → _get_graph()：定义图
+  → _model_step()：模型决定下一步
+      ├─ 无 tool_calls → 解析最终 JSON → validate_claims → 结束
+      └─ 有 tool_calls → _tools_step()
+                           → 执行工具、累积证据、追加 tool 消息
+                           → 返回 _model_step()
+```
+
+图的实际定义节选：
+
+```python
+builder.add_node("model", cls._model_step)
+builder.add_node("tools", cls._tools_step)
+builder.add_edge(START, "model")
+builder.add_conditional_edges(
+    "model",
+    cls._route_after_model,
+    {"tools": "tools", END: END},
+)
+builder.add_edge("tools", "model")
+```
+
+`AgentState` 保存 messages、round、tool_calls_count、repeated_calls、evidence、evidence_map、warnings 和 final_answer。`AgentContext` 保存身份、run ID、配置、截止时间和回调。前者是循环中的变化状态，后者提供运行依赖。
+
+### 7.2 两个工具与本例轨迹
+
+| 工具 | 实现路径 | 作用 |
+| --- | --- | --- |
+| `search_knowledge` | `_tools_step()` → `RetrievalPipeline.retrieve()` | 在授权范围检索并登记证据 |
+| `read_section` | `_tools_step()` → `_read_section()` | 读取指定文档/build/source unit 的内容 |
+
+教学轨迹可能是：
+
+```text
+用户：订单重试前需要检查什么？
+模型：调用 search_knowledge(query="订单重试 检查事项")
+程序：返回证据摘要与 E1 编号，追加 role=tool 消息
+模型：若证据已足够，输出三条 claims；否则继续搜索或 read_section
+程序：validate_claims 后返回 answer
+```
+
+`tool_calls` 是模型提出的请求；工具真正执行、查权限、记录来源和限制预算由 Python 程序完成。模型不能因为输出一个工具名就直接绕过权限。
+
+搜索结果会去重，证据保存在状态中。工具消息发送压缩摘录，而完整原文仍可保存在 `evidence_map`；二者可能长度不同，不能把“系统存了完整证据”自动等同于“模型完整读过该证据”。
+
+### 7.3 为什么循环不会无限运行
+
+阅读 [runtime.py](../backend/app/qa/runtime.py) 的 `AgentRuntimePolicy`、`assert_runtime_budget()`、`compact_messages()`、`retry_call()`。
+
+当前有截止时间、主循环次数、工具调用数、重复调用、模型调用和 token 使用等约束。超过限制会产生明确错误；上下文压缩尽量保留当前问题及工具消息配对。
+
+需要审批的工具通过 LangGraph `interrupt()` 暂停；`JobCheckpointSaver` 将图状态持久化到任务相关存储。审批接口进入 `QaService.resolve_tool_approval()`，随后 `queue_resume()` 安排恢复。理解普通 model/tools 循环后，再读 [job_checkpointer.py](../backend/app/qa/job_checkpointer.py)，不必第一遍就深入 checkpoint 序列化。
+
+### 7.4 严格模式有一处必须分清的实现边界
+
+普通 RAG 的 strict 分支确实额外调用 judge-main，但目前只检查返回的 verdicts 是否全部为 SUPPORTED，没有完整核对判定数量和 claim ID 覆盖；空列表也会满足 Python 的 `all([])`。因此不能把标志值当成充分的逐条语义证明。
+
+Agent 分支在 strict 且存在 claims 时直接设置 `verification=SUPPORTED`；在这条当前路径中，不能找到与普通 RAG 对等的独立语义裁判调用。它的最终 `validate_claims()` 仍是结构校验。
+
+这与离线评估中的 [evaluation/judge.py](../backend/app/evaluation/judge.py) 不同，后者对事实与断言的裁判索引做完整性检查。三者名字相似，职责与强度却不同。本次仅记录实际行为，没有修复这些业务逻辑。
+
+**对应测试：** [test_agent.py](../backend/tests/test_agent.py) 的 `test_agent_single_tool_search_and_answer()`、`test_agent_repeated_calls_termination()`；[test_agent_runtime.py](../backend/tests/test_agent_runtime.py) 的 `test_agent_hitl_checkpoint_and_resume()`。
+
+### 7.5 评估如何复用问答流程
+
+阅读 [evaluation/runner.py](../backend/app/evaluation/runner.py)：
+
+```text
+estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
+  → Worker._run_evaluate()
+  → EvaluationRunner._execute_run()
+      ├─ 检索模式 → RetrievalPipeline.retrieve()
+      └─ RAG/AGENT → QaService.create_conversation / submit_run / get_run
+  → _compute_retrieval_metrics()
+  → 状态检查 + 可选 judge_answer()
+  → 保存单题结果 → aggregate() → export_run()/compare()
+```
+
+对本例，金标准应有“幂等键、重试次数上限、补偿日志”三个事实组。只找到一组也可能 Hit@5=1；模型只答出一项不应算完整成功。`judgeMode=HUMAN` 默认保留待复核结果，LLM 模式才进行语义裁判。
+
+指标、API 示例、成功率分母、快照范围、多轮执行限制和门禁详见 [RAG 评估完整说明](rag-evaluation-guide.md)。这里优先理解它怎样调用已读过的问答服务，而不是另外实现一套独立 RAG。
+
+## 8. 第二遍阅读：追踪权限、状态和失败
+
+### 8.1 看哪些表，不必先记全部字段
+
+在 [models.py](../backend/app/models.py) 按下面变量名定位表定义：
+
+| 流程 | 优先查看的表变量 | 重点字段 |
+| --- | --- | --- |
+| 身份 | `app_user_table`、`auth_session_table` | tenant、user、有效状态 |
+| 原始资料 | `document_table`、`document_version_table` | 文档状态、版本、active_build_id |
+| 解析索引 | `index_build_table`、`source_unit_table`、`chunk_table`、`chunk_span_table` | build、kind、parent_id、来源偏移 |
+| 后台执行 | `job_table` | kind、target_id、status、checkpoint、lease_epoch |
+| 问答 | `conversation_table`、`context_segment_table`、`qa_run_table` | owner、scope、question、result_json |
+| 溯源与调用 | `run_source_table`、`run_event_table`、`model_call_table` | 来源关联、阶段事件、调用用途和用量 |
+| 评估 | `eval_run_table`、`eval_result_table`、`eval_review_table` | manifest、单题结果、追加复核 |
+
+`run_event` 是程序组装的阶段记录，`model_call` 是模型调用记录，模型返回 JSON 是另一种数据。不要把它们统称为模型“自己输出的完整执行轨迹”。
+
+### 8.2 三条跨模块约束
+
+**权限不是只在入口检查一次。** 入口认身份，检索前限制 build，外发前检查候选，读取历史时检查来源。这些调用散落在多个文件，但沿同一份证据追踪就能理解各自目的。
+
+**任务重试不等于任意重放。** 入库重试会清理未发布 build 的部分产物并重建；QA 通过 `qa_execution_scope()` 和 `qa_lease_is_current()` 限制执行权；Agent 可以通过 checkpoint 恢复。租约过期时旧执行者不能继续发布，但这些机制也不意味着模型外部调用已获得全局 exactly-once 保证。
+
+**业务终态与工程成功分开看。** 无证据是业务结果，网关不可用是执行故障，格式正确是结构检查通过，答案正确则需要语义或人工评价。
+
+### 8.3 遇到现象应该从哪里看
+
+| 现象 | 建议定位顺序 |
+| --- | --- |
+| 上传返回了但搜不到 | job 状态 → source_unit/chunk → build READY → active_build_id → ACL → 索引 |
+| 检索命中但答非所问 | hit.text → evidence → 模型 messages → claims → 金标准事实 |
+| 子块命中，引用却显示一大段 | `_expand_parents()`、matchedText、parentChunkId |
+| 调用没有继续执行 | Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
+| 数据库是 SUCCEEDED，接口是 PARTIAL | `result_json.status` 与 `get_run()` 的合并 |
+| 以前能读的答案现在隐藏 | `get_run()` → `_all_sources()` → `can_read_document()` |
+| 评估成功率很高但大量题没审核 | judgedCases、judgmentCoverage、最新人工标签 |
+
+## 9. 跑测试读源码：一个可操作的学习路线
+
+### 9.1 先确认测试环境与真实环境的区别
+
+[conftest.py](../backend/tests/conftest.py) 使用内存 SQLite，设置 test 环境并清空真实模型与 Milvus 配置。部分测试还会 monkeypatch 外部调用。这些测试可以观察完整 HTTP 调用和数据库变化，但不等于真实 MySQL、Milvus、Docling 与付费模型的联合验收。
+
+### 9.2 第一组：只看解析和切块
+
+在现有 IDE 的 Python 调试器里给 `parse_document()`、`chunk_units()` 打断点，运行：
+
+```powershell
+# 在仓库根目录打开 Windows 原生 PowerShell；需要已经安装 backend/.venv。
+Push-Location -LiteralPath .\backend
+try {
+    & .\.venv\Scripts\python.exe -m pytest tests/test_ingestion.py::test_document_upload_and_preview -q
+    if ($LASTEXITCODE -ne 0) { throw '入库测试失败' }
+} finally {
+    Pop-Location
+}
+```
+
+断点要观察：`file_bytes → raw_units → chunks/spans → child_chunks`。先检查标题和文本如何分组，再检查长文本怎样切开，不必第一遍研究所有 SQL。
+
+### 9.3 第二组：看检索和回答
+
+在 backend 目录运行已有测试：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest tests/test_enterprise_retrieval.py::test_config_driven_rerank_parent_expansion_and_provenance tests/test_qa.py::test_qa_run_lifecycle_and_evidence -q
+if ($LASTEXITCODE -ne 0) { throw '检索与问答测试失败' }
+```
+
+断点按顺序放在 `retrieve()`、`_expand_parents()`、`QaService._execute_run()` 中生成前、`validate_claims()`。检查 `allowed_build_ids`、`hits`、`evidence_map`、`messages`、`parsed_answer` 和 `validated`。
+
+运行 pytest 命令本身不会自动启用 IDE 断点；若用命令行交互调试，可在命令中加 `--trace` 从测试入口进入，或用 IDE 的 pytest 调试配置启动。
+
+### 9.4 第三组：看 Agent 和完整用户流程
+
+仍在 backend 目录执行：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest tests/test_agent.py::test_agent_single_tool_search_and_answer tests/test_agent_runtime.py::test_agent_hitl_checkpoint_and_resume tests/test_system_e2e.py::test_e2e_full_user_and_admin_workflow -q
+if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
+```
+
+观察 `_model_step()` 返回的 tool_calls，接着看 `_tools_step()` 如何写入 evidence 并追加 tool 消息；再观察审批暂停与恢复。`test_e2e_full_user_and_admin_workflow()` 可用作学习用的客户端脚本，帮助串起认证、资料和问答接口。
+
+### 9.5 怎样判断自己已经读懂
+
+尝试不看文档回答这些问题，然后回到对应函数验证：
+
+1. 为什么上传成功还要等待 job？为什么要同时有 version 和 build？
+2. 为什么只索引 CHILD，模型却可能看到 PARENT？
+3. 文档撤权后，Milvus 里还有向量为什么也不应该被使用？
+4. E1 是在哪里产生的？怎样追到 source_unit？
+5. 模型输出的 claim 为什么不能直接当成正确事实？
+6. `SUCCEEDED` 与答案 `PARTIAL` 为什么能同时出现？
+7. Agent 是谁决定调用工具、谁真正执行工具？
+8. 单元测试通过能证明什么，不能证明什么？
+9. 评估里 100% 成功率为什么仍可能无法通过门禁？
+
+能沿着代码解释这九个问题，说明已经掌握项目主要过程；之后再深入删除传播、租约恢复、模型计费、复杂 ACL 和部署配置。
+
+## 10. 与现有文档如何配合
+
+推荐顺序是：[README 总览](../README.md) → 本源码导读 → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
+
+本导读的关键边界都来自当前代码：同步测试与异步生产不同、普通 RAG 与 Agent 的 strict 路径不同、引用越界会被扩成整段、部分设计策略没有进入当前流水线。这些差异应在阅读时保留，不能为了画出理想流程而隐藏。
+
+文档核对不代替真实依赖端到端运行。后续修改代码时，应一起检查这里的函数链、数据字段和分支说明是否仍然成立。

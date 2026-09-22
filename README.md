@@ -163,6 +163,8 @@ flowchart TD
 
 ## 阅读顺序
 
+若目标是理解当前 Python 项目并阅读主要源码，先看[源码导读：从上传文件到回答与评估](docs/source-walkthrough.md)，再看[RAG 评估完整说明](docs/rag-evaluation-guide.md)。下面的 PRD 与技术设计用于理解需求和设计意图，其中部分仍描述旧 Java / Elasticsearch 方案，当前行为以源码及这两份导读的核对基线为准。
+
 1. [当前范围与交付顺序](docs/00-project-assessment.md)
 2. [PRD-00 产品总览](docs/prd/PRD-00-product-overview.md)
 3. [PRD-01 身份与文档权限](docs/prd/PRD-01-identity-and-access.md)
