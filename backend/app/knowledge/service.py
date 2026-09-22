@@ -836,6 +836,58 @@ class KnowledgeService:
                 build_config,
             )
 
+            quality_warnings: List[Dict[str, Any]] = []
+            for unit in raw_units:
+                location = unit.get("location") if isinstance(unit, dict) else {}
+                metadata = location.get("metadata") if isinstance(location, dict) else {}
+                warnings = metadata.get("doclingWarnings") if isinstance(metadata, dict) else None
+                if isinstance(warnings, list):
+                    for warning in warnings:
+                        if isinstance(warning, dict):
+                            quality_warnings.append(warning)
+                        else:
+                            quality_warnings.append({"code": "DOCLING_WARNING", "detail": str(warning)})
+
+            with get_db_connection() as conn:
+                checkpoint_row = conn.execute(
+                    select(job_table.c.checkpoint).where(
+                        and_(
+                            job_table.c.tenant_id == tenant_id,
+                            job_table.c.id == job_id,
+                        )
+                    )
+                ).first()
+                checkpoint = dict(checkpoint_row.checkpoint or {}) if checkpoint_row else {}
+                if quality_warnings and not checkpoint.get("warningsAccepted"):
+                    checkpoint["qualityWarnings"] = quality_warnings[:100]
+                    conn.execute(
+                        update(index_build_table)
+                        .where(
+                            and_(
+                                index_build_table.c.tenant_id == tenant_id,
+                                index_build_table.c.id == build_id,
+                            )
+                        )
+                        .values(
+                            status="NEEDS_REVIEW",
+                            quality_warnings=quality_warnings[:100],
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    conn.execute(
+                        update(job_table)
+                        .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                        .values(
+                            status="NEEDS_REVIEW",
+                            stage="PARSING",
+                            checkpoint=checkpoint,
+                            lease_until=None,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    conn.commit()
+                    return
+
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
@@ -1335,6 +1387,8 @@ class KnowledgeService:
                 )
                 .values(status="CHUNKING", review_reason=reason, updated_at=now)
             )
+            checkpoint = dict(job.checkpoint or {})
+            checkpoint["warningsAccepted"] = True
             conn.execute(
                 update(job_table)
                 .where(
@@ -1349,6 +1403,7 @@ class KnowledgeService:
                     available_at=now,
                     lease_until=None,
                     error_code=None,
+                    checkpoint=checkpoint,
                     updated_at=now,
                 )
             )
