@@ -204,6 +204,9 @@ class EvaluationRunner:
         cap = number(body.get("maxCostCny", 10))
         if cap <= 0 or cap > 10:
             raise ApiException(400, "INVALID_BATCH_LIMIT", "批次费用上限需大于0且不超过10元")
+        max_model_calls = int(body.get("maxModelCalls", 1000))
+        if max_model_calls < 1 or max_model_calls > 1000:
+            raise ApiException(400, "INVALID_BATCH_LIMIT", "批次模型调用上限需在1到1000之间")
 
         if est.get("estimatedCostCny") is None:
             raise ApiException(409, "MODEL_PRICING_NOT_CONFIGURED", "价格未知不能启动付费评估，可先运行RETRIEVAL_ONLY")
@@ -218,6 +221,7 @@ class EvaluationRunner:
 
         manifest = dict(est)
         manifest["maxCostCny"] = cap
+        manifest["maxModelCalls"] = max_model_calls
         manifest["requesterId"] = actor.user_id
         manifest["environment"] = getattr(settings, "RAG_ENVIRONMENT", "demo")
 
@@ -249,7 +253,11 @@ class EvaluationRunner:
                     status="QUEUED",
                     stage="EVALUATING",
                     available_at=now,
-                    checkpoint={"runId": run_id, "maxCostCny": cap},
+                    checkpoint={
+                        "runId": run_id,
+                        "maxCostCny": cap,
+                        "maxModelCalls": max_model_calls,
+                    },
                     created_at=now,
                     updated_at=now,
                 )
@@ -480,6 +488,7 @@ class EvaluationRunner:
                         },
                         idempotency_key=f"eval:{result_id}:0",
                         trusted_config_id=eval_config_id,
+                        trusted_evaluation_job_id=str(run_row.job_id),
                     )
                     qa_run_id = submitted["runId"]
 
