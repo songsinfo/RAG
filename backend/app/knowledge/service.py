@@ -1539,6 +1539,34 @@ class KnowledgeService:
                     ).first()
                     version_id = str(b_row.version_id) if b_row else ""
                     published_epoch = int(b_row.fence or 0) if b_row else 0
+                    rep_rows = conn.execute(
+                        select(
+                            representation_table.c.chunk_id,
+                            representation_table.c.kind,
+                            representation_table.c.ordinal,
+                            representation_table.c.text_content,
+                            representation_table.c.vector_bytes,
+                            representation_table.c.dims,
+                        ).where(
+                            and_(
+                                representation_table.c.tenant_id == actor.tenant_id,
+                                representation_table.c.build_id == build_id,
+                            )
+                        )
+                    ).fetchall()
+                    representation_map: Dict[str, List[Dict[str, Any]]] = {}
+                    for rep in rep_rows:
+                        item = {
+                            "kind": str(rep.kind),
+                            "ordinal": int(rep.ordinal or 0),
+                            "text_content": str(rep.text_content or ""),
+                        }
+                        if rep.vector_bytes and rep.dims:
+                            item["dense_vector"] = list(
+                                struct.unpack(f"<{int(rep.dims)}f", bytes(rep.vector_bytes))
+                            )
+                        representation_map.setdefault(str(rep.chunk_id), []).append(item)
+
                     MilvusHybridService.upsert_chunks(
                         tenant_id=actor.tenant_id,
                         build_id=build_id,
@@ -1547,6 +1575,7 @@ class KnowledgeService:
                         doc_id=doc_id,
                         version_id=version_id,
                         index_epoch=published_epoch,
+                        representations=representation_map or None,
                     )
 
                 conn.execute(
