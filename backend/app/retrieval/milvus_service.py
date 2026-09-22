@@ -347,7 +347,7 @@ class MilvusHybridService:
                     )
 
                 if mode == "DENSE":
-                    query_emb = get_embeddings([query], dim=1024)[0]
+                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
                     res = client.search(
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
@@ -371,7 +371,7 @@ class MilvusHybridService:
                     )
                     return normalize_result(res)[:fusion_top_k]
 
-                query_emb = get_embeddings([query], dim=1024)[0]
+                query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
                 dense_req = AnnSearchRequest(
                     data=[query_emb],
                     anns_field="dense_vector",
@@ -442,7 +442,7 @@ class MilvusHybridService:
             bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
         if mode in {"DENSE", "HYBRID"}:
-            query_emb = get_embeddings([query], dim=1024)[0]
+            query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
