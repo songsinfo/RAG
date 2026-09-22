@@ -1,5 +1,8 @@
 # PRD-05 评估系统与策略实验
 
+> **历史规格说明（2026-09-22）**：本文保留早期需求/方案基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling 入库链路或“未实现”等历史描述，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 版本：1.0 · 状态：规格已编写，未实现。本文件定义质量与实验口径；安全规则遵循 PRD-01。
 
 ## Problem Statement
