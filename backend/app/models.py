@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy import (
-    MetaData, Table, Column, String, DateTime, Boolean, BigInteger, Integer, LargeBinary, Text, JSON
+    MetaData, Table, Column, String, DateTime, Boolean, BigInteger, Integer, LargeBinary, Text, JSON, Numeric
 )
 from sqlalchemy.sql import func
 
@@ -372,6 +372,36 @@ run_event_table = Table(
     Column("duration_ms", BigInteger, nullable=True),
     Column("payload", JSON, nullable=True),
     Column("error_code", String(64), nullable=True),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+tenant_budget_table = Table(
+    "tenant_budget",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("period_month", String(7), nullable=False),
+    Column("currency", String(3), nullable=False, default="CNY", server_default="CNY"),
+    Column("limit_amount", Numeric(18, 6), nullable=False),
+    Column("reserved_amount", Numeric(18, 6), nullable=False, default=0, server_default="0"),
+    Column("settled_amount", Numeric(18, 6), nullable=False, default=0, server_default="0"),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+budget_reservation_table = Table(
+    "budget_reservation",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("budget_id", String(36), nullable=False),
+    Column("caller_environment", String(128), nullable=False),
+    Column("caller_call_id", String(36), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("reserved_amount", Numeric(18, 6), nullable=False),
+    Column("settled_amount", Numeric(18, 6), nullable=True),
+    Column("expires_at", DateTime(6), nullable=False),
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
