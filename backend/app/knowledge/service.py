@@ -1431,6 +1431,7 @@ class KnowledgeService:
             build = conn.execute(
                 select(
                     index_build_table.c.id,
+                    index_build_table.c.status,
                     index_build_table.c.quality_warnings,
                     index_build_table.c.review_reason,
                 ).where(
@@ -1451,6 +1452,8 @@ class KnowledgeService:
                     source_unit_table.c.kind,
                     source_unit_table.c.text_content.label("text"),
                     source_unit_table.c.location,
+                    source_unit_table.c.machine_generated.label("machineGenerated"),
+                    source_unit_table.c.artifact_id.label("artifactId"),
                 ).where(source_unit_table.c.build_id == build.id)
             ).fetchall()
 
@@ -1465,7 +1468,20 @@ class KnowledgeService:
             ).fetchall()
 
             return {
-                "units": [{"id": str(u.id), "key": u.key, "kind": u.kind, "text": u.text, "location": u.location} for u in units],
+                "buildId": str(build.id),
+                "status": str(build.status),
+                "units": [
+                    {
+                        "id": str(u.id),
+                        "key": u.key,
+                        "kind": u.kind,
+                        "text": u.text,
+                        "location": u.location,
+                        "machineGenerated": bool(u.machineGenerated),
+                        "artifactId": str(u.artifactId) if u.artifactId else None,
+                    }
+                    for u in units
+                ],
                 "chunks": [{"id": str(c.id), "kind": c.kind, "parentId": str(c.parentId) if c.parentId else None, "ordinal": c.ordinal, "text": c.text} for c in chunks],
                 "warnings": build.quality_warnings or [],
                 "reviewReason": build.review_reason,
