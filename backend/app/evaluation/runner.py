@@ -40,6 +40,7 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
+from app.evaluation.judge import judge_answer, RUBRIC_VERSION
 
 
 def check_no_model(config: Dict[str, Any]):
@@ -131,6 +132,9 @@ class EvaluationRunner:
                 raise ApiException(400, "INVALID_INPUT", "重复次数1..3")
 
             mode = str(body.get("mode", "RAG")).strip().upper()
+            judge_mode = str(body.get("judgeMode", "HUMAN")).upper()
+            if judge_mode not in {"HUMAN", "LLM"}:
+                raise ApiException(400, "INVALID_INPUT", "judgeMode 必须 HUMAN/LLM")
             if mode not in {"RAG", "AGENT", "RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 raise ApiException(400, "INVALID_INPUT", "评估模式无效")
 
@@ -175,6 +179,8 @@ class EvaluationRunner:
                 "split": split,
                 "repeats": repeats,
                 "mode": mode,
+                "judgeMode": judge_mode,
+                "rubricVersion": RUBRIC_VERSION,
                 "strict": bool(body.get("strict", False)),
                 "plannedQuestions": len(cases_rows) * repeats,
                 "plannedTurns": turns * repeats,
@@ -418,14 +424,15 @@ class EvaluationRunner:
 
                     metric = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, hits, hits)
                     metric["durationMs"] = round(latency_ms, 2)
-                    metric["costCny"] = 0.0
+                    metric["costCny"] = 0.0 if mode == "RETRIEVAL_ONLY" else None
+                    metric["costStatus"] = "NO_MODEL_CALLS" if mode == "RETRIEVAL_ONLY" else "UNKNOWN"
                     metric["mode"] = mode
                     metric["configId"] = eval_config_id
                     metric["retrievalConfig"] = retrieval["config"]
                     hit_val = metric.get("hit")
                     exp_status = expected_obj.get("status", "ANSWER")
                     if exp_status == "ABSTAIN":
-                        metric["taskSuccess"] = bool(hit_val is None or hit_val == 0.0)
+                        metric["taskSuccess"] = None
                     else:
                         metric["taskSuccess"] = bool(hit_val is not None and hit_val > 0.0)
 
@@ -435,7 +442,7 @@ class EvaluationRunner:
                     )
                 except Exception as e:
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
-                    fail_metric = {"hit": 0.0, "recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "taskSuccess": False, "durationMs": round(latency_ms, 2), "costCny": 0.0}
+                    fail_metric = {"hit": 0.0, "recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "taskSuccess": False, "durationMs": round(latency_ms, 2), "costCny": 0.0 if mode == "RETRIEVAL_ONLY" else None}
                     EvaluationRunner._update_result(
                         actor, result_id, "FAILED", fail_metric, {"error": str(e)}, error_code="RETRIEVAL_FAILED"
                     )
@@ -509,20 +516,38 @@ class EvaluationRunner:
                     metrics["statusMatch"] = status_matches
 
                     # LLM judge or deterministic evaluation
-                    correctness = "CORRECT" if (is_terminal_success and status_matches and (metrics.get("hit", 0.0) > 0.0 or exp_status == "ABSTAIN")) else "WRONG"
+                    # Retrieval and output status cannot establish semantic correctness.
+                    correctness = "UNDETERMINED" if is_terminal_success and status_matches else "WRONG"
                     judge_obj = {
                         "correctness": correctness,
-                        "supportedClaims": len(qa_detail.get("claims", [])),
+                        "supportedClaims": None,
                         "totalClaims": len(qa_detail.get("claims", [])),
-                        "supportedCitationLinks": len(evidence_items),
-                        "totalCitationLinks": len(evidence_items),
-                        "claimsWithSupportedCitation": len(qa_detail.get("claims", [])),
+                        "supportedCitationLinks": None,
+                        "totalCitationLinks": sum(len(c.get("evidence", [])) for c in qa_detail.get("claims", [])),
+                        "claimsWithSupportedCitation": None,
+                        "method": "STATUS_ONLY_V2",
                         "output": qa_detail,
                     }
 
+                    if correctness == "UNDETERMINED" and manifest.get("judgeMode") == "LLM":
+                        try:
+                            judge_obj.update(judge_answer(actor.tenant_id, qa_run_id, question_obj, expected_obj, qa_detail))
+                            correctness = judge_obj["correctness"]
+                        except Exception as exc:
+                            judge_obj["judgeError"] = type(exc).__name__
+                            judge_obj["correctness"] = "UNDETERMINED"
                     metrics["correctness"] = correctness
-                    metrics["taskSuccess"] = is_terminal_success and status_matches and correctness == "CORRECT"
-                    metrics["costCny"] = 0.01
+                    metrics["taskSuccess"] = correctness == "CORRECT" if correctness != "UNDETERMINED" else None
+                    with get_db_connection() as conn:
+                        calls = conn.execute(select(model_call_table.c.settled_amount, model_call_table.c.pricing_snapshot).where(and_(
+                            model_call_table.c.tenant_id == actor.tenant_id,
+                            model_call_table.c.run_id == qa_run_id,
+                        ))).fetchall()
+                    amounts = [number(c.settled_amount) for c in calls
+                               if c.settled_amount is not None and obj(c.pricing_snapshot).get("rate") != "fixed"]
+                    metrics["knownCostCny"] = sum(amounts)
+                    metrics["costCny"] = sum(amounts) if calls and len(amounts) == len(calls) else None
+                    metrics["costStatus"] = "SETTLED" if metrics["costCny"] is not None else "UNKNOWN"
 
                     if mode == "AGENT":
                         with get_db_connection() as conn:
@@ -586,7 +611,7 @@ class EvaluationRunner:
                     )
                 except Exception as e:
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
-                    fail_metric = {"hit": 0.0, "recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "taskSuccess": False, "durationMs": round(latency_ms, 2), "costCny": 0.0}
+                    fail_metric = {"hit": 0.0, "recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "taskSuccess": False, "durationMs": round(latency_ms, 2), "costCny": None}
                     EvaluationRunner._update_result(
                         actor, result_id, "FAILED", fail_metric, {"error": str(e)}, error_code=type(e).__name__
                     )
@@ -727,7 +752,8 @@ class EvaluationRunner:
             for a_key, a_val in anchors.items():
                 target_doc = str(a_val.get("documentId", ""))
                 target_quote = str(a_val.get("quote", ""))
-                if (not doc_id or doc_id == target_doc) and target_quote and target_quote in text_content:
+                version_id = str(row.version_id) if row else str(hit.get("versionId", ""))
+                if doc_id == target_doc and version_id == str(a_val.get("versionId", "")) and target_quote and target_quote in text_content:
                     matched_anchors.add(a_key)
 
             ranked.append(matched_anchors)
@@ -766,6 +792,12 @@ class EvaluationRunner:
                 )
             ).fetchall()
 
+            reviews = conn.execute(select(eval_review_table).where(and_(
+                eval_review_table.c.tenant_id == actor.tenant_id,
+                eval_review_table.c.result_id.in_([str(r.id) for r in rows]),
+            )).order_by(eval_review_table.c.created_at.asc(), eval_review_table.c.id.asc())).fetchall()
+        latest_reviews = {str(r.result_id): obj(r.labels_json) for r in reviews}
+
         total = len(rows)
         completed = sum(1 for r in rows if r.status == "COMPLETED")
         failed = sum(1 for r in rows if r.status == "FAILED")
@@ -783,9 +815,25 @@ class EvaluationRunner:
         agent_input_tokens = 0
         agent_output_tokens = 0
         agent_timeouts = 0
+        judged = 0
+        known_cost = 0.0
+        unknown_cost = 0
+        reviewed_correct = 0
 
         for r in rows:
             m = obj(r.metrics_json)
+            label = latest_reviews.get(str(r.id), {}).get("correctness")
+            if label:
+                m["taskSuccess"] = label == "CORRECT" if label != "UNDETERMINED" else None
+                reviewed_correct += int(label == "CORRECT")
+            if isinstance(m.get("taskSuccess"), bool):
+                judged += 1
+            cost = m.get("costCny")
+            if isinstance(cost, (int, float)):
+                known_cost += cost
+            else:
+                unknown_cost += 1
+                known_cost += float(m.get("knownCostCny") or 0.0)
             if m.get("taskSuccess") is True:
                 success_count += 1
             if isinstance(m.get("durationMs"), (int, float)):
@@ -815,7 +863,11 @@ class EvaluationRunner:
             "completed": completed,
             "failed": failed,
             "notCompleted": total - completed - failed,
-            "taskSuccessRate": EvaluationMetrics.ratio(success_count, total) if total else None,
+            "taskSuccessRate": EvaluationMetrics.ratio(success_count, judged),
+            "judgedCases": judged,
+            "judgmentCoverage": EvaluationMetrics.ratio(judged, total),
+            "humanReviewedCases": len(latest_reviews),
+            "humanCorrectCases": reviewed_correct,
             "hitAt5": (hit_sum / retrieval_n) if retrieval_n else None,
             "recallAt5": (recall_sum / retrieval_n) if retrieval_n else None,
             "mrr": (mrr_sum / retrieval_n) if retrieval_n else None,
@@ -824,7 +876,9 @@ class EvaluationRunner:
             "ndcgDenominator": ndcg_n,
             "observedP50Ms": round(p50, 2) if p50 is not None else None,
             "observedP95Ms": round(p95, 2) if p95 is not None else None,
-            "knownCostCny": 0.0,
+            "knownCostCny": round(known_cost, 8),
+            "unknownCostCases": unknown_cost,
+            "totalCostCny": round(known_cost, 8) if unknown_cost == 0 else None,
             "agentCases": agent_cases,
             "avgAgentTurns": (agent_turns / agent_cases) if agent_cases else None,
             "avgAgentToolCalls": (agent_tool_calls / agent_cases) if agent_cases else None,
@@ -844,7 +898,7 @@ class EvaluationRunner:
             if not r:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "评估运行不存在")
 
-            metrics = obj(r.metrics_json) or EvaluationRunner.aggregate(actor, run_id)
+            metrics = EvaluationRunner.aggregate(actor, run_id)
             return {
                 "id": str(r.id),
                 "runId": str(r.id),
@@ -1019,15 +1073,15 @@ class EvaluationRunner:
 
         runs = [EvaluationRunner.get_run(actor, rid) for rid in run_ids]
         first_m = runs[0].get("manifest", {})
-        comparable = all(
-            r.get("manifest", {}).get("datasetVersionId") == first_m.get("datasetVersionId") and
-            r.get("manifest", {}).get("snapshotId") == first_m.get("snapshotId") and
-            r.get("manifest", {}).get("split") == first_m.get("split")
-            for r in runs
-        )
+        comparison_fields = ("datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats", "environment", "judgeMode", "rubricVersion")
+        differences = [key for key in comparison_fields if any(
+            r.get("manifest", {}).get(key) != first_m.get(key) for r in runs
+        )]
+        comparable = not differences
 
         return {
             "comparable": comparable,
+            "differingFields": differences,
             "reason": "MATCHED_MANIFEST" if comparable else "DIFFERENT_MANIFEST",
             "runs": runs,
             "results": [{"runId": rid, "cases": EvaluationRunner.results(actor, rid)} for rid in run_ids],
