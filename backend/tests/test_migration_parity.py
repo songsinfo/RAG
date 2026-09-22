@@ -1,5 +1,8 @@
+import io
 import uuid
+import zipfile
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -8,6 +11,8 @@ import app.db as app_db
 from app.errors import ApiException
 from app.identity.deps import Actor
 from app.knowledge.service import KnowledgeService
+from app.knowledge.imports import create_import_preview, consume_import_preview, split_wiki_package
+from app.model_budget import BudgetService
 from app.models import (
     document_table,
     eval_case_table,
@@ -292,3 +297,76 @@ def test_purge_scrubs_evaluation_derivatives():
     assert dataset_status == "PURGED"
     assert snapshot.status == "PURGED"
     assert snapshot.manifest_json == {}
+
+
+
+def test_directory_import_rechecks_source_hash(tmp_path, monkeypatch):
+    root = tmp_path / "import-root"
+    root.mkdir()
+    source = root / "guide.md"
+    source.write_text("# Guide\noriginal", encoding="utf-8")
+    monkeypatch.setenv("RAG_IMPORT_ROOT", str(root))
+
+    preview = create_import_preview(ACTOR.tenant_id, ACTOR.user_id, ".")
+    assert preview["files"][0]["relativePath"] == "guide.md"
+
+    source.write_text("# Guide\nchanged", encoding="utf-8")
+    with pytest.raises(ApiException) as exc:
+        consume_import_preview(
+            ACTOR.tenant_id,
+            ACTOR.user_id,
+            preview["estimateId"],
+            ["guide.md"],
+        )
+    assert exc.value.code == "SOURCE_CHANGED"
+
+
+def test_wiki_import_rejects_traversal_and_remote_assets():
+    def make_zip(entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, value in entries.items():
+                archive.writestr(name, value)
+        return buffer.getvalue()
+
+    with pytest.raises(ApiException) as exc:
+        split_wiki_package(make_zip({"../escape.md": "# bad"}))
+    assert exc.value.code == "INVALID_ARCHIVE"
+
+    with pytest.raises(ApiException) as exc:
+        split_wiki_package(
+            make_zip({"page.md": "![remote](https://example.invalid/image.png)"})
+        )
+    assert exc.value.code == "INVALID_ARCHIVE"
+
+    pages = split_wiki_package(
+        make_zip(
+            {
+                "page.md": "# Page\n![local](assets/p.png)",
+                "assets/p.png": b"\x89PNG\r\n\x1a\n",
+            }
+        )
+    )
+    assert len(pages) == 1
+    assert b"data:image/png;base64," in pages[0]["bytes"]
+
+
+def test_not_sent_budget_reservation_is_released():
+    call_id = str(uuid.uuid4())
+    reserved = BudgetService.reserve(
+        tenant_id=ACTOR.tenant_id,
+        call_id=call_id,
+        model_alias="chat-main",
+        input_upper_bound=100,
+        output_upper_bound=100,
+    )
+    BudgetService.settle(
+        ACTOR.tenant_id,
+        reserved["id"],
+        "NOT_SENT",
+        Decimal("0"),
+    )
+    summary = BudgetService.summary(ACTOR.tenant_id)
+    assert summary
+    assert Decimal(summary[0]["reservedAmount"]) == Decimal("0")
+    assert Decimal(summary[0]["settledAmount"]) == Decimal("0")
