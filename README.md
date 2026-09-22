@@ -189,7 +189,7 @@ flowchart TD
 
 从[技术设计入口](docs/design/README.md)开始，依次阅读架构、数据库与权限、入库状态机、检索与证据、API/会话/Agent、评估和实施验收。附件含 MySQL DDL 和 Milvus 集合映射；[验收追踪表](docs/design/08-traceability.md)逐条对应 81 项 PRD 验收。
 
-下一步继续 F5：恢复 Docker 后运行无模型 HTTP 集成，随后在独立 evaluation 环境绑定题集来源，并按固定 B0-B3 配置完成真实模型消融评估。不要把 81 项静态追踪写成 81 项运行验收通过。
+当前代码已完成 Python/FastAPI + Milvus + Docling HybridChunker 主链路。真实 MySQL/Milvus/Docling/LiteLLM 联合验收与 B0-B3 模型消融仍应在独立 evaluation 环境执行；在生成并核对真实运行报告前，不应把静态追踪或测试通过表述成真实模型效果已经验证。
 
 ## 资料组织
 
