@@ -415,6 +415,8 @@ class QaService:
         trusted_config_id: Optional[str] = None,
         trusted_evaluation_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         question = str(body.get("question", "")).strip()
         if not question:
             raise ApiException(400, "INVALID_INPUT", "提问内容不能为空")
@@ -458,9 +460,30 @@ class QaService:
             ).first()
             if not seg:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "会话无上下文分段")
+            requested_segment_id = str(body.get("segmentId") or "").strip()
+            if not requested_segment_id:
+                raise ApiException(400, "INVALID_INPUT", "segmentId 必填")
+            if requested_segment_id != str(seg.id):
+                raise ApiException(409, "VERSION_CONFLICT", "上下文范围已改变")
+
+            # Serialize submissions for the same user, matching the Java
+            # pessimistic-lock contract before allocating turn numbers.
+            user_row = conn.execute(
+                select(app_user_table.c.id)
+                .where(
+                    and_(
+                        app_user_table.c.tenant_id == actor.tenant_id,
+                        app_user_table.c.id == actor.user_id,
+                        app_user_table.c.status == "ACTIVE",
+                    )
+                )
+                .with_for_update()
+            ).first()
+            if not user_row:
+                raise ApiException(403, "OPERATION_FORBIDDEN", "用户不可用")
 
             # 3. Idempotency check
-            scoped_key = f"{actor.user_id}:{idempotency_key}" if idempotency_key else None
+            scoped_key = f"{actor.user_id}:{idempotency_key}"
             req_hash = hashlib.sha256(f"{conv_id}:{seg.id}:{question}:{mode}:{strict_mode}".encode("utf-8")).digest()
 
             if scoped_key:
@@ -482,18 +505,18 @@ class QaService:
                         "pollAfterMs": 1000,
                     }
 
-            # 4. Check concurrency: only one active run per conversation
+            # 4. Preserve the Java contract: one active online run per user.
             active_run = conn.execute(
                 select(qa_run_table.c.id).where(
                     and_(
                         qa_run_table.c.tenant_id == actor.tenant_id,
-                        qa_run_table.c.conversation_id == conv_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                        qa_run_table.c.owner_id == actor.user_id,
+                        qa_run_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
                     )
                 )
             ).first()
             if active_run:
-                raise ApiException(409, "CONCURRENT_RUN", "当前会话已有正在执行的问答任务")
+                raise ApiException(409, "ACTIVE_RUN_EXISTS", "已有活动请求")
 
             # 5. Insert new run
             run_id = str(uuid.uuid4())
@@ -533,7 +556,7 @@ class QaService:
                     strict_mode=strict_mode,
                     status="QUEUED",
                     stage="ROUTING",
-                    idempotency_key=scoped_key or run_id,
+                    idempotency_key=scoped_key,
                     request_hash=req_hash,
                     question=question,
                     result_json=None,
