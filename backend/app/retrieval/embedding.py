@@ -44,6 +44,8 @@ def get_embeddings(
     dim: int = 1024,
     batch_size: int | None = None,
     tenant_id: str | None = None,
+    run_id: str | None = None,
+    job_id: str | None = None,
 ) -> List[List[float]]:
     if not texts:
         return []
@@ -74,6 +76,11 @@ def get_embeddings(
                 output_upper_bound=0,
             )
             try:
+                from app.qa.model_gateway import ModelGateway
+                ModelGateway.assert_run_sources_current(
+                    tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                    run_id,
+                )
                 sent = True
                 resp = client.post(
                     endpoint,
@@ -93,12 +100,13 @@ def get_embeddings(
                 ModelGateway._record_call(
                     tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                     call_id=call_id,
-                    run_id=None,
+                    run_id=run_id,
                     purpose="EMBEDDING",
                     status="FAILED" if sent else "NOT_SENT",
                     input_tokens=0,
                     output_tokens=0,
                     model_alias="embedding-main",
+                    job_id=job_id,
                 )
                 recorded = True
                 raise
@@ -141,12 +149,13 @@ def get_embeddings(
             ModelGateway._record_call(
                 tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                 call_id=call_id,
-                run_id=None,
+                run_id=run_id,
                 purpose="EMBEDDING",
                 status="SUCCESS",
                 input_tokens=input_tokens,
                 output_tokens=0,
                 model_alias="embedding-main",
+                job_id=job_id,
             )
             recorded = True
 
@@ -158,12 +167,13 @@ def get_embeddings(
                 ModelGateway._record_call(
                     tenant_id=tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
                     call_id=call_id,
-                    run_id=None,
+                    run_id=run_id,
                     purpose="EMBEDDING",
                     status="FAILED" if ("sent" in locals() and sent) else "NOT_SENT",
                     input_tokens=0,
                     output_tokens=0,
                     model_alias="embedding-main",
+                    job_id=job_id,
                 )
             except Exception:
                 logger.exception("Failed to reconcile embedding budget after validation error")
