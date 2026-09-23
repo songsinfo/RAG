@@ -190,12 +190,13 @@ class ModelGateway:
                 policy = AgentRuntimePolicy.from_env()
 
                 def invoke_primary():
+                    nonlocal sent
                     cls.assert_run_sources_current(tenant_id, run_id)
                     cls.assert_job_current(tenant_id, job_id)
+                    sent = True
                     return llm.invoke(lc_messages)
 
                 try:
-                    sent = True
                     response = retry_call(
                         f"llm:{model_alias}",
                         invoke_primary,
@@ -211,8 +212,10 @@ class ModelGateway:
                         raise
 
                     def invoke_fallback():
+                        nonlocal sent
                         cls.assert_run_sources_current(tenant_id, run_id)
                         cls.assert_job_current(tenant_id, job_id)
+                        sent = True
                         return fallback.invoke(lc_messages)
 
                     response = retry_call(
@@ -441,12 +444,13 @@ class ModelGateway:
                 policy = AgentRuntimePolicy.from_env()
 
                 def invoke_primary_tools():
+                    nonlocal sent
                     cls.assert_run_sources_current(tenant_id, run_id)
                     cls.assert_job_current(tenant_id, job_id)
+                    sent = True
                     return llm.invoke(lc_messages)
 
                 try:
-                    sent = True
                     response = retry_call(
                         f"llm-tools:{model_alias}",
                         invoke_primary_tools,
@@ -463,8 +467,10 @@ class ModelGateway:
                     fallback_bound = fallback_model.bind_tools(tools, strict=True)
 
                     def invoke_fallback_tools():
+                        nonlocal sent
                         cls.assert_run_sources_current(tenant_id, run_id)
                         cls.assert_job_current(tenant_id, job_id)
+                        sent = True
                         return fallback_bound.invoke(lc_messages)
 
                     response = retry_call(
