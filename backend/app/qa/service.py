@@ -420,8 +420,8 @@ class QaService:
         if not idempotency_key or len(idempotency_key) > 128:
             raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         question = str(body.get("question", "")).strip()
-        if not question:
-            raise ApiException(400, "INVALID_INPUT", "提问内容不能为空")
+        if not question or len(question) > 2000:
+            raise ApiException(400, "INVALID_INPUT", "提问内容不能为空且最多2000字符")
         validate_input(question)
 
         mode = body.get("mode", "RAG")
