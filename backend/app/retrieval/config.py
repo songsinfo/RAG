@@ -134,7 +134,7 @@ class RetrievalConfig:
                 True,
             ),
             parent_expansion_enabled=_as_bool(parent.get("enabled", post.get("parent")), True),
-            parent_max_chars=_bounded_int(parent.get("maxChars"), 6000, 500, 20000),
+            parent_max_chars=_bounded_int(parent.get("maxChars"), context_max_bytes, 500, 20000),
             rewrite_enabled=_as_bool(query_cfg.get("rewrite"), False),
             allow_rewrite_fallback=_as_bool(query_cfg.get("allowRewriteFallback"), True),
             multi_query_enabled=_as_bool(query_cfg.get("multiQuery"), False),
