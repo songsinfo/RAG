@@ -78,6 +78,7 @@ def test_client_cannot_override_retrieval_config():
             conv["conversationId"],
             {
                 "question": "系统如何检索？",
+                "segmentId": conv["currentSegmentId"],
                 "mode": "RAG",
                 "configId": "cfg-attacker-selected",
             },
@@ -537,7 +538,7 @@ def test_model_send_gate_rejects_revoked_history_source():
     run = QaService.submit_run(
         ACTOR,
         conv["conversationId"],
-        {"question": "first", "mode": "RAG"},
+        {"question": "first", "segmentId": conv["currentSegmentId"], "mode": "RAG"},
         idempotency_key="history-acl-run",
     )
     now = datetime.now(timezone.utc)
