@@ -1,6 +1,8 @@
+import hmac
 import json
+import os
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status, Response
+from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status, Response, Request
 from pydantic import BaseModel
 
 from app.identity.deps import Actor, get_current_actor, require_admin
@@ -238,6 +240,27 @@ async def import_wiki_package(
         )
     return results
 
+
+
+
+@router.post("/internal/deletions")
+def receive_internal_deletion(
+    body: Dict[str, Any],
+    request: Request,
+):
+    token = os.getenv("RAG_DELETION_API_TOKEN", "")
+    supplied = request.headers.get("Authorization", "")
+    if (
+        len(token) < 32
+        or request.headers.get("Origin") is not None
+        or not hmac.compare_digest(supplied, f"Bearer {token}")
+    ):
+        raise ApiException(403, "OPERATION_FORBIDDEN", "内部服务身份无效")
+    return KnowledgeService.receive_deletion(
+        str(body.get("originSystem") or ""),
+        str(body.get("originTenantId") or ""),
+        str(body.get("originDocumentId") or ""),
+    )
 
 # Job polling endpoints
 @router.get("/admin/jobs")
