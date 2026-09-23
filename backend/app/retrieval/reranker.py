@@ -28,7 +28,15 @@ def rerank_hits(
             job_id=job_id,
         )
     except ApiException as exc:
-        if not fail_open:
+        fallback_codes = {
+            "RERANK_UNAVAILABLE",
+            "MODEL_GATEWAY_UNAVAILABLE",
+            "MODEL_TIMEOUT",
+            "MODEL_PROVIDER_ERROR",
+            "MODEL_RETRYABLE",
+            "INVALID_MODEL_OUTPUT",
+        }
+        if not fail_open or exc.code not in fallback_codes:
             raise
         return hits[:top_k], [f"RERANK_FALLBACK:{exc.code}"]
 
