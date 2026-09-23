@@ -27,6 +27,7 @@ class RetrievalPipeline:
         document_ids: Optional[List[str]] = None,
         config_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
         limit_override: Optional[int] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
@@ -77,6 +78,7 @@ class RetrievalPipeline:
             history=history or [],
             cfg=cfg,
             run_id=run_id,
+            job_id=job_id,
             warnings=warnings,
         )
 
@@ -96,6 +98,7 @@ class RetrievalPipeline:
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
                     run_id=run_id,
+                    job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
             )
@@ -114,6 +117,7 @@ class RetrievalPipeline:
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
                     run_id=run_id,
+                    job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
             )
@@ -138,6 +142,7 @@ class RetrievalPipeline:
                 tenant_id=actor.tenant_id,
                 run_id=run_id,
                 query=independent_query,
+                job_id=job_id,
                 hits=hits,
                 model_alias=cfg.rerank_model,
                 top_k=cfg.rerank_top_k,
@@ -146,7 +151,15 @@ class RetrievalPipeline:
             warnings.extend(rerank_warnings)
 
         if cfg.mmr_enabled and hits:
-            hits = cls._mmr_select(actor.tenant_id, independent_query, hits, cfg.final_top_k, cfg.mmr_lambda, run_id=run_id)
+            hits = cls._mmr_select(
+                actor.tenant_id,
+                independent_query,
+                hits,
+                cfg.final_top_k,
+                cfg.mmr_lambda,
+                run_id=run_id,
+                job_id=job_id,
+            )
 
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
@@ -227,6 +240,7 @@ class RetrievalPipeline:
         history: List[Dict[str, str]],
         cfg: RetrievalConfig,
         run_id: Optional[str],
+        job_id: Optional[str],
         warnings: List[str],
     ) -> Tuple[str, List[str], Optional[str]]:
         independent = query.strip()
@@ -249,6 +263,7 @@ class RetrievalPipeline:
                     messages,
                     max_tokens=300,
                     model_alias="chat-main",
+                    job_id=job_id,
                 )
                 parsed = json.loads(raw)
                 rewritten = str(parsed.get("query", "")).strip()
@@ -276,6 +291,7 @@ class RetrievalPipeline:
                     ],
                     max_tokens=400,
                     model_alias="chat-main",
+                    job_id=job_id,
                 )
                 parsed = json.loads(raw)
                 queries = parsed.get("queries", [])
@@ -305,6 +321,7 @@ class RetrievalPipeline:
                     ],
                     max_tokens=300,
                     model_alias="chat-main",
+                    job_id=job_id,
                 ).strip()
                 if not hyde_text:
                     hyde_text = None
@@ -322,11 +339,18 @@ class RetrievalPipeline:
         count: int,
         lambda_value: float,
         run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if len(hits) <= 1:
             return hits[:count]
         texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
-        vectors = get_embeddings([query] + texts, dim=1024, tenant_id=tenant_id, run_id=run_id)
+        vectors = get_embeddings(
+            [query] + texts,
+            dim=1024,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            job_id=job_id,
+        )
         query_vector = vectors[0]
         doc_vectors = vectors[1:]
 
