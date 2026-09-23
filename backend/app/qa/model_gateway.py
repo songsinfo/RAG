@@ -665,7 +665,10 @@ class ModelGateway:
                         run_id=run_id,
                         job_id=job_id,
                         purpose=purpose,
-                        model_config_id=MODEL_CONFIG_IDS.get(model_alias, model_alias),
+                        model_config_id=(
+                            (budget.get("pricing") or {}).get("configId")
+                            or MODEL_CONFIG_IDS.get(model_alias, model_alias)
+                        ),
                         attempt_no=1,
                         status=persisted_status,
                         reserved_amount=str(budget.get("reservedAmount") or "0"),
