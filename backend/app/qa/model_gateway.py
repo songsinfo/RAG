@@ -9,7 +9,15 @@ from typing import List, Dict, Any, Optional
 from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.models import model_call_table
+from sqlalchemy import and_, select
+from app.models import (
+    model_call_table,
+    qa_run_table,
+    run_source_table,
+    document_table,
+    app_user_table,
+    tenant_table,
+)
 from app.qa.model_clients import get_chat_model, get_http_client
 from app.qa.runtime import AgentRuntimePolicy, estimate_tokens, retry_call
 from app.model_budget import BudgetService
@@ -25,6 +33,81 @@ MODEL_CONFIG_IDS = {
 
 
 class ModelGateway:
+    @staticmethod
+    def assert_run_sources_current(tenant_id: str, run_id: Optional[str]) -> None:
+        if not run_id:
+            return
+        from app.identity.deps import Actor, can_read_document
+
+        with get_db_connection() as conn:
+            run = conn.execute(
+                select(
+                    qa_run_table.c.owner_id,
+                    qa_run_table.c.status,
+                ).where(
+                    and_(
+                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.id == run_id,
+                    )
+                )
+            ).first()
+            if not run or str(run.status) not in {"QUEUED", "RUNNING", "WAITING_APPROVAL"}:
+                raise ApiException(409, "CANCELLED", "请求已停止")
+
+            user = conn.execute(
+                select(
+                    app_user_table.c.is_admin,
+                    tenant_table.c.security_epoch,
+                )
+                .select_from(
+                    app_user_table.join(
+                        tenant_table,
+                        tenant_table.c.id == app_user_table.c.tenant_id,
+                    )
+                )
+                .where(
+                    and_(
+                        app_user_table.c.tenant_id == tenant_id,
+                        app_user_table.c.id == run.owner_id,
+                        app_user_table.c.status == "ACTIVE",
+                    )
+                )
+            ).first()
+            if not user:
+                raise ApiException(409, "SOURCE_CHANGED", "问答用户已失效")
+            actor = Actor(
+                tenant_id=tenant_id,
+                user_id=str(run.owner_id),
+                admin=bool(user.is_admin),
+                security_epoch=int(user.security_epoch or 0),
+            )
+            sources = conn.execute(
+                select(
+                    run_source_table.c.document_id,
+                    run_source_table.c.build_id,
+                )
+                .where(
+                    and_(
+                        run_source_table.c.tenant_id == tenant_id,
+                        run_source_table.c.run_id == run_id,
+                    )
+                )
+                .distinct()
+            ).fetchall()
+            for source in sources:
+                if not can_read_document(conn, actor, str(source.document_id)):
+                    raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
+                current = conn.execute(
+                    select(document_table.c.active_build_id).where(
+                        and_(
+                            document_table.c.tenant_id == tenant_id,
+                            document_table.c.id == source.document_id,
+                        )
+                    )
+                ).first()
+                if not current or str(current.active_build_id or "") != str(source.build_id):
+                    raise ApiException(409, "SOURCE_CHANGED", "来源版本已变化，请重新提问")
+
     @classmethod
     def chat(
         cls,
@@ -35,6 +118,7 @@ class ModelGateway:
         max_tokens: int = 2400,
         model_alias: str = "chat-main",
         deadline_epoch: Optional[float] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         gateway_url = os.getenv("LITELLM_BASE_URL")
         master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
@@ -78,6 +162,7 @@ class ModelGateway:
 
                 policy = AgentRuntimePolicy.from_env()
                 try:
+                    cls.assert_run_sources_current(tenant_id, run_id)
                     sent = True
                     response = retry_call(
                         f"llm:{model_alias}",
@@ -237,6 +322,7 @@ class ModelGateway:
         max_tokens: int = 1200,
         model_alias: str = "chat-main",
         deadline_epoch: Optional[float] = None,
+        job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         call_id = str(uuid.uuid4())
         start_time = time.time()
@@ -310,6 +396,7 @@ class ModelGateway:
 
                 policy = AgentRuntimePolicy.from_env()
                 try:
+                    cls.assert_run_sources_current(tenant_id, run_id)
                     sent = True
                     response = retry_call(
                         f"llm-tools:{model_alias}",
@@ -426,6 +513,7 @@ class ModelGateway:
         documents: List[str],
         top_n: int,
         model_alias: str = "rerank-main",
+        job_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not documents:
             return []
@@ -447,6 +535,7 @@ class ModelGateway:
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
             sent = False
             try:
+                cls.assert_run_sources_current(tenant_id, run_id)
                 sent = True
                 response = get_http_client().post(
                     endpoint,
@@ -550,6 +639,7 @@ class ModelGateway:
         input_tokens: int,
         output_tokens: int,
         model_alias: str,
+        job_id: Optional[str] = None,
     ):
         try:
             now = datetime.now(timezone.utc)
@@ -568,7 +658,7 @@ class ModelGateway:
                         tenant_id=tenant_id,
                         id=call_id,
                         run_id=run_id,
-                        job_id=None,
+                        job_id=job_id,
                         purpose=purpose,
                         model_config_id=MODEL_CONFIG_IDS.get(model_alias, model_alias),
                         attempt_no=1,
