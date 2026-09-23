@@ -85,6 +85,7 @@ class ModelGateway:
                 select(
                     run_source_table.c.document_id,
                     run_source_table.c.build_id,
+                    run_source_table.c.purpose,
                 )
                 .where(
                     and_(
@@ -97,16 +98,17 @@ class ModelGateway:
             for source in sources:
                 if not can_read_document(conn, actor, str(source.document_id)):
                     raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
-                current = conn.execute(
-                    select(document_table.c.active_build_id).where(
-                        and_(
-                            document_table.c.tenant_id == tenant_id,
-                            document_table.c.id == source.document_id,
+                if str(source.purpose) != "HISTORY":
+                    current = conn.execute(
+                        select(document_table.c.active_build_id).where(
+                            and_(
+                                document_table.c.tenant_id == tenant_id,
+                                document_table.c.id == source.document_id,
+                            )
                         )
-                    )
-                ).first()
-                if not current or str(current.active_build_id or "") != str(source.build_id):
-                    raise ApiException(409, "SOURCE_CHANGED", "来源版本已变化，请重新提问")
+                    ).first()
+                    if not current or str(current.active_build_id or "") != str(source.build_id):
+                        raise ApiException(409, "SOURCE_CHANGED", "来源版本已变化，请重新提问")
 
     @classmethod
     def chat(
