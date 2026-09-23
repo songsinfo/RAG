@@ -318,7 +318,7 @@ def test_agent_repeated_calls_termination(client):
             headers={"X-CSRF-Token": csrf},
         )
         conv_id = conv_resp.json()["conversationId"]
-    segment_id = conv_resp.json()["currentSegmentId"]
+        segment_id = conv_resp.json()["currentSegmentId"]
 
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
