@@ -1753,7 +1753,9 @@ class KnowledgeService:
 
     @staticmethod
     def get_artifact(actor: Actor, doc_id: str, artifact_id: str) -> bytes:
-        if not can_read_document(actor, doc_id):
+        with get_db_connection() as conn:
+            readable = can_read_document(conn, actor, doc_id)
+        if not readable:
             raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
         with get_db_connection() as conn:
             row = conn.execute(
@@ -1792,7 +1794,7 @@ class KnowledgeService:
             ).first()
             if not build:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "构建不存在")
-            if not can_read_document(actor, str(build.document_id)):
+            if not can_read_document(conn, actor, str(build.document_id)):
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "构建不存在")
             if str(build.status) != "NEEDS_REVIEW":
                 raise ApiException(409, "INVALID_STATE", "构建不在待审查状态")
