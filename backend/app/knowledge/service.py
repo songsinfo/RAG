@@ -1012,6 +1012,7 @@ class KnowledgeService:
                             ],
                             max_tokens=1024,
                             model_alias="chat-main",
+                            job_id=job_id,
                         )
                         try:
                             summary_obj = json.loads(raw_summary)
@@ -1036,6 +1037,7 @@ class KnowledgeService:
                             ],
                             max_tokens=1024,
                             model_alias="chat-main",
+                            job_id=job_id,
                         )
                         try:
                             question_obj = json.loads(raw_questions)
@@ -1068,6 +1070,7 @@ class KnowledgeService:
                     [item["text_content"] for item in representation_items],
                     dim=1024,
                     tenant_id=tenant_id,
+                    job_id=job_id,
                 )
                 now = datetime.now(timezone.utc)
                 rep_rows = []
