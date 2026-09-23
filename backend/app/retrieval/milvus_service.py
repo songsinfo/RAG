@@ -608,6 +608,23 @@ class MilvusHybridService:
                         )
                     representation_map.setdefault(str(rep.chunk_id), []).append(item)
 
+                if chunk_dicts and not representation_map:
+                    raise ApiException(
+                        409,
+                        "INDEX_REBUILD_REQUIRES_REINGEST",
+                        "活动构建缺少持久化 representation，不能在无作业 owner 的重建流程中重新调用 Embedding；请重新入库",
+                    )
+                if any(
+                    not rep.get("dense_vector")
+                    for reps in representation_map.values()
+                    for rep in reps
+                ):
+                    raise ApiException(
+                        409,
+                        "INDEX_REBUILD_REQUIRES_REINGEST",
+                        "活动构建 representation 缺少持久化向量，请重新入库",
+                    )
+
                 cls.upsert_chunks(
                     tenant_id=tenant_id,
                     build_id=str(b.active_build_id),
