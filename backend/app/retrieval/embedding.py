@@ -78,10 +78,9 @@ def get_embeddings(
             )
             try:
                 from app.qa.model_gateway import ModelGateway
-                ModelGateway.assert_run_sources_current(
-                    tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
-                    run_id,
-                )
+                effective_tenant = tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1")
+                ModelGateway.assert_run_sources_current(effective_tenant, run_id)
+                ModelGateway.assert_job_current(effective_tenant, job_id)
                 sent = True
                 resp = client.post(
                     endpoint,
