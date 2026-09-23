@@ -53,6 +53,9 @@ class RetrievalConfig:
     mmr_enabled: bool = False
     mmr_lambda: float = 0.7
     representations: Tuple[str, ...] = ("ORIGINAL",)
+    max_variants: int = 4
+    num_candidates: int = 200
+    context_max_bytes: int = 6000
 
     @classmethod
     def from_payload(cls, config_id: str, payload: Optional[Dict[str, Any]]) -> "RetrievalConfig":
@@ -62,17 +65,24 @@ class RetrievalConfig:
         parent = root.get("parentExpansion") if isinstance(root.get("parentExpansion"), dict) else {}
         query_cfg = root.get("query") if isinstance(root.get("query"), dict) else {}
         post = root.get("post") if isinstance(root.get("post"), dict) else {}
+        fusion = root.get("fusion") if isinstance(root.get("fusion"), dict) else {}
+        context = root.get("context") if isinstance(root.get("context"), dict) else {}
 
         raw_mode = str(retrieval.get("mode") or "HYBRID").strip().upper()
         mode = "BM25" if raw_mode in {"SPARSE", "LEXICAL"} else raw_mode
 
         legacy_top_k = _bounded_int(retrieval.get("topK"), 10, 1, 100)
-        dense_default = 0 if mode == "BM25" else max(legacy_top_k * 2, 10)
-        sparse_default = 0 if mode == "DENSE" else max(legacy_top_k * 2, 10)
+        per_route_k = _bounded_int(retrieval.get("perRouteK"), max(legacy_top_k * 2, 10), 1, 100)
+        dense_default = 0 if mode == "BM25" else per_route_k
+        sparse_default = 0 if mode == "DENSE" else per_route_k
         dense_top_k = _bounded_int(retrieval.get("denseTopK"), dense_default, 0, 200)
         sparse_top_k = _bounded_int(retrieval.get("sparseTopK"), sparse_default, 0, 200)
-        fusion_top_k = _bounded_int(retrieval.get("fusionTopK"), legacy_top_k, 1, 100)
-        final_top_k = _bounded_int(retrieval.get("finalTopK"), min(legacy_top_k, 8), 1, 50)
+        fusion_top_k = _bounded_int(retrieval.get("fusionTopK"), max(legacy_top_k, min(per_route_k, 30)), 1, 100)
+        final_default = _bounded_int(context.get("maxUnits"), min(legacy_top_k, 8), 1, 20)
+        final_top_k = _bounded_int(retrieval.get("finalTopK"), final_default, 1, 50)
+        num_candidates = _bounded_int(retrieval.get("numCandidates"), max(per_route_k, 200), per_route_k, 1000)
+        max_variants = _bounded_int(query_cfg.get("maxVariants"), 4, 1, 4)
+        context_max_bytes = _bounded_int(context.get("maxTokens"), 6000, 100, 12000)
 
         rrf_block = retrieval.get("rrf") if isinstance(retrieval.get("rrf"), dict) else {}
         if not rrf_block and isinstance(root.get("rrf"), dict):
@@ -82,7 +92,7 @@ class RetrievalConfig:
             mode == "HYBRID",
         )
         rrf_k = _bounded_int(
-            rrf_block.get("k", retrieval.get("rrfK")),
+            rrf_block.get("k", fusion.get("rrfK", retrieval.get("rrfK"))),
             60,
             1,
             500,
@@ -111,10 +121,18 @@ class RetrievalConfig:
             rrf_enabled=rrf_enabled,
             rrf_k=rrf_k,
             final_top_k=final_top_k,
-            rerank_enabled=_as_bool(rerank.get("enabled"), False),
-            rerank_top_k=_bounded_int(rerank.get("topK"), min(fusion_top_k, 10), 1, 50),
+            rerank_enabled=_as_bool(rerank.get("enabled", post.get("rerank")), False),
+            rerank_top_k=_bounded_int(
+                rerank.get("topK", post.get("rerankTopN")),
+                min(fusion_top_k, 10),
+                1,
+                50,
+            ),
             rerank_model=str(rerank.get("model") or "rerank-main"),
-            rerank_fail_open=_as_bool(rerank.get("failOpen"), True),
+            rerank_fail_open=_as_bool(
+                rerank.get("failOpen", post.get("allowRerankFallback")),
+                True,
+            ),
             parent_expansion_enabled=_as_bool(parent.get("enabled", post.get("parent")), True),
             parent_max_chars=_bounded_int(parent.get("maxChars"), 6000, 500, 20000),
             rewrite_enabled=_as_bool(query_cfg.get("rewrite"), False),
@@ -124,6 +142,9 @@ class RetrievalConfig:
             mmr_enabled=_as_bool(post.get("mmr"), False),
             mmr_lambda=mmr_lambda,
             representations=representations,
+            max_variants=max_variants,
+            num_candidates=num_candidates,
+            context_max_bytes=context_max_bytes,
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -152,6 +173,8 @@ def _validate_config(config: RetrievalConfig, status_code: int = 400) -> Retriev
         raise ApiException(status_code, "INVALID_CONFIG", "MMR lambda 必须在 0 到 1 之间")
     if not config.representations or not set(config.representations).issubset({"ORIGINAL", "SUMMARY", "QUESTION"}):
         raise ApiException(status_code, "INVALID_CONFIG", "representations 配置无效")
+    if config.num_candidates < max(config.dense_top_k, config.sparse_top_k):
+        raise ApiException(status_code, "INVALID_CONFIG", "numCandidates 不能小于单路召回数量")
     return config
 
 
