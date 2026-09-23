@@ -260,6 +260,7 @@ class MilvusHybridService:
         allowed_build_epochs: Optional[Dict[str, int]] = None,
         representations: Optional[List[str]] = None,
         run_id: Optional[str] = None,
+        num_candidates: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
@@ -282,6 +283,10 @@ class MilvusHybridService:
         dense_top_k = 0 if dense_top_k is None and mode == "BM25" else (dense_top_k if dense_top_k is not None else 30)
         sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
         fusion_top_k = fusion_top_k or 20
+        num_candidates = max(
+            max(dense_top_k, sparse_top_k, 1),
+            min(1000, int(num_candidates or 200)),
+        )
 
         representations = [str(value).upper() for value in (representations or ["ORIGINAL"])]
         if not representations or not set(representations).issubset({"ORIGINAL", "SUMMARY", "QUESTION"}):
@@ -359,7 +364,7 @@ class MilvusHybridService:
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
                         anns_field="dense_vector",
-                        search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                        search_params={"metric_type": "COSINE", "params": {"ef": num_candidates}},
                         limit=max(1, dense_top_k * max(1, len(representations))),
                         filter=filter_expr,
                         output_fields=output_fields,
@@ -392,7 +397,7 @@ class MilvusHybridService:
                     collection_name=COLLECTION_NAME,
                     data=[query_emb],
                     anns_field="dense_vector",
-                    search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                    search_params={"metric_type": "COSINE", "params": {"ef": num_candidates}},
                     limit=max(1, dense_top_k * candidate_multiplier),
                     filter=filter_expr,
                     output_fields=output_fields,
