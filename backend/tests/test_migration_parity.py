@@ -25,6 +25,7 @@ from app.models import (
     chunk_table,
     model_call_table,
     job_table,
+    budget_reservation_table,
     config_revision_table,
     qa_run_table,
     run_source_table,
@@ -682,3 +683,45 @@ def test_model_gateway_rejects_cancelled_background_job():
     with pytest.raises(ApiException) as exc:
         ModelGateway.assert_job_current(ACTOR.tenant_id, job_id)
     assert exc.value.code == "CANCELLED"
+
+
+def test_direct_evaluation_job_reservation_uses_batch_owner():
+    now = datetime.now(timezone.utc)
+    job_id = "job-eval-budget-owner"
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=job_id,
+                kind="EVALUATE",
+                target_id="eval-budget-owner",
+                requested_by=ACTOR.user_id,
+                idempotency_key="eval-budget-owner-key",
+                request_hash=b"eval-budget-owner",
+                status="RUNNING",
+                stage="EVALUATING",
+                attempt=0,
+                available_at=now,
+                lease_epoch=1,
+                checkpoint={"maxCostCny": 10, "maxModelCalls": 100},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    result = BudgetService.reserve(
+        ACTOR.tenant_id,
+        "call-eval-budget-owner",
+        "chat-main",
+        100,
+        100,
+        job_id=job_id,
+    )
+    assert result["status"] == "RESERVED"
+    with app_db.engine.begin() as conn:
+        row = conn.execute(
+            select(budget_reservation_table.c.caller_environment).where(
+                budget_reservation_table.c.caller_call_id == "call-eval-budget-owner"
+            )
+        ).first()
+    assert row is not None
+    assert str(row.caller_environment).endswith("|eval:" + job_id)
