@@ -95,6 +95,8 @@ class MilvusHybridService:
         version_id: str,
         index_epoch: Optional[int] = None,
         representations: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ):
         if not chunks:
             return
@@ -134,6 +136,9 @@ class MilvusHybridService:
                     [batch[i]["text_content"] for i in missing_indexes],
                     dim=1024,
                     batch_size=batch_size,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    job_id=job_id,
                 )
             generated_by_index = {
                 idx: vector for idx, vector in zip(missing_indexes, generated)
@@ -254,6 +259,7 @@ class MilvusHybridService:
         rrf_k: int = 60,
         allowed_build_epochs: Optional[Dict[str, int]] = None,
         representations: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
@@ -348,13 +354,13 @@ class MilvusHybridService:
                     )
 
                 if mode == "DENSE":
-                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
+                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id, run_id=run_id)[0]
                     res = client.search(
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
                         anns_field="dense_vector",
                         search_params={"metric_type": "COSINE", "params": {"ef": 64}},
-                        limit=max(1, dense_top_k),
+                        limit=max(1, dense_top_k * max(1, len(representations))),
                         filter=filter_expr,
                         output_fields=output_fields,
                     )
@@ -366,35 +372,47 @@ class MilvusHybridService:
                         data=[query],
                         anns_field="sparse_vector",
                         search_params={"metric_type": "BM25"},
-                        limit=max(1, sparse_top_k),
+                        limit=max(1, sparse_top_k * max(1, len(representations))),
                         filter=filter_expr,
                         output_fields=output_fields,
                     )
                     return normalize_result(res)[:fusion_top_k]
 
-                query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
-                dense_req = AnnSearchRequest(
+                # Fuse at canonical chunk level. Milvus-level hybrid RRF would
+                # treat ORIGINAL/SUMMARY/QUESTION as independent documents and let
+                # one chunk vote multiple times before deduplication.
+                candidate_multiplier = max(1, len(representations))
+                query_emb = get_embeddings(
+                    [query],
+                    dim=1024,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                )[0]
+                dense_res = client.search(
+                    collection_name=COLLECTION_NAME,
                     data=[query_emb],
                     anns_field="dense_vector",
-                    param={"metric_type": "COSINE", "params": {"ef": 64}},
-                    limit=max(1, dense_top_k),
-                    expr=filter_expr,
-                )
-                sparse_req = AnnSearchRequest(
-                    data=[query],
-                    anns_field="sparse_vector",
-                    param={"metric_type": "BM25"},
-                    limit=max(1, sparse_top_k),
-                    expr=filter_expr,
-                )
-                res = client.hybrid_search(
-                    collection_name=COLLECTION_NAME,
-                    reqs=[dense_req, sparse_req],
-                    ranker=RRFRanker(k=rrf_k),
-                    limit=fusion_top_k,
+                    search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                    limit=max(1, dense_top_k * candidate_multiplier),
+                    filter=filter_expr,
                     output_fields=output_fields,
                 )
-                return normalize_result(res)
+                sparse_res = client.search(
+                    collection_name=COLLECTION_NAME,
+                    data=[query],
+                    anns_field="sparse_vector",
+                    search_params={"metric_type": "BM25"},
+                    limit=max(1, sparse_top_k * candidate_multiplier),
+                    filter=filter_expr,
+                    output_fields=output_fields,
+                )
+                dense_hits = normalize_result(dense_res)[:dense_top_k]
+                sparse_hits = normalize_result(sparse_res)[:sparse_top_k]
+                return rrf_fuse(
+                    [dense_hits, sparse_hits],
+                    weights=[0.5, 0.5],
+                    rrf_k=rrf_k,
+                )[:fusion_top_k]
             except ApiException:
                 raise
             except Exception as e:
@@ -443,7 +461,7 @@ class MilvusHybridService:
             bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
         if mode in {"DENSE", "HYBRID"}:
-            query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
+            query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id, run_id=run_id)[0]
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
