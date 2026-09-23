@@ -121,10 +121,11 @@ def test_feedback_lifecycle(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "如何保证问答质量？", "mode": "RAG"},
+        json={"question": "如何保证问答质量？", "segmentId": segment_id, "mode": "RAG"},
         headers={"X-CSRF-Token": csrf},
     )
     run_id = run_resp.json()["runId"]
@@ -335,10 +336,11 @@ def test_revocation_desensitization(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "Apollo 项目什么时候发布？", "mode": "RAG"},
+        json={"question": "Apollo 项目什么时候发布？", "segmentId": segment_id, "mode": "RAG"},
         headers={"X-CSRF-Token": csrf},
     )
     run_id = run_resp.json()["runId"]
