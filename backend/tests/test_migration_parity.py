@@ -838,7 +838,6 @@ def test_pre_dispatch_job_gate_releases_as_not_sent(monkeypatch):
             raise AssertionError("provider must not be invoked after cancellation")
 
     statuses = []
-    monkeypatch.setenv("LITELM_BASE_URL", "http://gateway.invalid")
     monkeypatch.setenv("LITELLM_BASE_URL", "http://gateway.invalid")
     monkeypatch.setattr("app.qa.model_gateway.get_chat_model", lambda *args, **kwargs: NeverInvoke())
     monkeypatch.setattr(
