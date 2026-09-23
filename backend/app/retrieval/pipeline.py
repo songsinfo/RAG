@@ -285,69 +285,78 @@ class RetrievalPipeline:
                     model_alias="chat-main",
                     job_id=job_id,
                 )
-                parsed = json.loads(raw)
+                try:
+                    parsed = json.loads(raw)
+                except Exception as exc:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Query Rewrite 未返回合法 JSON") from exc
                 rewritten = str(parsed.get("query", "")).strip()
-                if not rewritten:
-                    raise ValueError("empty rewritten query")
+                if not rewritten or len(rewritten) > 2000:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Query Rewrite 返回内容无效")
                 independent = rewritten
-            except Exception:
-                if not cfg.allow_rewrite_fallback:
+            except ApiException as exc:
+                fallback_codes = {
+                    "MODEL_GATEWAY_UNAVAILABLE",
+                    "MODEL_TIMEOUT",
+                    "MODEL_PROVIDER_ERROR",
+                    "MODEL_RETRYABLE",
+                    "INVALID_MODEL_OUTPUT",
+                }
+                if not cfg.allow_rewrite_fallback or exc.code not in fallback_codes:
                     raise
                 warnings.append("REWRITE_SKIPPED")
 
         variants = [independent]
         if cfg.multi_query_enabled:
+            raw = ModelGateway.chat(
+                actor.tenant_id,
+                run_id,
+                "MULTI_QUERY",
+                [
+                    {
+                        "role": "system",
+                        "content": "为检索生成最多两个不改变约束条件的等价问法。只输出 JSON {\"queries\":[\"...\"]}。",
+                    },
+                    {"role": "user", "content": independent},
+                ],
+                max_tokens=400,
+                model_alias="chat-main",
+                job_id=job_id,
+            )
             try:
-                raw = ModelGateway.chat(
-                    actor.tenant_id,
-                    run_id,
-                    "MULTI_QUERY",
-                    [
-                        {
-                            "role": "system",
-                            "content": "为检索生成最多两个不改变约束条件的等价问法。只输出 JSON {\"queries\":[\"...\"]}。",
-                        },
-                        {"role": "user", "content": independent},
-                    ],
-                    max_tokens=400,
-                    model_alias="chat-main",
-                    job_id=job_id,
-                )
                 parsed = json.loads(raw)
-                queries = parsed.get("queries", [])
-                if isinstance(queries, list):
-                    for item in queries:
-                        value = str(item).strip()
-                        if value and value not in variants:
-                            variants.append(value)
-                        if len(variants) >= cfg.max_variants:
-                            break
-            except Exception:
-                warnings.append("MULTI_QUERY_SKIPPED")
+            except Exception as exc:
+                raise ApiException(502, "INVALID_MODEL_OUTPUT", "Multi-Query 未返回合法 JSON") from exc
+            queries = parsed.get("queries")
+            if not isinstance(queries, list) or len(queries) > 2:
+                raise ApiException(502, "INVALID_MODEL_OUTPUT", "Multi-Query 返回数量无效")
+            for item in queries:
+                value = str(item).strip()
+                if not value or len(value) > 2000:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "Multi-Query 返回内容无效")
+                if value not in variants:
+                    variants.append(value)
+                if len(variants) >= cfg.max_variants:
+                    break
 
         hyde_text: Optional[str] = None
         if cfg.hyde_enabled:
-            try:
-                hyde_text = ModelGateway.chat(
-                    actor.tenant_id,
-                    run_id,
-                    "HYDE",
-                    [
-                        {
-                            "role": "system",
-                            "content": "生成一个不超过300 token的假想资料段落，只用于向量检索。不得声称其为事实。",
-                        },
-                        {"role": "user", "content": independent},
-                    ],
-                    max_tokens=300,
-                    model_alias="chat-main",
-                    job_id=job_id,
-                ).strip()
-                if not hyde_text:
-                    hyde_text = None
-            except Exception:
-                warnings.append("HYDE_SKIPPED")
-                hyde_text = None
+            hyde_text = ModelGateway.chat(
+                actor.tenant_id,
+                run_id,
+                "HYDE",
+                [
+                    {
+                        "role": "system",
+                        "content": "生成一个不超过300 token的假想资料段落，只用于向量检索。不得声称其为事实。",
+                    },
+                    {"role": "user", "content": independent},
+                ],
+                max_tokens=300,
+                model_alias="chat-main",
+                job_id=job_id,
+            ).strip()
+            if not hyde_text:
+                raise ApiException(502, "INVALID_MODEL_OUTPUT", "HyDE 返回内容为空")
 
         return independent, variants, hyde_text
 
