@@ -117,6 +117,23 @@ class KnowledgeService:
 
         now = datetime.now(timezone.utc)
         empty_hash = hashlib.sha256(b"").digest()
+        current_environment = os.getenv("RAG_ENVIRONMENT", "demo")
+        origin_match = (
+            or_(
+                eval_snapshot_document_table.c.origin_system == origin_system,
+                eval_snapshot_document_table.c.origin_system == "LOCAL_SYNTHETIC",
+            )
+            if origin_system == current_environment
+            else eval_snapshot_document_table.c.origin_system == origin_system
+        )
+        gold_origin_match = (
+            or_(
+                eval_gold_table.c.origin_system == origin_system,
+                eval_gold_table.c.origin_system == "LOCAL_SYNTHETIC",
+            )
+            if origin_system == current_environment
+            else eval_gold_table.c.origin_system == origin_system
+        )
         copied_documents: set[tuple[str, str]] = set()
         artifact_keys: List[str] = []
 
@@ -128,7 +145,7 @@ class KnowledgeService:
                     eval_snapshot_document_table.c.document_id,
                 ).where(
                     and_(
-                        eval_snapshot_document_table.c.origin_system == origin_system,
+                        origin_match,
                         eval_snapshot_document_table.c.origin_tenant_id == origin_tenant_id,
                         eval_snapshot_document_table.c.origin_document_id == origin_document_id,
                     )
@@ -153,7 +170,7 @@ class KnowledgeService:
                     eval_gold_table.c.case_id,
                 ).where(
                     and_(
-                        eval_gold_table.c.origin_system == origin_system,
+                        gold_origin_match,
                         eval_gold_table.c.origin_tenant_id == origin_tenant_id,
                         eval_gold_table.c.origin_document_id == origin_document_id,
                     )
