@@ -11,6 +11,7 @@ import app.db as app_db
 from app.errors import ApiException
 from app.identity.deps import Actor
 from app.knowledge.service import KnowledgeService
+from app.knowledge.chunker import adapt_docling_hybrid_chunks
 from app.knowledge.imports import create_import_preview, consume_import_preview, split_wiki_package
 from app.model_budget import BudgetService
 from app.models import (
@@ -21,8 +22,11 @@ from app.models import (
     eval_snapshot_document_table,
     eval_snapshot_table,
     chunk_table,
+    model_call_table,
+    config_revision_table,
 )
 from app.qa.service import QaService
+from app.qa.model_gateway import ModelGateway
 from app.retrieval.config import RetrievalConfig
 from app.retrieval.pipeline import RetrievalPipeline
 
@@ -370,3 +374,144 @@ def test_not_sent_budget_reservation_is_released():
     assert summary
     assert Decimal(summary[0]["reservedAmount"]) == Decimal("0")
     assert Decimal(summary[0]["settledAmount"]) == Decimal("0")
+
+
+
+def test_docling_warning_metadata_survives_adapter():
+    units, _, _ = adapt_docling_hybrid_chunks(
+        [
+            {
+                "chunk_index": 0,
+                "text": "warning text",
+                "raw_text": "warning text",
+                "num_tokens": 3,
+                "headings": ["Section"],
+                "metadata": {
+                    "doclingWarnings": [
+                        {"code": "LOW_OCR_CONFIDENCE", "detail": "page 1"}
+                    ]
+                },
+            }
+        ]
+    )
+    assert units
+    assert units[0]["location"]["metadata"]["doclingWarnings"][0]["code"] == "LOW_OCR_CONFIDENCE"
+
+
+def test_legacy_java_retrieval_config_maps_to_python_execution_fields():
+    cfg = RetrievalConfig.from_payload(
+        "legacy",
+        {
+            "query": {
+                "rewrite": True,
+                "multiQuery": True,
+                "hyde": True,
+                "maxVariants": 3,
+            },
+            "retrieval": {
+                "mode": "HYBRID",
+                "perRouteK": 40,
+                "numCandidates": 300,
+                "representations": ["ORIGINAL", "SUMMARY"],
+            },
+            "fusion": {"rrfK": 75},
+            "post": {
+                "rerank": True,
+                "rerankTopN": 20,
+                "allowRerankFallback": False,
+                "mmr": True,
+                "parent": True,
+                "lambda": 0.6,
+            },
+            "context": {"maxTokens": 5000, "maxUnits": 6},
+        },
+    )
+    assert cfg.dense_top_k == 40
+    assert cfg.sparse_top_k == 40
+    assert cfg.num_candidates == 300
+    assert cfg.rrf_k == 75
+    assert cfg.max_variants == 3
+    assert cfg.rerank_enabled is True
+    assert cfg.rerank_top_k == 20
+    assert cfg.rerank_fail_open is False
+    assert cfg.final_top_k == 6
+    assert cfg.context_max_bytes == 5000
+    assert cfg.representations == ("ORIGINAL", "SUMMARY")
+
+
+def test_model_call_can_be_owned_by_job():
+    call_id = str(uuid.uuid4())
+    ModelGateway._record_call(
+        tenant_id=ACTOR.tenant_id,
+        call_id=call_id,
+        run_id=None,
+        purpose="EMBEDDING",
+        status="SUCCESS",
+        input_tokens=10,
+        output_tokens=0,
+        model_alias="embedding-main",
+        job_id="job-test-owner",
+    )
+    with app_db.engine.connect() as conn:
+        row = conn.execute(
+            select(
+                model_call_table.c.run_id,
+                model_call_table.c.job_id,
+            ).where(model_call_table.c.id == call_id)
+        ).one()
+    assert row.run_id is None
+    assert row.job_id == "job-test-owner"
+
+
+def test_latest_published_model_pricing_overrides_seed_zero_price():
+    now = datetime.now(timezone.utc)
+    cfg_id = str(uuid.uuid4())
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            config_revision_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=cfg_id,
+                kind="MODEL",
+                name="chat-main-real-price",
+                revision=99,
+                sha256=b"p" * 32,
+                payload={
+                    "modelAlias": "chat-main",
+                    "currency": "CNY",
+                    "inputPricePerMillion": 2.5,
+                    "outputPricePerMillion": 10,
+                },
+                status="PUBLISHED",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    pricing = BudgetService.pricing(ACTOR.tenant_id, "chat-main")
+    assert pricing["configId"] == cfg_id
+    assert pricing["inputPricePerMillion"] == Decimal("2.5")
+    assert pricing["outputPricePerMillion"] == Decimal("10")
+
+
+def test_peer_deletion_requires_ack(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"acknowledged": True, "copiesPurged": 1}
+
+    class Client:
+        @staticmethod
+        def post(*args, **kwargs):
+            return Response()
+
+    monkeypatch.setenv("RAG_DELETION_PEERS", "https://eval.internal")
+    monkeypatch.setenv("RAG_DELETION_API_TOKEN", "x" * 32)
+    monkeypatch.setattr("app.knowledge.service.get_http_client", lambda: Client())
+
+    domains = KnowledgeService._propagate_deletion_to_peers(
+        "demo",
+        ACTOR.tenant_id,
+        "doc-1",
+    )
+    assert domains["peer:https://eval.internal"] == "COMPLETE"
