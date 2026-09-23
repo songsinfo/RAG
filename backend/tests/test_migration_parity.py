@@ -725,3 +725,84 @@ def test_direct_evaluation_job_reservation_uses_batch_owner():
         ).first()
     assert row is not None
     assert str(row.caller_environment).endswith("|eval:" + job_id)
+
+
+def test_fallback_model_rechecks_background_job_gate(monkeypatch):
+    now = datetime.now(timezone.utc)
+    job_id = "job-fallback-gate"
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=job_id,
+                kind="INGEST",
+                target_id="doc-fallback-gate",
+                requested_by=ACTOR.user_id,
+                idempotency_key="job-fallback-gate-key",
+                request_hash=b"job-fallback-gate",
+                status="RUNNING",
+                stage="INDEXING",
+                attempt=0,
+                available_at=now,
+                lease_epoch=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    class Primary:
+        def invoke(self, messages):
+            with app_db.engine.begin() as conn:
+                conn.execute(
+                    job_table.update()
+                    .where(job_table.c.id == job_id)
+                    .values(status="CANCELLED", cancel_requested_at=now)
+                )
+            raise RuntimeError("primary failed")
+
+    class Fallback:
+        def invoke(self, messages):
+            raise AssertionError("fallback must not run after job cancellation")
+
+    def fake_model(alias, *args, **kwargs):
+        return Primary() if alias == "chat-main" else Fallback()
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://gateway.invalid")
+    monkeypatch.setenv("AGENT_FALLBACK_MODEL_ALIAS", "chat-fallback")
+    monkeypatch.setattr("app.qa.model_gateway.get_chat_model", fake_model)
+    monkeypatch.setattr(
+        BudgetService,
+        "reserve",
+        classmethod(lambda cls, *args, **kwargs: {
+            "id": "reservation-fallback",
+            "amount": Decimal("0"),
+            "pricing": {
+                "configId": "cfg-model-chat-main",
+                "inputPricePerMillion": Decimal("0"),
+                "outputPricePerMillion": Decimal("0"),
+            },
+            "status": "RESERVED",
+        }),
+    )
+    monkeypatch.setattr(
+        BudgetService,
+        "settle_call",
+        classmethod(lambda cls, *args, **kwargs: {
+            "reservedAmount": Decimal("0"),
+            "settledAmount": None,
+            "pricing": {"configId": "cfg-model-chat-main"},
+            "reservationId": "reservation-fallback",
+            "authority": "LOCAL_MONTHLY_BUDGET",
+        }),
+    )
+
+    with pytest.raises(ApiException) as exc:
+        ModelGateway.chat(
+            ACTOR.tenant_id,
+            run_id=None,
+            purpose="ENRICH",
+            messages=[{"role": "user", "content": "test"}],
+            model_alias="chat-main",
+            job_id=job_id,
+        )
+    assert exc.value.code == "CANCELLED"
