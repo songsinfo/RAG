@@ -872,3 +872,61 @@ def test_pre_dispatch_job_gate_releases_as_not_sent(monkeypatch):
         )
     assert exc.value.code == "CANCELLED"
     assert statuses == ["NOT_SENT"]
+
+
+def test_sent_failure_persists_unknown_model_call_status():
+    now = datetime.now(timezone.utc)
+    job_id = "job-unknown-audit"
+    call_id = "call-unknown-audit"
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=job_id,
+                kind="INGEST",
+                target_id="doc-unknown-audit",
+                requested_by=ACTOR.user_id,
+                idempotency_key="job-unknown-audit-key",
+                request_hash=b"job-unknown-audit",
+                status="RUNNING",
+                stage="INDEXING",
+                attempt=0,
+                available_at=now,
+                lease_epoch=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    BudgetService.reserve(
+        ACTOR.tenant_id,
+        call_id,
+        "chat-main",
+        100,
+        100,
+        job_id=job_id,
+    )
+    ModelGateway._record_call(
+        tenant_id=ACTOR.tenant_id,
+        call_id=call_id,
+        run_id=None,
+        purpose="ENRICH",
+        status="FAILED",
+        input_tokens=0,
+        output_tokens=0,
+        model_alias="chat-main",
+        job_id=job_id,
+    )
+
+    with app_db.engine.connect() as conn:
+        call_status = conn.execute(
+            select(model_call_table.c.status).where(model_call_table.c.id == call_id)
+        ).scalar_one()
+        reservation_status = conn.execute(
+            select(budget_reservation_table.c.status).where(
+                budget_reservation_table.c.caller_call_id == call_id
+            )
+        ).scalar_one()
+
+    assert call_status == "UNKNOWN"
+    assert reservation_status == "UNKNOWN"
