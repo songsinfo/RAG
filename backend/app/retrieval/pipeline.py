@@ -96,6 +96,7 @@ class RetrievalPipeline:
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
                     run_id=run_id,
+                    num_candidates=cfg.num_candidates,
                 )
             )
         if hyde_text:
@@ -113,6 +114,7 @@ class RetrievalPipeline:
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
                     run_id=run_id,
+                    num_candidates=cfg.num_candidates,
                 )
             )
 
@@ -148,6 +150,32 @@ class RetrievalPipeline:
 
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
+
+        # Apply the legacy Java context budget after parent expansion.
+        budgeted_hits: List[Dict[str, Any]] = []
+        used_bytes = 0
+        for hit in hits:
+            text_value = str(hit.get("text") or "")
+            size = len(text_value.encode("utf-8"))
+            if used_bytes + size > cfg.context_max_bytes:
+                if not budgeted_hits:
+                    # Keep at least the best hit, but fall back to its canonical
+                    # child text if an expanded parent alone exceeds the budget.
+                    child_id = str(hit.get("chunkId") or "")
+                    fallback = cls._hydrate_original_chunks(
+                        actor.tenant_id,
+                        [{"chunkId": child_id, **hit}],
+                    )[0] if child_id else hit
+                    fallback_text = str(fallback.get("text") or "")
+                    if len(fallback_text.encode("utf-8")) <= cfg.context_max_bytes:
+                        budgeted_hits.append(fallback)
+                warnings.append("CONTEXT_TRIMMED")
+                break
+            budgeted_hits.append(hit)
+            used_bytes += size
+            if len(budgeted_hits) >= cfg.final_top_k:
+                break
+        hits = budgeted_hits
 
         hits = cls._attach_provenance(actor.tenant_id, hits)
         final_limit = cfg.final_top_k
@@ -252,10 +280,12 @@ class RetrievalPipeline:
                 parsed = json.loads(raw)
                 queries = parsed.get("queries", [])
                 if isinstance(queries, list):
-                    for item in queries[:2]:
+                    for item in queries:
                         value = str(item).strip()
                         if value and value not in variants:
                             variants.append(value)
+                        if len(variants) >= cfg.max_variants:
+                            break
             except Exception:
                 warnings.append("MULTI_QUERY_SKIPPED")
 
