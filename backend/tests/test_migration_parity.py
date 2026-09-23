@@ -24,11 +24,15 @@ from app.models import (
     chunk_table,
     model_call_table,
     config_revision_table,
+    qa_run_table,
+    run_source_table,
+    document_grant_table,
 )
 from app.qa.service import QaService
 from app.qa.model_gateway import ModelGateway
 from app.retrieval.config import RetrievalConfig
 from app.retrieval.pipeline import RetrievalPipeline
+from app.retrieval.milvus_service import MilvusHybridService
 
 
 ACTOR = Actor(
@@ -515,3 +519,103 @@ def test_peer_deletion_requires_ack(monkeypatch):
         "doc-1",
     )
     assert domains["peer:https://eval.internal"] == "COMPLETE"
+
+
+
+def test_model_send_gate_rejects_revoked_history_source():
+    kb = KnowledgeService.create_kb(ACTOR, "History ACL KB", [])
+    uploaded = KnowledgeService.upload_document(
+        ACTOR,
+        kb["id"],
+        None,
+        "history.txt",
+        b"history secret",
+        "history-acl-upload",
+        {"embedding": True},
+    )
+    conv = QaService.create_conversation(ACTOR, {"scope": {"mode": "ALL"}})
+    run = QaService.submit_run(
+        ACTOR,
+        conv["conversationId"],
+        {"question": "first", "mode": "RAG"},
+        idempotency_key="history-acl-run",
+    )
+    now = datetime.now(timezone.utc)
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            qa_run_table.update()
+            .where(qa_run_table.c.id == run["runId"])
+            .values(status="RUNNING")
+        )
+        conn.execute(
+            run_source_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=str(uuid.uuid4()),
+                run_id=run["runId"],
+                document_id=uploaded["documentId"],
+                build_id=uploaded["buildId"],
+                unit_id=None,
+                evidence_id=None,
+                purpose="HISTORY",
+                span_json=None,
+                payload_hash=None,
+                send_status="PREPARED",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        conn.execute(
+            document_grant_table.delete().where(
+                document_grant_table.c.document_id == uploaded["documentId"]
+            )
+        )
+
+    with pytest.raises(ApiException) as exc:
+        ModelGateway.assert_run_sources_current(ACTOR.tenant_id, run["runId"])
+    assert exc.value.code == "SOURCE_CHANGED"
+
+
+def test_real_milvus_hybrid_fuses_after_canonical_dedupe(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def search(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return [[
+                    {"distance": 0.99, "entity": {"chunk_id": "c1", "kb_id": "k", "document_id": "d", "version_id": "v", "build_id": "b", "index_epoch": 1, "representation_type": "ORIGINAL", "text_content": "c1 original"}},
+                    {"distance": 0.98, "entity": {"chunk_id": "c1", "kb_id": "k", "document_id": "d", "version_id": "v", "build_id": "b", "index_epoch": 1, "representation_type": "SUMMARY", "text_content": "c1 summary"}},
+                    {"distance": 0.97, "entity": {"chunk_id": "c2", "kb_id": "k", "document_id": "d", "version_id": "v", "build_id": "b", "index_epoch": 1, "representation_type": "ORIGINAL", "text_content": "c2"}},
+                ]]
+            return [[
+                {"distance": 10.0, "entity": {"chunk_id": "c2", "kb_id": "k", "document_id": "d", "version_id": "v", "build_id": "b", "index_epoch": 1, "representation_type": "QUESTION", "text_content": "c2 question"}},
+                {"distance": 9.0, "entity": {"chunk_id": "c3", "kb_id": "k", "document_id": "d", "version_id": "v", "build_id": "b", "index_epoch": 1, "representation_type": "ORIGINAL", "text_content": "c3"}},
+            ]]
+
+    fake = FakeClient()
+    monkeypatch.setattr(MilvusHybridService, "get_client", classmethod(lambda cls: fake))
+    monkeypatch.setattr(
+        "app.retrieval.milvus_service.get_embeddings",
+        lambda *args, **kwargs: [[1.0] * 1024],
+    )
+
+    hits = MilvusHybridService.search(
+        tenant_id=ACTOR.tenant_id,
+        query="q",
+        allowed_build_ids=["b"],
+        dense_top_k=3,
+        sparse_top_k=3,
+        fusion_top_k=3,
+        mode="HYBRID",
+        rrf_enabled=True,
+        rrf_k=60,
+        allowed_build_epochs={"b": 1},
+        representations=["ORIGINAL", "SUMMARY", "QUESTION"],
+        run_id="run-test",
+        num_candidates=20,
+    )
+    ids = [hit["chunkId"] for hit in hits]
+    assert len(ids) == len(set(ids))
+    assert ids[0] == "c2"
+    assert set(ids) == {"c1", "c2", "c3"}
