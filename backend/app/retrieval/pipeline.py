@@ -344,15 +344,13 @@ class RetrievalPipeline:
         if len(hits) <= 1:
             return hits[:count]
         texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
-        vectors = get_embeddings(
-            [query] + texts,
+        doc_vectors = get_embeddings(
+            texts,
             dim=1024,
             tenant_id=tenant_id,
             run_id=run_id,
             job_id=job_id,
         )
-        query_vector = vectors[0]
-        doc_vectors = vectors[1:]
 
         def cosine(left: List[float], right: List[float]) -> float:
             dot = sum(a * b for a, b in zip(left, right))
@@ -360,7 +358,12 @@ class RetrievalPipeline:
             right_norm = math.sqrt(sum(b * b for b in right))
             if left_norm == 0.0 or right_norm == 0.0:
                 return 0.0
-            return dot / (left_norm * right_norm)
+            value = dot / (left_norm * right_norm)
+            return max(-1.0, min(1.0, value))
+
+        raw_scores = [float(hit.get("score", 0.0) or 0.0) for hit in hits]
+        min_score = min(raw_scores)
+        max_score = max(raw_scores)
 
         selected: List[int] = []
         remaining = set(range(len(hits)))
@@ -369,9 +372,16 @@ class RetrievalPipeline:
             best_index = None
             best_score = float("-inf")
             for idx in remaining:
-                relevance = cosine(query_vector, doc_vectors[idx])
+                relevance = (
+                    1.0
+                    if max_score == min_score
+                    else (raw_scores[idx] - min_score) / (max_score - min_score)
+                )
                 redundancy = max(
-                    (cosine(doc_vectors[idx], doc_vectors[chosen]) for chosen in selected),
+                    (
+                        (cosine(doc_vectors[idx], doc_vectors[chosen]) + 1.0) / 2.0
+                        for chosen in selected
+                    ),
                     default=0.0,
                 )
                 score = lambda_value * relevance - (1.0 - lambda_value) * redundancy
