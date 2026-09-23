@@ -934,7 +934,9 @@ def test_sent_failure_persists_unknown_model_call_status():
 
 
 def test_artifact_download_and_warning_acceptance_check_document_access():
-    kb = KnowledgeService.create_kb(ACTOR, "Access checks KB", [])
+    kb = KnowledgeService.create_kb(
+        ACTOR, "Access checks KB", [{"type": "USER", "userId": ACTOR.user_id}]
+    )
     uploaded = KnowledgeService.upload_document(
         ACTOR,
         kb["id"],
