@@ -444,6 +444,7 @@ def test_legacy_java_retrieval_config_maps_to_python_execution_fields():
     assert cfg.rerank_fail_open is False
     assert cfg.final_top_k == 6
     assert cfg.context_max_bytes == 5000
+    assert cfg.parent_max_chars == 5000
     assert cfg.representations == ("ORIGINAL", "SUMMARY")
 
 
