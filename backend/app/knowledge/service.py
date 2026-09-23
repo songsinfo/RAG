@@ -1,6 +1,7 @@
 import hashlib
 import json
 import mimetypes
+import os
 import uuid
 import struct
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from app.identity.deps import Actor, can_read_document
 from app.knowledge.artifacts import save_artifact, read_artifact, delete_artifact
 from app.knowledge.parser import parse_and_chunk_document
 from app.qa.model_gateway import ModelGateway
+from app.qa.model_clients import get_http_client
 from app.retrieval.embedding import get_embeddings
 from app.models import (
     knowledge_base_table,
@@ -48,6 +50,359 @@ from app.models import (
 
 
 class KnowledgeService:
+    @staticmethod
+    def _propagate_deletion_to_peers(
+        origin_system: str,
+        origin_tenant_id: str,
+        origin_document_id: str,
+    ) -> Dict[str, str]:
+        raw_peers = os.getenv("RAG_DELETION_PEERS", "").strip()
+        if not raw_peers:
+            return {"local": "COMPLETE", "backup": "EXPIRES_7_DAYS"}
+
+        token = os.getenv("RAG_DELETION_API_TOKEN", "")
+        if len(token) < 32:
+            raise ApiException(503, "DELETION_PEER_NOT_CONFIGURED", "副本清理凭据未配置")
+
+        domains: Dict[str, str] = {
+            "local": "COMPLETE",
+            "backup": "EXPIRES_7_DAYS",
+        }
+        client = get_http_client()
+        for raw_peer in raw_peers.split(","):
+            peer = raw_peer.strip().rstrip("/")
+            if not peer:
+                continue
+            if not peer.startswith(("http://", "https://")):
+                raise ApiException(503, "DELETION_PEER_NOT_CONFIGURED", "副本清理地址无效")
+            try:
+                response = client.post(
+                    f"{peer}/api/v1/internal/deletions",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "originSystem": origin_system,
+                        "originTenantId": origin_tenant_id,
+                        "originDocumentId": origin_document_id,
+                    },
+                    timeout=20.0,
+                )
+                body = response.json() if response.status_code == 200 else {}
+                if response.status_code != 200 or body.get("acknowledged") is not True:
+                    raise ApiException(503, "DELETION_PEER_PENDING", "副本实例尚未确认清理")
+                domains[f"peer:{peer}"] = "COMPLETE"
+            except ApiException:
+                raise
+            except Exception as exc:
+                raise ApiException(503, "DELETION_PEER_PENDING", f"副本实例清理失败: {exc}") from exc
+        return domains
+
+    @staticmethod
+    def receive_deletion(
+        origin_system: str,
+        origin_tenant_id: str,
+        origin_document_id: str,
+    ) -> Dict[str, Any]:
+        if (
+            not origin_system.strip()
+            or not origin_tenant_id.strip()
+            or not origin_document_id.strip()
+            or len(origin_system) > 128
+            or len(origin_tenant_id) > 36
+            or len(origin_document_id) > 36
+        ):
+            raise ApiException(400, "INVALID_INPUT", "删除来源无效")
+
+        now = datetime.now(timezone.utc)
+        empty_hash = hashlib.sha256(b"").digest()
+        copied_documents: set[tuple[str, str]] = set()
+        artifact_keys: List[str] = []
+
+        with get_db_connection() as conn:
+            snapshot_rows = conn.execute(
+                select(
+                    eval_snapshot_document_table.c.tenant_id,
+                    eval_snapshot_document_table.c.snapshot_id,
+                    eval_snapshot_document_table.c.document_id,
+                ).where(
+                    and_(
+                        eval_snapshot_document_table.c.origin_system == origin_system,
+                        eval_snapshot_document_table.c.origin_tenant_id == origin_tenant_id,
+                        eval_snapshot_document_table.c.origin_document_id == origin_document_id,
+                    )
+                )
+            ).fetchall()
+            for row in snapshot_rows:
+                copied_documents.add((str(row.tenant_id), str(row.document_id)))
+                conn.execute(
+                    update(eval_snapshot_table)
+                    .where(
+                        and_(
+                            eval_snapshot_table.c.tenant_id == row.tenant_id,
+                            eval_snapshot_table.c.id == row.snapshot_id,
+                        )
+                    )
+                    .values(status="PURGED", manifest_json={}, manifest_hash=empty_hash, updated_at=now)
+                )
+
+            gold_rows = conn.execute(
+                select(
+                    eval_gold_table.c.tenant_id,
+                    eval_gold_table.c.case_id,
+                ).where(
+                    and_(
+                        eval_gold_table.c.origin_system == origin_system,
+                        eval_gold_table.c.origin_tenant_id == origin_tenant_id,
+                        eval_gold_table.c.origin_document_id == origin_document_id,
+                    )
+                )
+            ).fetchall()
+            for row in gold_rows:
+                tenant = str(row.tenant_id)
+                case_id = str(row.case_id)
+                result_ids = [
+                    str(value.id)
+                    for value in conn.execute(
+                        select(eval_result_table.c.id).where(
+                            and_(
+                                eval_result_table.c.tenant_id == tenant,
+                                eval_result_table.c.case_id == case_id,
+                            )
+                        )
+                    ).fetchall()
+                ]
+                if result_ids:
+                    conn.execute(
+                        update(eval_review_table)
+                        .where(
+                            and_(
+                                eval_review_table.c.tenant_id == tenant,
+                                eval_review_table.c.result_id.in_(result_ids),
+                            )
+                        )
+                        .values(labels_json={}, reason_text=None, updated_at=now)
+                    )
+                    conn.execute(
+                        update(eval_result_table)
+                        .where(
+                            and_(
+                                eval_result_table.c.tenant_id == tenant,
+                                eval_result_table.c.id.in_(result_ids),
+                            )
+                        )
+                        .values(status="PURGED", metrics_json=None, judge_json=None, updated_at=now)
+                    )
+                dataset_id = conn.execute(
+                    select(eval_case_table.c.dataset_version_id).where(
+                        and_(
+                            eval_case_table.c.tenant_id == tenant,
+                            eval_case_table.c.id == case_id,
+                        )
+                    )
+                ).scalar()
+                conn.execute(
+                    update(eval_case_table)
+                    .where(
+                        and_(
+                            eval_case_table.c.tenant_id == tenant,
+                            eval_case_table.c.id == case_id,
+                        )
+                    )
+                    .values(question_json={}, expected_json={}, annotation_status="PURGED", updated_at=now)
+                )
+                conn.execute(
+                    update(eval_gold_table)
+                    .where(
+                        and_(
+                            eval_gold_table.c.tenant_id == tenant,
+                            eval_gold_table.c.case_id == case_id,
+                        )
+                    )
+                    .values(anchor_json={}, version_hash=empty_hash, updated_at=now)
+                )
+                if dataset_id:
+                    conn.execute(
+                        update(eval_dataset_version_table)
+                        .where(
+                            and_(
+                                eval_dataset_version_table.c.tenant_id == tenant,
+                                eval_dataset_version_table.c.id == dataset_id,
+                            )
+                        )
+                        .values(status="PURGED", updated_at=now)
+                    )
+
+            for tenant, document_id in copied_documents:
+                artifact_keys.extend(
+                    str(row.storage_key)
+                    for row in conn.execute(
+                        select(artifact_table.c.storage_key).where(
+                            and_(
+                                artifact_table.c.tenant_id == tenant,
+                                artifact_table.c.document_id == document_id,
+                            )
+                        )
+                    ).fetchall()
+                )
+                build_ids = [
+                    str(row.id)
+                    for row in conn.execute(
+                        select(index_build_table.c.id).where(
+                            and_(
+                                index_build_table.c.tenant_id == tenant,
+                                index_build_table.c.document_id == document_id,
+                            )
+                        )
+                    ).fetchall()
+                ]
+                affected_runs = [
+                    str(row.run_id)
+                    for row in conn.execute(
+                        select(run_source_table.c.run_id)
+                        .where(
+                            and_(
+                                run_source_table.c.tenant_id == tenant,
+                                run_source_table.c.document_id == document_id,
+                            )
+                        )
+                        .distinct()
+                    ).fetchall()
+                ]
+                if affected_runs:
+                    conn.execute(
+                        update(qa_run_table)
+                        .where(
+                            and_(
+                                qa_run_table.c.tenant_id == tenant,
+                                qa_run_table.c.id.in_(affected_runs),
+                            )
+                        )
+                        .values(
+                            question=None,
+                            result_json=None,
+                            status="CANCELLED",
+                            terminal_reason="SOURCE_PURGED",
+                            cancel_requested_at=now,
+                            finished_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    conn.execute(
+                        update(run_event_table)
+                        .where(
+                            and_(
+                                run_event_table.c.tenant_id == tenant,
+                                run_event_table.c.run_id.in_(affected_runs),
+                            )
+                        )
+                        .values(payload=None, updated_at=now)
+                    )
+                    conn.execute(
+                        update(run_source_table)
+                        .where(
+                            and_(
+                                run_source_table.c.tenant_id == tenant,
+                                run_source_table.c.run_id.in_(affected_runs),
+                            )
+                        )
+                        .values(span_json=None, updated_at=now)
+                    )
+                conn.execute(
+                    update(source_unit_table)
+                    .where(
+                        and_(
+                            source_unit_table.c.tenant_id == tenant,
+                            source_unit_table.c.document_id == document_id,
+                        )
+                    )
+                    .values(text_content=None, location={}, updated_at=now)
+                )
+                if build_ids:
+                    conn.execute(
+                        update(chunk_table)
+                        .where(
+                            and_(
+                                chunk_table.c.tenant_id == tenant,
+                                chunk_table.c.build_id.in_(build_ids),
+                            )
+                        )
+                        .values(text_content="", content_hash=empty_hash, updated_at=now)
+                    )
+                    conn.execute(
+                        update(chunk_span_table)
+                        .where(
+                            and_(
+                                chunk_span_table.c.tenant_id == tenant,
+                                chunk_span_table.c.build_id.in_(build_ids),
+                            )
+                        )
+                        .values(location=None, updated_at=now)
+                    )
+                    conn.execute(
+                        update(representation_table)
+                        .where(
+                            and_(
+                                representation_table.c.tenant_id == tenant,
+                                representation_table.c.build_id.in_(build_ids),
+                            )
+                        )
+                        .values(
+                            text_content="",
+                            vector_bytes=None,
+                            dims=None,
+                            vector_hash=None,
+                            text_hash=empty_hash,
+                            updated_at=now,
+                        )
+                    )
+                conn.execute(
+                    update(artifact_table)
+                    .where(
+                        and_(
+                            artifact_table.c.tenant_id == tenant,
+                            artifact_table.c.document_id == document_id,
+                        )
+                    )
+                    .values(status="PURGED", updated_at=now)
+                )
+                conn.execute(
+                    update(document_version_table)
+                    .where(
+                        and_(
+                            document_version_table.c.tenant_id == tenant,
+                            document_version_table.c.document_id == document_id,
+                        )
+                    )
+                    .values(original_name=None, updated_at=now)
+                )
+                conn.execute(
+                    update(document_table)
+                    .where(
+                        and_(
+                            document_table.c.tenant_id == tenant,
+                            document_table.c.id == document_id,
+                        )
+                    )
+                    .values(
+                        title=None,
+                        active_build_id=None,
+                        status="PURGED",
+                        row_version=document_table.c.row_version + 1,
+                        updated_at=now,
+                    )
+                )
+            conn.commit()
+
+        from app.retrieval.milvus_service import MilvusHybridService
+        for tenant, document_id in copied_documents:
+            MilvusHybridService.delete_by_document(tenant, document_id)
+        for key in artifact_keys:
+            delete_artifact(key)
+
+        return {"acknowledged": True, "copiesPurged": len(copied_documents)}
+
     @staticmethod
     def recover_unfinished_jobs():
         """Requeue only expired leased jobs; queued jobs survive process restarts."""
@@ -1742,7 +2097,7 @@ class KnowledgeService:
                         tenant_id=actor.tenant_id,
                         id=del_rec_id,
                         document_id=doc_id,
-                        origin_system="local",
+                        origin_system=os.getenv("RAG_ENVIRONMENT", "demo"),
                         requested_by=actor.user_id,
                         status="PENDING",
                         domains_json={},
@@ -2203,8 +2558,8 @@ class KnowledgeService:
                     )
                 )
                 .values(
-                    status="COMPLETE",
-                    completed_at=now,
+                    status="LOCAL_COMPLETE",
+                    completed_at=None,
                     domains_json={"local": "COMPLETE", "backup": "EXPIRES_7_DAYS"},
                     updated_at=now,
                 )
@@ -2212,7 +2567,39 @@ class KnowledgeService:
             conn.execute(
                 update(job_table)
                 .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
-                .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
+                .values(status="RUNNING", stage="PEER_PURGE", updated_at=now)
+            )
+            conn.commit()
+
+        origin_system = os.getenv("RAG_ENVIRONMENT", "demo")
+        domains = KnowledgeService._propagate_deletion_to_peers(
+            origin_system,
+            tenant_id,
+            doc_id,
+        )
+        completed_at = datetime.now(timezone.utc)
+        with get_db_connection() as conn:
+            if lease_epoch is not None and not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
+                return
+            conn.execute(
+                update(deletion_record_table)
+                .where(
+                    and_(
+                        deletion_record_table.c.tenant_id == tenant_id,
+                        deletion_record_table.c.id == del_rec_id,
+                    )
+                )
+                .values(
+                    status="COMPLETE",
+                    completed_at=completed_at,
+                    domains_json=domains,
+                    updated_at=completed_at,
+                )
+            )
+            conn.execute(
+                update(job_table)
+                .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
+                .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=completed_at)
             )
             conn.commit()
 
