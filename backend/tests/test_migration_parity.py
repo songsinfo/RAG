@@ -24,6 +24,7 @@ from app.models import (
     eval_snapshot_table,
     chunk_table,
     model_call_table,
+    job_table,
     config_revision_table,
     qa_run_table,
     run_source_table,
@@ -647,3 +648,37 @@ def test_rewrite_keeps_original_and_rewritten_query(monkeypatch):
     assert variants == ["原始追问", "独立改写问题"]
     assert hyde is None
     assert warnings == []
+
+
+def test_model_gateway_rejects_cancelled_background_job():
+    now = datetime.now(timezone.utc)
+    job_id = "job-model-gate"
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=job_id,
+                kind="INGEST",
+                target_id="doc-model-gate",
+                requested_by=ACTOR.user_id,
+                idempotency_key="job-model-gate-key",
+                request_hash=b"job-model-gate",
+                status="RUNNING",
+                stage="INDEXING",
+                attempt=0,
+                available_at=now,
+                lease_epoch=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    ModelGateway.assert_job_current(ACTOR.tenant_id, job_id)
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.update()
+            .where(job_table.c.id == job_id)
+            .values(status="CANCELLED", cancel_requested_at=now)
+        )
+    with pytest.raises(ApiException) as exc:
+        ModelGateway.assert_job_current(ACTOR.tenant_id, job_id)
+    assert exc.value.code == "CANCELLED"
