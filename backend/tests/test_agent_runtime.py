@@ -119,8 +119,8 @@ def test_agent_hitl_checkpoint_and_resume(client, monkeypatch):
         ).json()
         run = client.post(
             f"/api/v1/conversations/{conv['conversationId']}/runs",
-            json={"question": "需要审批的检索", "mode": "AGENT"},
-            headers={"X-CSRF-Token": csrf},
+            json={"question": "需要审批的检索", "segmentId": conv["currentSegmentId"], "mode": "AGENT"},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": "agent-hitl-run"},
         ).json()
         run_id = run["runId"]
 
