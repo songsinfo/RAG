@@ -205,6 +205,7 @@ class ModelGateway:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model_alias=model_alias,
+                    job_id=job_id,
                 )
                 return content
             except ApiException:
@@ -217,6 +218,7 @@ class ModelGateway:
                     input_tokens=0,
                     output_tokens=0,
                     model_alias=model_alias,
+                    job_id=job_id,
                 )
                 raise
             except Exception as e:
@@ -230,6 +232,7 @@ class ModelGateway:
                     input_tokens=0,
                     output_tokens=0,
                     model_alias=model_alias,
+                    job_id=job_id,
                 )
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"大模型网关调用失败: {e}")
 
@@ -243,6 +246,7 @@ class ModelGateway:
                 input_tokens=0,
                 output_tokens=0,
                 model_alias=model_alias,
+                job_id=job_id,
             )
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
@@ -582,6 +586,7 @@ class ModelGateway:
                     input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
                     output_tokens=0,
                     model_alias=model_alias,
+                    job_id=job_id,
                 )
                 return normalized
             except ApiException:
