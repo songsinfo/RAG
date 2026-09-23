@@ -409,6 +409,7 @@ class BudgetService:
             "reservedAmount": Decimal(str(row.reserved_amount)),
             "settledAmount": settled,
             "pricing": {
+                "configId": str(pricing["configId"]),
                 "currency": "CNY",
                 "inputPricePerMillion": str(pricing["inputPricePerMillion"]),
                 "outputPricePerMillion": str(pricing["outputPricePerMillion"]),
