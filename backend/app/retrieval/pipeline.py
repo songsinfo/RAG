@@ -1,12 +1,13 @@
 import json
 import math
+import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, select
 
 from app.db import get_db_connection
 from app.identity.deps import Actor, assert_hits_still_readable, get_readable_build_records
-from app.models import chunk_span_table, chunk_table, source_unit_table
+from app.models import chunk_span_table, chunk_table, source_unit_table, representation_table
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
 from app.retrieval.milvus_service import MilvusHybridService
 from app.retrieval.reranker import rerank_hits
@@ -82,18 +83,25 @@ class RetrievalPipeline:
             warnings=warnings,
         )
 
+        # Match the Java route semantics: BM25 variants and dense variants
+        # are independent RRF routes. HyDE contributes only to the dense family.
         ranked_lists: List[List[Dict[str, Any]]] = []
-        for query_variant in query_variants:
-            ranked_lists.append(
-                MilvusHybridService.search(
+        route_weights: List[float] = []
+        use_sparse = cfg.mode in {"BM25", "HYBRID"}
+        use_dense = cfg.mode in {"DENSE", "HYBRID"}
+
+        if use_sparse:
+            sparse_weight = (0.5 if use_dense else 1.0) / max(1, len(query_variants))
+            for query_variant in query_variants:
+                route = MilvusHybridService.search(
                     tenant_id=actor.tenant_id,
                     query=query_variant,
                     allowed_build_ids=allowed_build_ids,
-                    dense_top_k=cfg.dense_top_k,
+                    dense_top_k=0,
                     sparse_top_k=cfg.sparse_top_k,
-                    fusion_top_k=cfg.fusion_top_k,
-                    mode=cfg.mode,
-                    rrf_enabled=cfg.rrf_enabled,
+                    fusion_top_k=cfg.sparse_top_k,
+                    mode="BM25",
+                    rrf_enabled=False,
                     rrf_k=cfg.rrf_k,
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
@@ -101,16 +109,23 @@ class RetrievalPipeline:
                     job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
-            )
-        if hyde_text:
-            ranked_lists.append(
-                MilvusHybridService.search(
+                if route:
+                    ranked_lists.append(route)
+                    route_weights.append(sparse_weight)
+
+        if use_dense:
+            dense_queries = list(query_variants)
+            if hyde_text:
+                dense_queries.append(hyde_text)
+            dense_weight = (0.5 if use_sparse else 1.0) / max(1, len(dense_queries))
+            for dense_query in dense_queries:
+                route = MilvusHybridService.search(
                     tenant_id=actor.tenant_id,
-                    query=hyde_text,
+                    query=dense_query,
                     allowed_build_ids=allowed_build_ids,
                     dense_top_k=cfg.dense_top_k,
                     sparse_top_k=0,
-                    fusion_top_k=cfg.fusion_top_k,
+                    fusion_top_k=cfg.dense_top_k,
                     mode="DENSE",
                     rrf_enabled=False,
                     rrf_k=cfg.rrf_k,
@@ -120,15 +135,20 @@ class RetrievalPipeline:
                     job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
-            )
+                if route:
+                    ranked_lists.append(route)
+                    route_weights.append(dense_weight)
 
-        ranked_lists = [items for items in ranked_lists if items]
         if not ranked_lists:
             hits = []
         elif len(ranked_lists) == 1:
             hits = ranked_lists[0][:cfg.fusion_top_k]
         else:
-            hits = rrf_fuse(ranked_lists, rrf_k=cfg.rrf_k)[:cfg.fusion_top_k]
+            hits = rrf_fuse(
+                ranked_lists,
+                weights=route_weights,
+                rrf_k=cfg.rrf_k,
+            )[:cfg.fusion_top_k]
 
         hits = cls._hydrate_original_chunks(actor.tenant_id, hits)
 
@@ -343,14 +363,32 @@ class RetrievalPipeline:
     ) -> List[Dict[str, Any]]:
         if len(hits) <= 1:
             return hits[:count]
-        texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
-        doc_vectors = get_embeddings(
-            texts,
-            dim=1024,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            job_id=job_id,
-        )
+        chunk_ids = [str(hit.get("chunkId") or "") for hit in hits]
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(
+                    representation_table.c.chunk_id,
+                    representation_table.c.vector_bytes,
+                    representation_table.c.dims,
+                ).where(
+                    and_(
+                        representation_table.c.tenant_id == tenant_id,
+                        representation_table.c.chunk_id.in_(chunk_ids),
+                        representation_table.c.kind == "ORIGINAL",
+                        representation_table.c.vector_bytes.isnot(None),
+                    )
+                )
+            ).fetchall()
+        vector_map: Dict[str, List[float]] = {}
+        for row in rows:
+            dims = int(row.dims or 0)
+            raw = bytes(row.vector_bytes or b"")
+            if dims <= 0 or len(raw) != dims * 4:
+                continue
+            vector_map[str(row.chunk_id)] = list(struct.unpack(f"<{dims}f", raw))
+        if any(chunk_id not in vector_map for chunk_id in chunk_ids):
+            raise ApiException(409, "INDEX_CAPABILITY_MISSING", "MMR 缺少原文向量，请重新构建索引")
+        doc_vectors = [vector_map[chunk_id] for chunk_id in chunk_ids]
 
         def cosine(left: List[float], right: List[float]) -> float:
             dot = sum(a * b for a, b in zip(left, right))
