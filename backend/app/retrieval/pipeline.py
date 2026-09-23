@@ -95,6 +95,7 @@ class RetrievalPipeline:
                     rrf_k=cfg.rrf_k,
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
+                    run_id=run_id,
                 )
             )
         if hyde_text:
@@ -111,6 +112,7 @@ class RetrievalPipeline:
                     rrf_k=cfg.rrf_k,
                     allowed_build_epochs=allowed_build_epochs,
                     representations=list(cfg.representations),
+                    run_id=run_id,
                 )
             )
 
@@ -142,7 +144,7 @@ class RetrievalPipeline:
             warnings.extend(rerank_warnings)
 
         if cfg.mmr_enabled and hits:
-            hits = cls._mmr_select(actor.tenant_id, independent_query, hits, cfg.final_top_k, cfg.mmr_lambda)
+            hits = cls._mmr_select(actor.tenant_id, independent_query, hits, cfg.final_top_k, cfg.mmr_lambda, run_id=run_id)
 
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
@@ -283,11 +285,18 @@ class RetrievalPipeline:
         return independent, variants, hyde_text
 
     @staticmethod
-    def _mmr_select(tenant_id: str, query: str, hits: List[Dict[str, Any]], count: int, lambda_value: float) -> List[Dict[str, Any]]:
+    def _mmr_select(
+        tenant_id: str,
+        query: str,
+        hits: List[Dict[str, Any]],
+        count: int,
+        lambda_value: float,
+        run_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         if len(hits) <= 1:
             return hits[:count]
         texts = [str(hit.get("matchedText") or hit.get("text") or "") for hit in hits]
-        vectors = get_embeddings([query] + texts, dim=1024, tenant_id=tenant_id)
+        vectors = get_embeddings([query] + texts, dim=1024, tenant_id=tenant_id, run_id=run_id)
         query_vector = vectors[0]
         doc_vectors = vectors[1:]
 
