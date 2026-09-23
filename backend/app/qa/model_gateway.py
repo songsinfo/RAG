@@ -17,6 +17,7 @@ from app.models import (
     document_table,
     app_user_table,
     tenant_table,
+    job_table,
 )
 from app.qa.model_clients import get_chat_model, get_http_client
 from app.qa.runtime import AgentRuntimePolicy, estimate_tokens, retry_call
@@ -33,6 +34,29 @@ MODEL_CONFIG_IDS = {
 
 
 class ModelGateway:
+    @staticmethod
+    def assert_job_current(tenant_id: str, job_id: Optional[str]) -> None:
+        if not job_id:
+            return
+        with get_db_connection() as conn:
+            job = conn.execute(
+                select(
+                    job_table.c.status,
+                    job_table.c.cancel_requested_at,
+                ).where(
+                    and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                    )
+                )
+            ).first()
+        if (
+            not job
+            or str(job.status) != "RUNNING"
+            or job.cancel_requested_at is not None
+        ):
+            raise ApiException(409, "CANCELLED", "后台任务已停止")
+
     @staticmethod
     def assert_run_sources_current(tenant_id: str, run_id: Optional[str]) -> None:
         if not run_id:
@@ -166,6 +190,7 @@ class ModelGateway:
 
                 def invoke_primary():
                     cls.assert_run_sources_current(tenant_id, run_id)
+                    cls.assert_job_current(tenant_id, job_id)
                     return llm.invoke(lc_messages)
 
                 try:
@@ -414,6 +439,7 @@ class ModelGateway:
 
                 def invoke_primary_tools():
                     cls.assert_run_sources_current(tenant_id, run_id)
+                    cls.assert_job_current(tenant_id, job_id)
                     return llm.invoke(lc_messages)
 
                 try:
@@ -562,6 +588,7 @@ class ModelGateway:
             sent = False
             try:
                 cls.assert_run_sources_current(tenant_id, run_id)
+                cls.assert_job_current(tenant_id, job_id)
                 sent = True
                 response = get_http_client().post(
                     endpoint,
