@@ -20,6 +20,7 @@ from app.models import (
     segment_kb_table,
     qa_run_table,
     run_source_table,
+    run_dependency_table,
     run_event_table,
     model_call_table,
     feedback_table,
@@ -733,7 +734,7 @@ class QaService:
                 )
                 conn.commit()
 
-            history = QaService._rag_history(actor.tenant_id, seg_id, run_id)
+            history = QaService._rag_history(actor, seg_id, run_id)
 
             # 1. Routing
             decision = classify_question(question)
@@ -1243,26 +1244,29 @@ class QaService:
             return True
 
     @staticmethod
-    def _rag_history(tenant_id: str, segment_id: str, current_run_id: str) -> List[Dict[str, str]]:
+    def _rag_history(actor: Actor, segment_id: str, current_run_id: str) -> List[Dict[str, str]]:
         with get_db_connection() as conn:
             current_turn = conn.execute(
                 select(qa_run_table.c.turn_no).where(
                     and_(
-                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.tenant_id == actor.tenant_id,
                         qa_run_table.c.id == current_run_id,
                     )
                 )
             ).scalar()
             if current_turn is None:
                 return []
+
             rows = conn.execute(
                 select(
+                    qa_run_table.c.id,
+                    qa_run_table.c.turn_no,
                     qa_run_table.c.question,
                     qa_run_table.c.result_json,
                 )
                 .where(
                     and_(
-                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.tenant_id == actor.tenant_id,
                         qa_run_table.c.segment_id == segment_id,
                         qa_run_table.c.turn_no < int(current_turn),
                         qa_run_table.c.status.in_(["COMPLETED", "SUCCEEDED", "PARTIAL", "CONFLICT"]),
@@ -1272,16 +1276,90 @@ class QaService:
                 .limit(4)
             ).fetchall()
 
-        messages: List[Dict[str, str]] = []
-        for row in reversed(rows):
-            question = str(row.question or "").strip()
-            result = row.result_json if isinstance(row.result_json, dict) else {}
-            answer = str(result.get("answer") or "").strip()
-            if question:
-                messages.append({"role": "user", "content": question[:2000]})
-            if answer:
-                messages.append({"role": "assistant", "content": answer[:4000]})
-        return messages
+            messages: List[Dict[str, str]] = []
+            total_chars = 0
+            for row in reversed(rows):
+                source_rows = conn.execute(
+                    select(
+                        run_source_table.c.document_id,
+                        run_source_table.c.build_id,
+                    ).where(
+                        and_(
+                            run_source_table.c.tenant_id == actor.tenant_id,
+                            run_source_table.c.run_id == row.id,
+                        )
+                    ).distinct()
+                ).fetchall()
+                if any(not can_read_document(conn, actor, str(src.document_id)) for src in source_rows):
+                    continue
+
+                question = str(row.question or "").strip()
+                result = row.result_json if isinstance(row.result_json, dict) else {}
+                answer = str(result.get("answer") or "").strip()
+                next_chars = len(question) + len(answer)
+                if total_chars + next_chars > 4000:
+                    break
+                total_chars += next_chars
+
+                dep_exists = conn.execute(
+                    select(run_dependency_table.c.id).where(
+                        and_(
+                            run_dependency_table.c.tenant_id == actor.tenant_id,
+                            run_dependency_table.c.run_id == current_run_id,
+                            run_dependency_table.c.prior_run_id == row.id,
+                        )
+                    )
+                ).first()
+                if not dep_exists:
+                    conn.execute(
+                        run_dependency_table.insert().values(
+                            tenant_id=actor.tenant_id,
+                            id=str(uuid.uuid4()),
+                            run_id=current_run_id,
+                            prior_run_id=str(row.id),
+                            created_at=datetime.now(timezone.utc),
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+
+                for src in source_rows:
+                    inherited = conn.execute(
+                        select(run_source_table.c.id).where(
+                            and_(
+                                run_source_table.c.tenant_id == actor.tenant_id,
+                                run_source_table.c.run_id == current_run_id,
+                                run_source_table.c.document_id == src.document_id,
+                                run_source_table.c.build_id == src.build_id,
+                                run_source_table.c.purpose == "HISTORY",
+                            )
+                        )
+                    ).first()
+                    if not inherited:
+                        conn.execute(
+                            run_source_table.insert().values(
+                                tenant_id=actor.tenant_id,
+                                id=str(uuid.uuid4()),
+                                run_id=current_run_id,
+                                document_id=str(src.document_id),
+                                build_id=str(src.build_id),
+                                unit_id=None,
+                                evidence_id=None,
+                                purpose="HISTORY",
+                                span_json=None,
+                                payload_hash=None,
+                                send_status="PREPARED",
+                                created_at=datetime.now(timezone.utc),
+                                updated_at=datetime.now(timezone.utc),
+                            )
+                        )
+
+                if question:
+                    messages.append({"role": "user", "content": question[:2000]})
+                if answer:
+                    messages.append({"role": "assistant", "content": answer[:4000]})
+
+            conn.commit()
+            return messages
 
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
