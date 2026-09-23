@@ -161,6 +161,7 @@ class ModelGateway:
                 max(1, estimate_tokens(messages)),
                 max_tokens,
                 run_id=run_id,
+                job_id=job_id,
             )
             sent = False
             try:
@@ -383,6 +384,7 @@ class ModelGateway:
                 max(1, estimate_tokens(messages)),
                 max_tokens,
                 run_id=run_id,
+                job_id=job_id,
             )
             sent = False
             try:
@@ -582,6 +584,7 @@ class ModelGateway:
                 max(1, (len(query) + sum(len(d) for d in documents)) // 4),
                 0,
                 run_id=run_id,
+                job_id=job_id,
             )
             base = gateway_url.rstrip("/")
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
