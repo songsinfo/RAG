@@ -257,19 +257,30 @@ class KnowledgeService:
                         )
                     ).fetchall()
                 ]
-                affected_runs = [
-                    str(row.run_id)
-                    for row in conn.execute(
-                        select(run_source_table.c.run_id)
-                        .where(
+                affected_rows = conn.execute(
+                    select(
+                        qa_run_table.c.id,
+                        qa_run_table.c.conversation_id,
+                    )
+                    .select_from(
+                        qa_run_table.join(
+                            run_source_table,
                             and_(
-                                run_source_table.c.tenant_id == tenant,
-                                run_source_table.c.document_id == document_id,
-                            )
+                                run_source_table.c.tenant_id == qa_run_table.c.tenant_id,
+                                run_source_table.c.run_id == qa_run_table.c.id,
+                            ),
                         )
-                        .distinct()
-                    ).fetchall()
-                ]
+                    )
+                    .where(
+                        and_(
+                            run_source_table.c.tenant_id == tenant,
+                            run_source_table.c.document_id == document_id,
+                        )
+                    )
+                    .distinct()
+                ).fetchall()
+                affected_runs = [str(row.id) for row in affected_rows]
+                affected_conversations = sorted({str(row.conversation_id) for row in affected_rows})
                 if affected_runs:
                     conn.execute(
                         update(qa_run_table)
@@ -286,6 +297,26 @@ class KnowledgeService:
                             terminal_reason="SOURCE_PURGED",
                             cancel_requested_at=now,
                             finished_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    conn.execute(
+                        update(job_table)
+                        .where(
+                            and_(
+                                job_table.c.tenant_id == tenant,
+                                job_table.c.kind == "QA_RUN",
+                                job_table.c.target_id.in_(affected_runs),
+                            )
+                        )
+                        .values(
+                            status="CANCELLED",
+                            stage="FINISHED",
+                            lease_epoch=job_table.c.lease_epoch + 1,
+                            lease_until=None,
+                            checkpoint=None,
+                            error_code="SOURCE_PURGED",
+                            cancel_requested_at=now,
                             updated_at=now,
                         )
                     )
@@ -309,6 +340,27 @@ class KnowledgeService:
                         )
                         .values(span_json=None, updated_at=now)
                     )
+                    conn.execute(
+                        update(feedback_table)
+                        .where(
+                            and_(
+                                feedback_table.c.tenant_id == tenant,
+                                feedback_table.c.run_id.in_(affected_runs),
+                            )
+                        )
+                        .values(comment_text=None, resolution_text=None, updated_at=now)
+                    )
+                    if affected_conversations:
+                        conn.execute(
+                            update(conversation_table)
+                            .where(
+                                and_(
+                                    conversation_table.c.tenant_id == tenant,
+                                    conversation_table.c.id.in_(affected_conversations),
+                                )
+                            )
+                            .values(title=None, updated_at=now)
+                        )
                 conn.execute(
                     update(source_unit_table)
                     .where(
@@ -376,6 +428,16 @@ class KnowledgeService:
                         )
                     )
                     .values(original_name=None, updated_at=now)
+                )
+                conn.execute(
+                    update(index_build_table)
+                    .where(
+                        and_(
+                            index_build_table.c.tenant_id == tenant,
+                            index_build_table.c.document_id == document_id,
+                        )
+                    )
+                    .values(quality_warnings=None, review_reason=None, updated_at=now)
                 )
                 conn.execute(
                     update(document_table)
