@@ -263,7 +263,9 @@ class RetrievalPipeline:
         job_id: Optional[str],
         warnings: List[str],
     ) -> Tuple[str, List[str], Optional[str]]:
-        independent = query.strip()
+        original = query.strip()
+        independent = original
+        variants = [original]
         if cfg.rewrite_enabled and history:
             messages = [
                 {
@@ -293,6 +295,8 @@ class RetrievalPipeline:
                 if not rewritten or len(rewritten) > 2000:
                     raise ApiException(502, "INVALID_MODEL_OUTPUT", "Query Rewrite 返回内容无效")
                 independent = rewritten
+                if rewritten not in variants and len(variants) < cfg.max_variants:
+                    variants.append(rewritten)
             except ApiException as exc:
                 fallback_codes = {
                     "MODEL_GATEWAY_UNAVAILABLE",
@@ -305,7 +309,6 @@ class RetrievalPipeline:
                     raise
                 warnings.append("REWRITE_SKIPPED")
 
-        variants = [independent]
         if cfg.multi_query_enabled:
             raw = ModelGateway.chat(
                 actor.tenant_id,
