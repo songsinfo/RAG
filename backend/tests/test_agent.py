@@ -125,7 +125,7 @@ def test_agent_single_tool_search_and_answer(client):
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
         json={"question": "StateGraph 如何工作？", "segmentId": segment_id, "mode": "AGENT"},
-        headers={"X-CSRF-Token": csrf},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
     )
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
@@ -272,7 +272,7 @@ def test_agent_read_section_tool(client):
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
         json={"question": "精读章节1", "segmentId": segment_id, "mode": "AGENT"},
-        headers={"X-CSRF-Token": csrf},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
     )
     run_id = run_resp.json()["runId"]
 
@@ -323,7 +323,7 @@ def test_agent_repeated_calls_termination(client):
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
             json={"question": "测试循环调用", "segmentId": segment_id, "mode": "AGENT"},
-            headers={"X-CSRF-Token": csrf},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
         )
         run_id = run_resp.json()["runId"]
 
@@ -386,7 +386,7 @@ def test_agent_unknown_tool_handled(client):
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
         json={"question": "测试未知工具", "segmentId": segment_id, "mode": "AGENT"},
-        headers={"X-CSRF-Token": csrf},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
     )
     run_id = run_resp.json()["runId"]
 
