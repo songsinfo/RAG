@@ -119,11 +119,12 @@ def test_agent_single_tool_search_and_answer(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     # 2. Submit AGENT run
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "StateGraph 如何工作？", "mode": "AGENT"},
+        json={"question": "StateGraph 如何工作？", "segmentId": segment_id, "mode": "AGENT"},
         headers={"X-CSRF-Token": csrf},
     )
     assert run_resp.status_code == 202
@@ -266,10 +267,11 @@ def test_agent_read_section_tool(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "精读章节1", "mode": "AGENT"},
+        json={"question": "精读章节1", "segmentId": segment_id, "mode": "AGENT"},
         headers={"X-CSRF-Token": csrf},
     )
     run_id = run_resp.json()["runId"]
@@ -316,10 +318,11 @@ def test_agent_repeated_calls_termination(client):
             headers={"X-CSRF-Token": csrf},
         )
         conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
-            json={"question": "测试循环调用", "mode": "AGENT"},
+            json={"question": "测试循环调用", "segmentId": segment_id, "mode": "AGENT"},
             headers={"X-CSRF-Token": csrf},
         )
         run_id = run_resp.json()["runId"]
@@ -378,10 +381,11 @@ def test_agent_unknown_tool_handled(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "测试未知工具", "mode": "AGENT"},
+        json={"question": "测试未知工具", "segmentId": segment_id, "mode": "AGENT"},
         headers={"X-CSRF-Token": csrf},
     )
     run_id = run_resp.json()["runId"]
