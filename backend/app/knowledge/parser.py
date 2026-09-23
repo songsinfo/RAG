@@ -1,4 +1,5 @@
 import hashlib
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -15,6 +16,44 @@ def _bool_form(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _prepare_docling_source(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    lower = filename.lower()
+    if lower.endswith((".txt", ".text")):
+        try:
+            text = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ApiException(422, "ENCODING_INVALID", "文本文件必须为 UTF-8") from exc
+        return text.encode("utf-8"), filename
+
+    if lower.endswith(".jsonl"):
+        try:
+            text = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ApiException(422, "ENCODING_INVALID", "FAQ JSONL 必须为 UTF-8") from exc
+        sections = []
+        for line_no, raw in enumerate(text.splitlines(), start=1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except Exception as exc:
+                raise ApiException(422, "FAQ_INVALID", f"FAQ 第 {line_no} 行不是合法 JSON") from exc
+            if not isinstance(row, dict):
+                raise ApiException(422, "FAQ_INVALID", f"FAQ 第 {line_no} 行必须是对象")
+            question = str(row.get("question") or "").strip()
+            answer = str(row.get("answer") or "").strip()
+            if not question or not answer:
+                raise ApiException(422, "FAQ_INVALID", f"FAQ 第 {line_no} 行缺少 question/answer")
+            sections.append(
+                f"# FAQ {line_no}\n\n**问题：** {question}\n\n**答案：** {answer}"
+            )
+        if not sections:
+            raise ApiException(422, "EMPTY_DOCUMENT", "FAQ JSONL 没有有效内容")
+        return ("\n\n".join(sections) + "\n").encode("utf-8"), f"{Path(filename).stem}.md"
+
+    return file_bytes, filename
+
+
 def _docling_hybrid_chunks(
     file_bytes: bytes,
     filename: str,
@@ -22,6 +61,7 @@ def _docling_hybrid_chunks(
     max_tokens: int,
     tokenizer: str,
     merge_peers: bool,
+    vision: bool,
 ) -> List[Dict[str, Any]]:
     """Parse and chunk every supported input through Docling HybridChunker."""
     base_url = (os.getenv("DOCLING_URL") or settings.DOCLING_URL).rstrip("/")
@@ -38,6 +78,8 @@ def _docling_hybrid_chunks(
         "convert_table_mode": "accurate",
         "convert_abort_on_error": "true",
         "convert_do_pdf_heading_hierarchy": "true",
+        "convert_do_picture_classification": _bool_form(vision),
+        "convert_do_picture_description": _bool_form(vision),
         # HybridChunker options.
         "chunking_use_markdown_tables": "true",
         "chunking_include_raw_text": "true",
@@ -86,6 +128,14 @@ def _docling_hybrid_chunks(
             "DOCLING_INVALID_RESPONSE",
             "Docling HybridChunker 未返回有效 chunks",
         )
+
+    warnings = payload.get("warnings") if isinstance(payload, dict) else None
+    if isinstance(warnings, list) and warnings:
+        first = dict(chunks[0])
+        metadata = dict(first.get("metadata") or {})
+        metadata["doclingWarnings"] = warnings[:100]
+        first["metadata"] = metadata
+        chunks = [first, *chunks[1:]]
     return chunks
 
 
@@ -120,12 +170,14 @@ def parse_and_chunk_document(
         else os.getenv("DOCLING_CHUNK_MERGE_PEERS", str(settings.DOCLING_CHUNK_MERGE_PEERS))
     ).lower() in {"1", "true", "yes", "on"}
 
+    prepared_bytes, prepared_filename = _prepare_docling_source(file_bytes, filename)
     docling_chunks = _docling_hybrid_chunks(
-        file_bytes,
-        filename,
+        prepared_bytes,
+        prepared_filename,
         max_tokens=max_tokens,
         tokenizer=tokenizer,
         merge_peers=merge_peers,
+        vision=bool(cfg.get("vision", False)),
     )
     return adapt_docling_hybrid_chunks(
         docling_chunks,

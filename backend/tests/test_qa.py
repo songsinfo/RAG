@@ -77,15 +77,12 @@ def test_claim_validator_logic():
     assert validated["status"] == "COMPLETED"
     assert "Milvus支持混合检索 [E1]" in validated["answer"]
 
-    # Model-generated Unicode offsets can be inaccurate; retain the valid
-    # evidence reference and normalize it to the complete chunk.
+    # Java baseline contract: invalid offsets are rejected rather than
+    # silently widened to the complete evidence chunk.
     payload["claims"][0]["evidence"][0] = {"evidenceId": "E1", "start": 50, "end": 500}
-    validated = validate_claims(payload, evidence_map)
-    assert validated["claims"][0]["evidence"][0] == {
-        "evidenceId": "E1",
-        "start": 0,
-        "end": len(evidence_map["E1"]),
-    }
+    with pytest.raises(ApiException) as exc:
+        validate_claims(payload, evidence_map)
+    assert exc.value.code == "INVALID_MODEL_EVIDENCE"
 
     # Invalid evidence id
     payload_bad_id = {
@@ -240,12 +237,13 @@ def test_qa_run_lifecycle_and_evidence(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = c_resp.json()["conversationId"]
+    segment_id = c_resp.json()["currentSegmentId"]
 
     # 2. Submit run
     idem_key = "qa-idem-key-1"
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "LangChain pipeline 特性是什么？", "mode": "RAG", "strictMode": True},
+        json={"question": "LangChain pipeline 特性是什么？", "segmentId": segment_id, "mode": "RAG", "strictMode": True},
         headers={"X-CSRF-Token": csrf, "Idempotency-Key": idem_key},
     )
     assert run_resp.status_code == 202
@@ -255,7 +253,7 @@ def test_qa_run_lifecycle_and_evidence(client):
     # 3. Test idempotency
     dup_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "LangChain pipeline 特性是什么？", "mode": "RAG", "strictMode": True},
+        json={"question": "LangChain pipeline 特性是什么？", "segmentId": segment_id, "mode": "RAG", "strictMode": True},
         headers={"X-CSRF-Token": csrf, "Idempotency-Key": idem_key},
     )
     assert dup_resp.status_code == 202
@@ -301,11 +299,12 @@ def test_qa_no_evidence_handling(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = c_resp.json()["conversationId"]
+    segment_id = c_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "量子引力透镜超空间跃迁引擎理论是什么？", "mode": "RAG"},
-        headers={"X-CSRF-Token": csrf},
+        json={"question": "量子引力透镜超空间跃迁引擎理论是什么？", "segmentId": segment_id, "mode": "RAG"},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "qa-no-evidence-1"},
     )
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]

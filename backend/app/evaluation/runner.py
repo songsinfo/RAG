@@ -204,6 +204,9 @@ class EvaluationRunner:
         cap = number(body.get("maxCostCny", 10))
         if cap <= 0 or cap > 10:
             raise ApiException(400, "INVALID_BATCH_LIMIT", "批次费用上限需大于0且不超过10元")
+        max_model_calls = int(body.get("maxModelCalls", 1000))
+        if max_model_calls < 1 or max_model_calls > 1000:
+            raise ApiException(400, "INVALID_BATCH_LIMIT", "批次模型调用上限需在1到1000之间")
 
         if est.get("estimatedCostCny") is None:
             raise ApiException(409, "MODEL_PRICING_NOT_CONFIGURED", "价格未知不能启动付费评估，可先运行RETRIEVAL_ONLY")
@@ -218,6 +221,7 @@ class EvaluationRunner:
 
         manifest = dict(est)
         manifest["maxCostCny"] = cap
+        manifest["maxModelCalls"] = max_model_calls
         manifest["requesterId"] = actor.user_id
         manifest["environment"] = getattr(settings, "RAG_ENVIRONMENT", "demo")
 
@@ -249,7 +253,11 @@ class EvaluationRunner:
                     status="QUEUED",
                     stage="EVALUATING",
                     available_at=now,
-                    checkpoint={"runId": run_id, "maxCostCny": cap},
+                    checkpoint={
+                        "runId": run_id,
+                        "maxCostCny": cap,
+                        "maxModelCalls": max_model_calls,
+                    },
                     created_at=now,
                     updated_at=now,
                 )
@@ -341,6 +349,7 @@ class EvaluationRunner:
             mode = manifest.get("mode", "RAG")
             snapshot_id = str(run_row.snapshot_id)
             eval_config_id = str(run_row.config_id)
+            eval_job_id = str(run_row.job_id)
 
             snap_docs = conn.execute(
                 select(eval_snapshot_document_table.c.document_id).where(
@@ -418,6 +427,7 @@ class EvaluationRunner:
                         document_ids=allowed_doc_ids,
                         config_id=eval_config_id,
                         run_id=None,
+                        job_id=eval_job_id,
                     )
                     hits = retrieval["hits"]
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
@@ -468,6 +478,7 @@ class EvaluationRunner:
                     # Create conversation
                     conv = QaService.create_conversation(persona_actor, {"title": f"Eval: {c_dict.get('caseKey')}"})
                     conv_id = conv["conversationId"]
+                    segment_id = conv["currentSegmentId"]
 
                     # Submit run
                     submitted = QaService.submit_run(
@@ -475,11 +486,13 @@ class EvaluationRunner:
                         conv_id,
                         {
                             "question": question_text,
+                            "segmentId": segment_id,
                             "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
                             "strictMode": manifest.get("strict", False),
-                            "configId": eval_config_id,
                         },
                         idempotency_key=f"eval:{result_id}:0",
+                        trusted_config_id=eval_config_id,
+                        trusted_evaluation_job_id=str(run_row.job_id),
                     )
                     qa_run_id = submitted["runId"]
 

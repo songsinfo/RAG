@@ -67,6 +67,21 @@ def create_config(body: Dict[str, Any], actor: Actor = Depends(get_current_actor
         raise ApiException(400, "INVALID_CONFIG", "配置字段无效")
     if kind == "RETRIEVAL":
         validate_retrieval_payload(payload)
+    if kind == "MODEL":
+        alias = str(payload.get("modelAlias") or "").strip()
+        currency = str(payload.get("currency", "CNY")).upper()
+        try:
+            input_price = float(payload.get("inputPricePerMillion"))
+            output_price = float(payload.get("outputPricePerMillion"))
+        except (TypeError, ValueError) as exc:
+            raise ApiException(400, "INVALID_CONFIG", "MODEL 配置必须包含合法价格") from exc
+        if (
+            not alias
+            or currency != "CNY"
+            or input_price < 0
+            or output_price < 0
+        ):
+            raise ApiException(400, "INVALID_CONFIG", "MODEL 配置必须包含 modelAlias、CNY 价格且价格非负")
 
     payload_json = json.dumps(payload, ensure_ascii=False)
     if len(payload_json) > 64000 or "api_key" in payload_json.lower() or "apikey" in payload_json.lower():

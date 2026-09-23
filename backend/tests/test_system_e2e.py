@@ -714,12 +714,13 @@ def test_ai_gateway_failure_leads_to_clean_terminal_failure(client: TestClient):
         headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
     )
     conv_id = conv_resp.json()["conversationId"]
+    segment_id = conv_resp.json()["currentSegmentId"]
 
     # Patch ModelGateway.chat to simulate gateway failure
     with patch.object(ModelGateway, "chat", side_effect=ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "大模型网关故障")):
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
-            json={"question": "会话网关测试相关证据内容？", "mode": "RAG"},
+            json={"question": "会话网关测试相关证据内容？", "segmentId": segment_id, "mode": "RAG"},
             headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
         )
         assert run_resp.status_code == 202

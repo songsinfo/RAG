@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy import (
-    MetaData, Table, Column, String, DateTime, Boolean, BigInteger, Integer, LargeBinary, Text, JSON
+    MetaData, Table, Column, String, DateTime, Boolean, BigInteger, Integer, LargeBinary, Text, JSON, Numeric, CheckConstraint
 )
 from sqlalchemy.sql import func
 
@@ -361,6 +361,17 @@ run_source_table = Table(
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
 
+run_dependency_table = Table(
+    "run_dependency",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("run_id", String(36), nullable=False),
+    Column("prior_run_id", String(36), nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
 run_event_table = Table(
     "run_event",
     metadata,
@@ -376,6 +387,36 @@ run_event_table = Table(
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
 
+tenant_budget_table = Table(
+    "tenant_budget",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("period_month", String(7), nullable=False),
+    Column("currency", String(3), nullable=False, default="CNY", server_default="CNY"),
+    Column("limit_amount", Numeric(18, 6), nullable=False),
+    Column("reserved_amount", Numeric(18, 6), nullable=False, default=0, server_default="0"),
+    Column("settled_amount", Numeric(18, 6), nullable=False, default=0, server_default="0"),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
+budget_reservation_table = Table(
+    "budget_reservation",
+    metadata,
+    Column("tenant_id", String(36), primary_key=True),
+    Column("id", String(36), primary_key=True),
+    Column("budget_id", String(36), nullable=False),
+    Column("caller_environment", String(128), nullable=False),
+    Column("caller_call_id", String(36), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("reserved_amount", Numeric(18, 6), nullable=False),
+    Column("settled_amount", Numeric(18, 6), nullable=True),
+    Column("expires_at", DateTime(6), nullable=False),
+    Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+)
+
 model_call_table = Table(
     "model_call",
     metadata,
@@ -384,20 +425,21 @@ model_call_table = Table(
     Column("run_id", String(36), nullable=True),
     Column("job_id", String(36), nullable=True),
     Column("purpose", String(24), nullable=False),
-    Column("model_config_id", String(36), nullable=True),
+    Column("model_config_id", String(36), nullable=False),
     Column("attempt_no", Integer, nullable=False, default=1, server_default="1"),
     Column("status", String(16), nullable=False, default="SUCCESS", server_default="SUCCESS"),
-    Column("reserved_amount", String(32), nullable=True),
-    Column("settled_amount", String(32), nullable=True),
+    Column("reserved_amount", Numeric(18, 6), nullable=False, default=0, server_default="0"),
+    Column("settled_amount", Numeric(18, 6), nullable=True),
     Column("input_tokens", BigInteger, nullable=True),
     Column("output_tokens", BigInteger, nullable=True),
     Column("provider_request_id", String(255), nullable=True),
-    Column("pricing_snapshot", JSON, nullable=True),
+    Column("pricing_snapshot", JSON, nullable=False),
     Column("usage_detail", JSON, nullable=True),
-    Column("reservation_authority", String(128), nullable=True),
+    Column("reservation_authority", String(128), nullable=False),
     Column("reservation_id", String(36), nullable=True),
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
+    CheckConstraint("((run_id IS NULL) <> (job_id IS NULL))", name="ck_model_call_owner"),
 )
 
 feedback_table = Table(
