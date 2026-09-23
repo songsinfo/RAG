@@ -208,8 +208,8 @@ class BudgetService:
                     )
                     .with_for_update()
                 ).first()
-                if not batch_job or str(batch_job.status) in {"FAILED", "CANCELLED"}:
-                    raise ApiException(409, "BATCH_NOT_RUNNING", "评测批次已停止")
+                if not batch_job or str(batch_job.status) != "RUNNING":
+                    raise ApiException(409, "BATCH_NOT_RUNNING", "评测批次未处于运行状态")
 
                 checkpoint = batch_job.checkpoint if isinstance(batch_job.checkpoint, dict) else {}
                 max_cost = cls._decimal(checkpoint.get("maxCostCny", 10), "maxCostCny")
