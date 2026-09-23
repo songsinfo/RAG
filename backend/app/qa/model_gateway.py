@@ -620,7 +620,7 @@ class ModelGateway:
             except Exception as exc:
                 cls._record_call(
                     tenant_id, call_id, run_id, "RERANK",
-                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias, job_id=job_id
                 )
                 raise ApiException(503, "RERANK_UNAVAILABLE", f"Reranker 网关调用失败: {exc}")
 
