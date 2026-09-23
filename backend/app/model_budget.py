@@ -34,22 +34,37 @@ class BudgetService:
 
     @classmethod
     def pricing(cls, tenant_id: str, model_alias: str) -> Dict[str, Any]:
-        config_id = f"cfg-model-{model_alias}"
         with get_db_connection() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 select(
                     config_revision_table.c.id,
                     config_revision_table.c.payload,
                     config_revision_table.c.status,
-                ).where(
+                    config_revision_table.c.revision,
+                    config_revision_table.c.updated_at,
+                )
+                .where(
                     and_(
                         config_revision_table.c.tenant_id == tenant_id,
-                        config_revision_table.c.id == config_id,
                         config_revision_table.c.kind == "MODEL",
+                        config_revision_table.c.status.in_(["ACTIVE", "PUBLISHED"]),
                     )
                 )
-            ).first()
-        if not row or str(row.status).upper() not in {"ACTIVE", "PUBLISHED"}:
+                .order_by(
+                    config_revision_table.c.updated_at.desc(),
+                    config_revision_table.c.revision.desc(),
+                )
+            ).fetchall()
+        row = next(
+            (
+                item
+                for item in rows
+                if isinstance(item.payload, dict)
+                and str(item.payload.get("modelAlias") or "").strip() == model_alias
+            ),
+            None,
+        )
+        if not row:
             raise ApiException(409, "MODEL_PRICING_NOT_CONFIGURED", f"模型价格配置不存在: {model_alias}")
         payload = row.payload if isinstance(row.payload, dict) else {}
         if str(payload.get("currency", "CNY")).upper() != "CNY":
