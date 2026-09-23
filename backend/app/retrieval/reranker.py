@@ -8,6 +8,7 @@ def rerank_hits(
     tenant_id: str,
     run_id: Optional[str],
     query: str,
+    job_id: Optional[str] = None,
     hits: List[Dict[str, Any]],
     model_alias: str,
     top_k: int,
@@ -24,6 +25,7 @@ def rerank_hits(
             documents=[str(h.get("text") or "") for h in hits],
             top_n=min(top_k, len(hits)),
             model_alias=model_alias,
+            job_id=job_id,
         )
     except ApiException as exc:
         if not fail_open:
