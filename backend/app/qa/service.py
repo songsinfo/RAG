@@ -15,6 +15,7 @@ from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     tenant_table,
+    app_user_table,
     conversation_table,
     context_segment_table,
     segment_kb_table,
@@ -415,8 +416,6 @@ class QaService:
         trusted_config_id: Optional[str] = None,
         trusted_evaluation_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not idempotency_key or len(idempotency_key) > 128:
-            raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         if not idempotency_key or len(idempotency_key) > 128:
             raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         question = str(body.get("question", "")).strip()
