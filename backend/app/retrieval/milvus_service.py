@@ -260,6 +260,7 @@ class MilvusHybridService:
         allowed_build_epochs: Optional[Dict[str, int]] = None,
         representations: Optional[List[str]] = None,
         run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
         num_candidates: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
@@ -359,7 +360,13 @@ class MilvusHybridService:
                     )
 
                 if mode == "DENSE":
-                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id, run_id=run_id)[0]
+                    query_emb = get_embeddings(
+                        [query],
+                        dim=1024,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        job_id=job_id,
+                    )[0]
                     res = client.search(
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
@@ -392,6 +399,7 @@ class MilvusHybridService:
                     dim=1024,
                     tenant_id=tenant_id,
                     run_id=run_id,
+                    job_id=job_id,
                 )[0]
                 dense_res = client.search(
                     collection_name=COLLECTION_NAME,
@@ -466,7 +474,13 @@ class MilvusHybridService:
             bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
         if mode in {"DENSE", "HYBRID"}:
-            query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id, run_id=run_id)[0]
+            query_emb = get_embeddings(
+                        [query],
+                        dim=1024,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        job_id=job_id,
+                    )[0]
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
