@@ -806,3 +806,68 @@ def test_fallback_model_rechecks_background_job_gate(monkeypatch):
             job_id=job_id,
         )
     assert exc.value.code == "CANCELLED"
+
+
+def test_pre_dispatch_job_gate_releases_as_not_sent(monkeypatch):
+    now = datetime.now(timezone.utc)
+    job_id = "job-pre-dispatch-gate"
+    with app_db.engine.begin() as conn:
+        conn.execute(
+            job_table.insert().values(
+                tenant_id=ACTOR.tenant_id,
+                id=job_id,
+                kind="INGEST",
+                target_id="doc-pre-dispatch",
+                requested_by=ACTOR.user_id,
+                idempotency_key="job-pre-dispatch-key",
+                request_hash=b"job-pre-dispatch",
+                status="CANCELLED",
+                stage="INDEXING",
+                attempt=0,
+                available_at=now,
+                lease_epoch=1,
+                cancel_requested_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    class NeverInvoke:
+        def invoke(self, messages):
+            raise AssertionError("provider must not be invoked after cancellation")
+
+    statuses = []
+    monkeypatch.setenv("LITELM_BASE_URL", "http://gateway.invalid")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://gateway.invalid")
+    monkeypatch.setattr("app.qa.model_gateway.get_chat_model", lambda *args, **kwargs: NeverInvoke())
+    monkeypatch.setattr(
+        BudgetService,
+        "reserve",
+        classmethod(lambda cls, *args, **kwargs: {
+            "id": "reservation-pre-dispatch",
+            "amount": Decimal("0"),
+            "pricing": {
+                "configId": "cfg-model-chat-main",
+                "inputPricePerMillion": Decimal("0"),
+                "outputPricePerMillion": Decimal("0"),
+            },
+            "status": "RESERVED",
+        }),
+    )
+    monkeypatch.setattr(
+        ModelGateway,
+        "_record_call",
+        classmethod(lambda cls, *args, **kwargs: statuses.append(kwargs.get("status") if "status" in kwargs else args[4])),
+    )
+
+    with pytest.raises(ApiException) as exc:
+        ModelGateway.chat(
+            ACTOR.tenant_id,
+            run_id=None,
+            purpose="ENRICH",
+            messages=[{"role": "user", "content": "test"}],
+            model_alias="chat-main",
+            job_id=job_id,
+        )
+    assert exc.value.code == "CANCELLED"
+    assert statuses == ["NOT_SENT"]
