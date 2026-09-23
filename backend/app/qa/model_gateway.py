@@ -163,12 +163,16 @@ class ModelGateway:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
 
                 policy = AgentRuntimePolicy.from_env()
-                try:
+
+                def invoke_primary():
                     cls.assert_run_sources_current(tenant_id, run_id)
+                    return llm.invoke(lc_messages)
+
+                try:
                     sent = True
                     response = retry_call(
                         f"llm:{model_alias}",
-                        lambda: llm.invoke(lc_messages),
+                        invoke_primary,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -179,9 +183,14 @@ class ModelGateway:
                     fallback = get_chat_model(fallback_alias, max_tokens, timeout_seconds)
                     if fallback is None:
                         raise
+
+                    def invoke_fallback():
+                        cls.assert_run_sources_current(tenant_id, run_id)
+                        return fallback.invoke(lc_messages)
+
                     response = retry_call(
                         f"llm:{fallback_alias}",
-                        lambda: fallback.invoke(lc_messages),
+                        invoke_fallback,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -401,12 +410,16 @@ class ModelGateway:
                 llm = base_model.bind_tools(tools, strict=True)
 
                 policy = AgentRuntimePolicy.from_env()
-                try:
+
+                def invoke_primary_tools():
                     cls.assert_run_sources_current(tenant_id, run_id)
+                    return llm.invoke(lc_messages)
+
+                try:
                     sent = True
                     response = retry_call(
                         f"llm-tools:{model_alias}",
-                        lambda: llm.invoke(lc_messages),
+                        invoke_primary_tools,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -418,9 +431,14 @@ class ModelGateway:
                     if fallback_model is None:
                         raise
                     fallback_bound = fallback_model.bind_tools(tools, strict=True)
+
+                    def invoke_fallback_tools():
+                        cls.assert_run_sources_current(tenant_id, run_id)
+                        return fallback_bound.invoke(lc_messages)
+
                     response = retry_call(
                         f"llm-tools:{fallback_alias}",
-                        lambda: fallback_bound.invoke(lc_messages),
+                        invoke_fallback_tools,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
