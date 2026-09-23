@@ -717,7 +717,15 @@ class ModelGateway:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
-            persisted_status = "SETTLED" if status == "SUCCESS" and budget.get("reservationId") else status
+            if budget.get("reservationId"):
+                if status == "SUCCESS":
+                    persisted_status = "SETTLED"
+                elif status == "NOT_SENT":
+                    persisted_status = "NOT_SENT"
+                else:
+                    persisted_status = "UNKNOWN"
+            else:
+                persisted_status = status
             with get_db_connection() as conn:
                 conn.execute(
                     model_call_table.insert().values(
