@@ -213,6 +213,8 @@ CREATE TABLE index_build (
   model_fingerprint VARCHAR(255) NULL,
   embedding_dims INT NULL,
   capabilities JSON NOT NULL,
+  quality_warnings JSON NULL,
+  review_reason VARCHAR(2000) NULL,
   manifest_hash BINARY(32) NULL,
   fence BIGINT NOT NULL,
   published_at DATETIME(6) NULL,
