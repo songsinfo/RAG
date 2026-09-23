@@ -108,6 +108,6 @@ jobs:
           checks = " ".join(
               (item.get("sqltext") or "")
               for item in inspector.get_check_constraints("model_call")
-          )
-          assert "run_id IS NULL" in checks and "job_id IS NULL" in checks, checks
+          ).lower()
+          assert "run_id is null" in checks and "job_id is null" in checks, checks
           PY
