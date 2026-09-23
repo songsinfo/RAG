@@ -416,7 +416,7 @@ class RetrievalPipeline:
         max_score = max(raw_scores)
 
         selected: List[int] = []
-        remaining = set(range(len(hits)))
+        remaining = list(range(len(hits)))
         target = min(max(1, count), len(hits))
         while remaining and len(selected) < target:
             best_index = None
