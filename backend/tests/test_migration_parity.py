@@ -1,3 +1,4 @@
+import json
 import io
 import uuid
 import zipfile
@@ -620,3 +621,29 @@ def test_real_milvus_hybrid_fuses_after_canonical_dedupe(monkeypatch):
     assert len(ids) == len(set(ids))
     assert ids[0] == "c2"
     assert set(ids) == {"c1", "c2", "c3"}
+
+
+def test_rewrite_keeps_original_and_rewritten_query(monkeypatch):
+    monkeypatch.setattr(
+        ModelGateway,
+        "chat",
+        classmethod(lambda cls, *args, **kwargs: json.dumps({"query": "独立改写问题"}, ensure_ascii=False)),
+    )
+    warnings = []
+    independent, variants, hyde = RetrievalPipeline._prepare_queries(
+        actor=ACTOR,
+        query="原始追问",
+        history=[{"role": "user", "content": "上一轮问题"}],
+        cfg=RetrievalConfig(
+            config_id="rewrite-parity",
+            rewrite_enabled=True,
+            max_variants=4,
+        ),
+        run_id="run-rewrite-parity",
+        job_id=None,
+        warnings=warnings,
+    )
+    assert independent == "独立改写问题"
+    assert variants == ["原始追问", "独立改写问题"]
+    assert hyde is None
+    assert warnings == []
