@@ -1754,10 +1754,8 @@ class KnowledgeService:
     @staticmethod
     def get_artifact(actor: Actor, doc_id: str, artifact_id: str) -> bytes:
         with get_db_connection() as conn:
-            readable = can_read_document(conn, actor, doc_id)
-        if not readable:
-            raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
-        with get_db_connection() as conn:
+            if not can_read_document(conn, actor, doc_id):
+                raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
             row = conn.execute(
                 select(artifact_table.c.storage_key).where(
                     and_(
