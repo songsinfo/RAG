@@ -1151,6 +1151,7 @@ class KnowledgeService:
                     version_id=version_id,
                     index_epoch=int(lease_epoch or 0),
                     representations=representation_map,
+                    job_id=job_id,
                 )
 
             # Fenced publish: only the current lease owner can make the build active.
