@@ -8,11 +8,11 @@ def rerank_hits(
     tenant_id: str,
     run_id: Optional[str],
     query: str,
-    job_id: Optional[str] = None,
     hits: List[Dict[str, Any]],
     model_alias: str,
     top_k: int,
     fail_open: bool,
+    job_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     if not hits:
         return [], []
