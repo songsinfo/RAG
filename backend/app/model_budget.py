@@ -101,6 +101,7 @@ class BudgetService:
         output_upper_bound: int,
         caller_environment: str | None = None,
         run_id: str | None = None,
+        job_id: str | None = None,
     ) -> Dict[str, Any]:
         pricing = cls.pricing(tenant_id, model_alias)
         amount = cls.estimate(pricing, input_upper_bound, output_upper_bound)
@@ -122,6 +123,17 @@ class BudgetService:
                 ).first()
                 budget_json = run_row.budget_json if run_row and isinstance(run_row.budget_json, dict) else {}
                 batch_job_id = str(budget_json.get("evaluationJobId") or "") or None
+            elif job_id:
+                owner_job = conn.execute(
+                    select(job_table.c.kind, job_table.c.status).where(
+                        and_(
+                            job_table.c.tenant_id == tenant_id,
+                            job_table.c.id == job_id,
+                        )
+                    )
+                ).first()
+                if owner_job and str(owner_job.kind) == "EVALUATE":
+                    batch_job_id = job_id
 
             environment = (
                 f"{base_environment}|eval:{batch_job_id}"
