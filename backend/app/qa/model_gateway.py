@@ -272,6 +272,7 @@ class ModelGateway:
             input_tokens=30,
             output_tokens=30,
             model_alias=model_alias,
+            job_id=job_id,
         )
 
         # Deterministic simulation based on prompt
@@ -346,7 +347,7 @@ class ModelGateway:
 
         if cls._agent_mock_handler:
             result = cls._agent_mock_handler(messages)
-            cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias)
+            cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias, job_id=job_id)
             return result
 
         if gateway_url:
@@ -469,6 +470,7 @@ class ModelGateway:
                     input_tokens,
                     output_tokens,
                     model_alias,
+                    job_id=job_id,
                 )
                 return {
                     "role": "assistant",
@@ -478,22 +480,22 @@ class ModelGateway:
             except ApiException:
                 cls._record_call(
                     tenant_id, call_id, run_id, purpose,
-                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias, job_id=job_id
                 )
                 raise
             except Exception as e:
                 cls._record_call(
                     tenant_id, call_id, run_id, purpose,
-                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias, job_id=job_id
                 )
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"Agent大模型网关调用失败: {e}")
 
         if not is_test_env():
-            cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
+            cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias, job_id=job_id)
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # Default deterministic mock: first round search, second round answer
-        cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias)
+        cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias, job_id=job_id)
         has_tool_response = any(m.get("role") == "tool" for m in messages)
         if not has_tool_response:
             user_msg = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
@@ -612,7 +614,7 @@ class ModelGateway:
             except ApiException:
                 cls._record_call(
                     tenant_id, call_id, run_id, "RERANK",
-                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias
+                    "FAILED" if sent else "NOT_SENT", 0, 0, model_alias, job_id=job_id
                 )
                 raise
             except Exception as exc:
@@ -624,7 +626,7 @@ class ModelGateway:
 
         if not is_test_env():
             cls._record_call(
-                tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias, job_id=job_id
             )
             raise ApiException(503, "RERANK_UNAVAILABLE", "未配置可用的 Reranker 网关")
 
@@ -650,6 +652,7 @@ class ModelGateway:
             input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
             output_tokens=0,
             model_alias=model_alias,
+            job_id=job_id,
         )
         return scored[: min(top_n, len(scored))]
 
