@@ -237,12 +237,13 @@ def test_qa_run_lifecycle_and_evidence(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = c_resp.json()["conversationId"]
+    segment_id = c_resp.json()["currentSegmentId"]
 
     # 2. Submit run
     idem_key = "qa-idem-key-1"
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "LangChain pipeline 特性是什么？", "mode": "RAG", "strictMode": True},
+        json={"question": "LangChain pipeline 特性是什么？", "segmentId": segment_id, "mode": "RAG", "strictMode": True},
         headers={"X-CSRF-Token": csrf, "Idempotency-Key": idem_key},
     )
     assert run_resp.status_code == 202
@@ -252,7 +253,7 @@ def test_qa_run_lifecycle_and_evidence(client):
     # 3. Test idempotency
     dup_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "LangChain pipeline 特性是什么？", "mode": "RAG", "strictMode": True},
+        json={"question": "LangChain pipeline 特性是什么？", "segmentId": segment_id, "mode": "RAG", "strictMode": True},
         headers={"X-CSRF-Token": csrf, "Idempotency-Key": idem_key},
     )
     assert dup_resp.status_code == 202
@@ -298,11 +299,12 @@ def test_qa_no_evidence_handling(client):
         headers={"X-CSRF-Token": csrf},
     )
     conv_id = c_resp.json()["conversationId"]
+    segment_id = c_resp.json()["currentSegmentId"]
 
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
-        json={"question": "量子引力透镜超空间跃迁引擎理论是什么？", "mode": "RAG"},
-        headers={"X-CSRF-Token": csrf},
+        json={"question": "量子引力透镜超空间跃迁引擎理论是什么？", "segmentId": segment_id, "mode": "RAG"},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "qa-no-evidence-1"},
     )
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
