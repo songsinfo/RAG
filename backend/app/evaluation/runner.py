@@ -476,6 +476,7 @@ class EvaluationRunner:
                     # Create conversation
                     conv = QaService.create_conversation(persona_actor, {"title": f"Eval: {c_dict.get('caseKey')}"})
                     conv_id = conv["conversationId"]
+                    segment_id = conv["currentSegmentId"]
 
                     # Submit run
                     submitted = QaService.submit_run(
@@ -483,6 +484,7 @@ class EvaluationRunner:
                         conv_id,
                         {
                             "question": question_text,
+                            "segmentId": segment_id,
                             "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
                             "strictMode": manifest.get("strict", False),
                         },
