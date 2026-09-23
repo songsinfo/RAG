@@ -37,7 +37,16 @@ def queued_run(monkeypatch):
     import app.qa.service as qa
     monkeypatch.setattr(qa, "is_test_env", lambda: False)
     conv = QaService.create_conversation(ACTOR, {"title": "review"})
-    return QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus", "mode": "AGENT"})["runId"]
+    return QaService.submit_run(
+        ACTOR,
+        conv["conversationId"],
+        {
+            "question": "Milvus",
+            "segmentId": conv["currentSegmentId"],
+            "mode": "AGENT",
+        },
+        idempotency_key=str(uuid.uuid4()),
+    )["runId"]
 
 
 def test_restore_rebuild_preserves_published_epoch(monkeypatch, tmp_path):
