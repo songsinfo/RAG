@@ -74,6 +74,7 @@ def get_embeddings(
                 model_alias="embedding-main",
                 input_upper_bound=input_tokens,
                 output_upper_bound=0,
+                run_id=run_id,
             )
             try:
                 from app.qa.model_gateway import ModelGateway
