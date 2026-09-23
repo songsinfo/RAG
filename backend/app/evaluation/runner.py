@@ -349,6 +349,7 @@ class EvaluationRunner:
             mode = manifest.get("mode", "RAG")
             snapshot_id = str(run_row.snapshot_id)
             eval_config_id = str(run_row.config_id)
+            eval_job_id = str(run_row.job_id)
 
             snap_docs = conn.execute(
                 select(eval_snapshot_document_table.c.document_id).where(
@@ -426,6 +427,7 @@ class EvaluationRunner:
                         document_ids=allowed_doc_ids,
                         config_id=eval_config_id,
                         run_id=None,
+                        job_id=eval_job_id,
                     )
                     hits = retrieval["hits"]
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
