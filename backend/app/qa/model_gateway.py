@@ -212,6 +212,7 @@ class ModelGateway:
 
                     def invoke_fallback():
                         cls.assert_run_sources_current(tenant_id, run_id)
+                        cls.assert_job_current(tenant_id, job_id)
                         return fallback.invoke(lc_messages)
 
                     response = retry_call(
@@ -463,6 +464,7 @@ class ModelGateway:
 
                     def invoke_fallback_tools():
                         cls.assert_run_sources_current(tenant_id, run_id)
+                        cls.assert_job_current(tenant_id, job_id)
                         return fallback_bound.invoke(lc_messages)
 
                     response = retry_call(
