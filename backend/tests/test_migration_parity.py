@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import app.db as app_db
 from app.errors import ApiException
@@ -17,6 +17,8 @@ from app.knowledge.imports import create_import_preview, consume_import_preview,
 from app.model_budget import BudgetService
 from app.models import (
     document_table,
+    artifact_table,
+    index_build_table,
     eval_case_table,
     eval_dataset_version_table,
     eval_gold_table,
@@ -929,3 +931,39 @@ def test_sent_failure_persists_unknown_model_call_status():
 
     assert call_status == "UNKNOWN"
     assert reservation_status == "UNKNOWN"
+
+
+def test_artifact_download_and_warning_acceptance_check_document_access():
+    kb = KnowledgeService.create_kb(ACTOR, "Access checks KB", [])
+    uploaded = KnowledgeService.upload_document(
+        ACTOR,
+        kb["id"],
+        None,
+        "access-check.txt",
+        b"Access check content",
+        "access-check-upload",
+        {},
+    )
+    with app_db.engine.begin() as conn:
+        artifact_id = conn.execute(
+            select(artifact_table.c.id).where(
+                artifact_table.c.document_id == uploaded["documentId"]
+            )
+        ).scalar_one()
+        conn.execute(
+            update(index_build_table)
+            .where(index_build_table.c.id == uploaded["buildId"])
+            .values(status="NEEDS_REVIEW")
+        )
+        conn.execute(
+            update(job_table)
+            .where(job_table.c.id == uploaded["jobId"])
+            .values(status="NEEDS_REVIEW")
+        )
+
+    assert KnowledgeService.get_artifact(
+        ACTOR, uploaded["documentId"], str(artifact_id)
+    ) == b"Access check content"
+    assert KnowledgeService.accept_warnings(
+        ACTOR, uploaded["buildId"], "Reviewed parser warning"
+    ) == {"buildId": uploaded["buildId"], "status": "QUEUED"}
