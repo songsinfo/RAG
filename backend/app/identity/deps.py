@@ -179,7 +179,7 @@ def get_readable_build_records(
     )
     if kb_ids:
         stmt = stmt.where(document_table.c.kb_id.in_(kb_ids))
-    if document_ids:
+    if document_ids is not None:
         stmt = stmt.where(document_table.c.id.in_(document_ids))
 
     rows = conn.execute(stmt).fetchall()
@@ -208,7 +208,10 @@ def assert_hits_still_readable(
 ) -> None:
     if not hits:
         return
-    readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
+    candidate_ids = list({str(h.get("documentId") or "") for h in hits})
+    if document_ids is not None:
+        candidate_ids = list(set(candidate_ids).intersection(document_ids))
+    readable = get_readable_build_records(conn, actor, kb_ids, candidate_ids)
     allowed = {
         (r["buildId"], r["documentId"]): int(r.get("indexEpoch") or 0)
         for r in readable

@@ -7,6 +7,7 @@ from typing import Iterable, List
 from app.config import settings, is_test_env
 from app.errors import ApiException
 from app.qa.model_clients import get_http_client
+from app.qa.model_usage import invoke_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ def get_embeddings(
     texts: List[str],
     dim: int = 1024,
     batch_size: int | None = None,
+    tenant_id: str | None = None,
 ) -> List[List[float]]:
     if not texts:
         return []
@@ -59,12 +61,14 @@ def get_embeddings(
     try:
         client = get_http_client()
         for batch in _batched(texts, batch_size):
-            resp = client.post(
+            resp = invoke_tracked(lambda: client.post(
                 endpoint,
                 headers={"Authorization": f"Bearer {master_key}"},
                 json={"model": "embedding-main", "input": batch},
                 timeout=30.0,
-            )
+            ), tenant_id=tenant_id, purpose="EMBEDDING", alias="embedding-main", payload=batch,
+                usage_reader=lambda response: {"input_tokens": response.json()["usage"]["total_tokens"], "output_tokens": 0}
+                if response.status_code == 200 and "total_tokens" in response.json().get("usage", {}) else {})
             if resp.status_code != 200:
                 err_msg = f"大模型嵌入接口返回异常状态码 {resp.status_code}: {resp.text}"
                 logger.error(err_msg)

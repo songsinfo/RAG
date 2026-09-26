@@ -1,6 +1,7 @@
 import hashlib
 import os
 import logging
+import threading
 from typing import List, Dict, Any, Optional
 from pymilvus import DataType, Function, FunctionType, AnnSearchRequest, RRFRanker, CollectionSchema, FieldSchema
 from sqlalchemy import select, and_, or_, exists
@@ -22,11 +23,16 @@ class MilvusHybridService:
     _mock_store: Dict[str, Dict[str, Any]] = {}
     _client = None
     _client_checked = False
+    _client_lock = threading.Lock()
 
     @classmethod
     def get_client(cls):
-        if not cls._client_checked:
-            cls._client_checked = True
+        with cls._client_lock:
+            return cls._connect_client()
+
+    @classmethod
+    def _connect_client(cls):
+        if cls._client is None:
             if is_test_env() and not os.getenv("MILVUS_URI"):
                 cls._client = None
                 return None
@@ -74,6 +80,7 @@ class MilvusHybridService:
                         index_params=index_params,
                     )
                 cls._client = client
+                cls._client_checked = True
                 logger.info("Connected to Milvus server at %s", milvus_uri)
             except Exception as e:
                 if not is_test_env():
@@ -104,7 +111,7 @@ class MilvusHybridService:
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start:start + batch_size]
             texts = [c["text_content"] for c in batch]
-            embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size)
+            embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size, tenant_id=tenant_id)
             records = []
 
             for chunk, emb in zip(batch, embeddings):
@@ -131,7 +138,8 @@ class MilvusHybridService:
                     "normalized_terms": norm,
                     "dense_vector": emb,
                 }
-                cls._mock_store[record_id] = record
+                if is_test_env():
+                    cls._mock_store[record_id] = record
                 records.append(record)
 
             if client:
@@ -289,7 +297,7 @@ class MilvusHybridService:
                     )
 
                 if mode == "DENSE":
-                    query_emb = get_embeddings([query], dim=1024)[0]
+                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
                     res = client.search(
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
@@ -313,7 +321,7 @@ class MilvusHybridService:
                     )
                     return normalize_result(res)[:fusion_top_k]
 
-                query_emb = get_embeddings([query], dim=1024)[0]
+                query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
                 dense_req = AnnSearchRequest(
                     data=[query_emb],
                     anns_field="dense_vector",

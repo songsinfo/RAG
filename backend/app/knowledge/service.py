@@ -479,7 +479,7 @@ class KnowledgeService:
 
         now = datetime.now(timezone.utc)
         scoped_idempotency = f"{actor.user_id}:{idempotency_key}"
-        req_hash = hashlib.sha256(f"{kb_id}:{document_id}:{filename}:{len(file_bytes)}:{json.dumps(build_config, sort_keys=True)}".encode("utf-8")).digest()
+        req_hash = hashlib.sha256(f"{kb_id}:{document_id}:{filename}:{hashlib.sha256(file_bytes).hexdigest()}:{json.dumps(build_config, sort_keys=True)}".encode("utf-8")).digest()
 
         with get_db_connection() as conn:
             # 1. Check idempotency
@@ -550,15 +550,17 @@ class KnowledgeService:
                 )
             else:
                 existing_doc = conn.execute(
-                    select(document_table.c.id).where(
+                    select(document_table).where(
                         and_(
                             document_table.c.tenant_id == actor.tenant_id,
                             document_table.c.id == doc_id,
                         )
-                    )
+                    ).with_for_update()
                 ).first()
                 if not existing_doc:
                     raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
+                if existing_doc.status != "LIVE":
+                    raise ApiException(409, "INVALID_STATE", "仅可为正常文档上传新版本")
 
             # 4. Save Artifact
             art_id = str(uuid.uuid4())
@@ -591,6 +593,7 @@ class KnowledgeService:
                     )
                 )
                 .order_by(document_version_table.c.version_no.desc())
+                .limit(1).with_for_update()
             ).scalar() or 0
             v_no = max_v + 1
 
@@ -658,6 +661,7 @@ class KnowledgeService:
                 "buildId": build_id,
                 "filename": filename,
                 "storageKey": storage_key,
+                "lifecycleEpoch": int(existing_doc.lifecycle_epoch or 0) if document_id else 0,
             }
             conn.execute(
                 job_table.insert().values(
@@ -942,6 +946,23 @@ class KnowledgeService:
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
+                doc = conn.execute(
+                    select(document_table).where(and_(
+                        document_table.c.tenant_id == tenant_id,
+                        document_table.c.id == doc_id,
+                    )).with_for_update()
+                ).first()
+                checkpoint = conn.execute(select(job_table.c.checkpoint).where(and_(
+                    job_table.c.tenant_id == tenant_id, job_table.c.id == job_id,
+                ))).scalar() or {}
+                if not doc or doc.status != "LIVE" or int(doc.lifecycle_epoch or 0) != int(checkpoint.get("lifecycleEpoch", 0)):
+                    raise ApiException(409, "SOURCE_CHANGED", "文档生命周期已变化，不能发布此构建")
+                candidate = conn.execute(select(index_build_table.c.build_no).where(and_(
+                    index_build_table.c.tenant_id == tenant_id, index_build_table.c.id == build_id,
+                ))).scalar_one()
+                active = conn.execute(select(index_build_table.c.build_no).where(and_(
+                    index_build_table.c.tenant_id == tenant_id, index_build_table.c.id == doc.active_build_id,
+                )).with_for_update()).scalar()
                 conn.execute(
                     update(index_build_table)
                     .where(and_(
@@ -956,14 +977,15 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
-                conn.execute(
-                    update(document_table)
-                    .where(and_(
-                        document_table.c.tenant_id == tenant_id,
-                        document_table.c.id == doc_id,
-                    ))
-                    .values(active_build_id=build_id, updated_at=now)
-                )
+                if active is None or candidate >= active:
+                    conn.execute(
+                        update(document_table)
+                        .where(and_(
+                            document_table.c.tenant_id == tenant_id,
+                            document_table.c.id == doc_id,
+                        ))
+                        .values(active_build_id=build_id, updated_at=now)
+                    )
                 result = conn.execute(
                     update(job_table)
                     .where(KnowledgeService._lease_filter(tenant_id, job_id, lease_epoch))
@@ -1689,4 +1711,3 @@ class KnowledgeService:
                 .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
             )
             conn.commit()
-

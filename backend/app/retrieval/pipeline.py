@@ -8,6 +8,7 @@ from app.models import chunk_span_table, chunk_table, source_unit_table
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
 from app.retrieval.milvus_service import MilvusHybridService
 from app.retrieval.reranker import rerank_hits
+from app.qa.model_usage import usage_scope
 
 
 class RetrievalPipeline:
@@ -26,6 +27,11 @@ class RetrievalPipeline:
         cfg = load_retrieval_config(actor.tenant_id, config_id)
 
         with get_db_connection() as conn:
+            if run_id:
+                from app.qa.context import run_document_scope
+                run_scope = run_document_scope(conn, actor, run_id)
+                if run_scope is not None:
+                    document_ids = run_scope if document_ids is None else list(set(document_ids).intersection(run_scope))
             readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
 
         allowed_build_ids = [row["buildId"] for row in readable]
@@ -41,18 +47,19 @@ class RetrievalPipeline:
                 "allowedBuildCount": 0,
             }
 
-        hits = MilvusHybridService.search(
-            tenant_id=actor.tenant_id,
-            query=query,
-            allowed_build_ids=allowed_build_ids,
-            dense_top_k=cfg.dense_top_k,
-            sparse_top_k=cfg.sparse_top_k,
-            fusion_top_k=cfg.fusion_top_k,
-            mode=cfg.mode,
-            rrf_enabled=cfg.rrf_enabled,
-            rrf_k=cfg.rrf_k,
-            allowed_build_epochs=allowed_build_epochs,
-        )
+        with usage_scope(actor.tenant_id, run_id):
+            hits = MilvusHybridService.search(
+                tenant_id=actor.tenant_id,
+                query=query,
+                allowed_build_ids=allowed_build_ids,
+                dense_top_k=cfg.dense_top_k,
+                sparse_top_k=cfg.sparse_top_k,
+                fusion_top_k=cfg.fusion_top_k,
+                mode=cfg.mode,
+                rrf_enabled=cfg.rrf_enabled,
+                rrf_k=cfg.rrf_k,
+                allowed_build_epochs=allowed_build_epochs,
+            )
 
         # Reranking is an external model boundary. Re-check every candidate
         # before any candidate text can leave the application process.
@@ -61,15 +68,16 @@ class RetrievalPipeline:
 
         warnings: List[str] = []
         if cfg.rerank_enabled and hits:
-            hits, rerank_warnings = rerank_hits(
-                tenant_id=actor.tenant_id,
-                run_id=run_id,
-                query=query,
-                hits=hits,
-                model_alias=cfg.rerank_model,
-                top_k=cfg.rerank_top_k,
-                fail_open=cfg.rerank_fail_open,
-            )
+            with usage_scope(actor.tenant_id, run_id):
+                hits, rerank_warnings = rerank_hits(
+                    tenant_id=actor.tenant_id,
+                    run_id=run_id,
+                    query=query,
+                    hits=hits,
+                    model_alias=cfg.rerank_model,
+                    top_k=cfg.rerank_top_k,
+                    fail_open=cfg.rerank_fail_open,
+                )
             warnings.extend(rerank_warnings)
 
         if cfg.parent_expansion_enabled and hits:

@@ -51,8 +51,10 @@ class RetrievalConfig:
     def from_payload(cls, config_id: str, payload: Optional[Dict[str, Any]]) -> "RetrievalConfig":
         root = payload if isinstance(payload, dict) else {}
         retrieval = root.get("retrieval") if isinstance(root.get("retrieval"), dict) else root
-        rerank = root.get("rerank") if isinstance(root.get("rerank"), dict) else {}
-        parent = root.get("parentExpansion") if isinstance(root.get("parentExpansion"), dict) else {}
+        post = root.get("post") if isinstance(root.get("post"), dict) else {}
+        fusion = root.get("fusion") if isinstance(root.get("fusion"), dict) else {}
+        rerank = root.get("rerank") if isinstance(root.get("rerank"), dict) else {"enabled": post.get("rerank")}
+        parent = root.get("parentExpansion") if isinstance(root.get("parentExpansion"), dict) else {"enabled": post.get("parent")}
 
         raw_mode = str(retrieval.get("mode") or "HYBRID").strip().upper()
         mode = "BM25" if raw_mode in {"SPARSE", "LEXICAL"} else raw_mode
@@ -60,8 +62,8 @@ class RetrievalConfig:
         legacy_top_k = _bounded_int(retrieval.get("topK"), 10, 1, 100)
         dense_default = 0 if mode == "BM25" else max(legacy_top_k * 2, 10)
         sparse_default = 0 if mode == "DENSE" else max(legacy_top_k * 2, 10)
-        dense_top_k = _bounded_int(retrieval.get("denseTopK"), dense_default, 0, 200)
-        sparse_top_k = _bounded_int(retrieval.get("sparseTopK"), sparse_default, 0, 200)
+        dense_top_k = _bounded_int(retrieval.get("denseTopK", retrieval.get("perRouteK")), dense_default, 0, 200)
+        sparse_top_k = _bounded_int(retrieval.get("sparseTopK", retrieval.get("perRouteK")), sparse_default, 0, 200)
         fusion_top_k = _bounded_int(retrieval.get("fusionTopK"), legacy_top_k, 1, 100)
         final_top_k = _bounded_int(retrieval.get("finalTopK"), min(legacy_top_k, 8), 1, 50)
 
@@ -73,7 +75,7 @@ class RetrievalConfig:
             mode == "HYBRID",
         )
         rrf_k = _bounded_int(
-            rrf_block.get("k", retrieval.get("rrfK")),
+            rrf_block.get("k", retrieval.get("rrfK", fusion.get("rrfK"))),
             60,
             1,
             500,
@@ -146,6 +148,7 @@ def load_retrieval_config(tenant_id: str, config_id: Optional[str]) -> Retrieval
         raise ApiException(409, "RETRIEVAL_CONFIG_NOT_PUBLISHED", "检索配置尚未发布")
 
     try:
+        validate_retrieval_payload(row.payload)
         return _validate_config(RetrievalConfig.from_payload(effective_id, row.payload), status_code=409)
     except ApiException as exc:
         raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", exc.message)
@@ -154,4 +157,15 @@ def load_retrieval_config(tenant_id: str, config_id: Optional[str]) -> Retrieval
 def validate_retrieval_payload(payload: Dict[str, Any]) -> RetrievalConfig:
     if not isinstance(payload, dict):
         raise ApiException(400, "INVALID_CONFIG", "检索配置必须是 JSON 对象")
+    for key in ("query", "post", "retrieval", "rerank", "parentExpansion", "fusion"):
+        if key in payload and not isinstance(payload[key], dict):
+            raise ApiException(400, "INVALID_CONFIG", f"{key} 必须是 JSON 对象")
+    query = payload.get("query") or {}
+    post = payload.get("post") or {}
+    retrieval = payload.get("retrieval") or payload
+    if any(_as_bool(query.get(key), False) for key in ("rewrite", "hyde", "multiQuery")) or _as_bool(post.get("mmr"), False):
+        raise ApiException(400, "UNSUPPORTED_STRATEGY", "当前未实现 Rewrite/HyDE/Multi-Query/MMR，不能启用这些策略")
+    representations = retrieval.get("representations", ["ORIGINAL"])
+    if not isinstance(representations, list) or representations != ["ORIGINAL"]:
+        raise ApiException(400, "UNSUPPORTED_STRATEGY", "当前仅支持 ORIGINAL 表示")
     return _validate_config(RetrievalConfig.from_payload("validation", payload))

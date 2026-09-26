@@ -41,6 +41,7 @@ from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
 from app.evaluation.judge import judge_answer, RUBRIC_VERSION
+from app.qa.model_usage import model_prices, usage_scope
 
 
 def check_no_model(config: Dict[str, Any]):
@@ -48,6 +49,8 @@ def check_no_model(config: Dict[str, Any]):
     try:
         effective = validate_retrieval_payload(config)
     except ApiException as exc:
+        if exc.code == "UNSUPPORTED_STRATEGY":
+            raise ApiException(409, "MODEL_REQUIRED", exc.message) from exc
         raise ApiException(409, "INVALID_CONFIG", exc.message) from exc
 
     query = config.get("query", {}) if isinstance(config.get("query"), dict) else {}
@@ -159,18 +162,32 @@ class EvaluationRunner:
             for c in cases_rows:
                 q = obj(c.question_json)
                 q_turns = maps(q.get("turns"))
+                if mode in {"RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"} and len(q_turns) > 1:
+                    raise ApiException(409, "MULTITURN_REQUIRES_QA", "多轮题请使用 RAG 或 AGENT 评测")
                 turns += max(1, len(q_turns))
 
             if mode == "RETRIEVAL_ONLY":
                 ceiling = 0.0
                 cost_status = "NO_MODEL_CALLS"
             else:
+                aliases = ["embedding-main"]
+                effective = validate_retrieval_payload(cfg_payload)
+                if effective.mode == "BM25":
+                    aliases = []
+                if effective.rerank_enabled:
+                    aliases.append(effective.rerank_model)
+                if mode in {"RAG", "AGENT"}:
+                    aliases.append("chat-main")
+                if judge_mode == "LLM" or body.get("strict", False):
+                    aliases.append("judge-main")
+                for alias in aliases:
+                    model_prices(alias)
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
                 input_tokens = total_turns * 30000 + total_questions * 30000
                 output_tokens = total_turns * 6000 + total_questions * 1800
                 ceiling = round((input_tokens * 0.00002 + output_tokens * 0.00006), 4)
-                cost_status = "UPPER_BOUND"
+                cost_status = "ESTIMATE_NOT_BILL"
 
             estimate_dict = {
                 "datasetVersionId": dataset_ver_id,
@@ -219,7 +236,7 @@ class EvaluationRunner:
         manifest = dict(est)
         manifest["maxCostCny"] = cap
         manifest["requesterId"] = actor.user_id
-        manifest["environment"] = getattr(settings, "RAG_ENVIRONMENT", "demo")
+        manifest["environment"] = settings.ENVIRONMENT
 
         with get_db_connection() as conn:
             existing_job = conn.execute(
@@ -352,17 +369,12 @@ class EvaluationRunner:
             ).fetchall()
             allowed_doc_ids = [str(d.document_id) for d in snap_docs]
 
-            # Allowed build ids for snapshot
-            build_rows = conn.execute(
-                select(document_table.c.active_build_id, document_table.c.id).where(
-                    and_(
-                        document_table.c.tenant_id == actor.tenant_id,
-                        document_table.c.id.in_(allowed_doc_ids),
-                        document_table.c.active_build_id.isnot(None),
-                    )
-                )
-            ).fetchall()
-            allowed_build_ids = [str(b.active_build_id) for b in build_rows]
+            snapshot_manifest = obj(conn.execute(select(eval_snapshot_table.c.manifest_json).where(and_(
+                eval_snapshot_table.c.tenant_id == actor.tenant_id,
+                eval_snapshot_table.c.id == snapshot_id,
+            ))).scalar())
+            evaluation_scope = {"snapshotId": snapshot_id, "evalRunId": run_id,
+                                "documents": snapshot_manifest.get("documents", [])}
 
             pending_results = conn.execute(
                 select(eval_result_table).where(
@@ -409,17 +421,28 @@ class EvaluationRunner:
             gold_groups = maps(expected_obj.get("evidenceGroups"))
 
             start_t = time.perf_counter()
+            try:
+                EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
+                persona_actor = EvaluationRunner._persona(actor, c_dict)
+            except ApiException as exc:
+                EvaluationRunner._update_result(actor, result_id, "FAILED",
+                    {"taskSuccess": False, "costCny": None}, {"error": exc.code}, error_code=exc.code)
+                continue
 
             if mode in {"RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 try:
-                    retrieval = RetrievalPipeline.retrieve(
-                        actor=actor,
-                        query=question_text,
-                        document_ids=allowed_doc_ids,
-                        config_id=eval_config_id,
-                        run_id=None,
-                    )
+                    if len(turns) > 1:
+                        raise ApiException(409, "MULTITURN_REQUIRES_QA", "多轮题不能仅执行第一轮检索")
+                    with usage_scope(actor.tenant_id, job_id=str(run_row.job_id)):
+                        retrieval = RetrievalPipeline.retrieve(
+                            actor=persona_actor,
+                            query=question_text,
+                            document_ids=allowed_doc_ids,
+                            config_id=eval_config_id,
+                            run_id=None,
+                        )
                     hits = retrieval["hits"]
+                    EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
 
                     metric = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, hits, hits)
@@ -449,52 +472,11 @@ class EvaluationRunner:
             else:
                 # Full RAG mode via production QaService
                 try:
-                    persona_login = str(c_dict.get("persona", {}).get("loginName", "operator"))
-                    with get_db_connection() as conn:
-                        persona_user = conn.execute(
-                            select(app_user_table.c.id).where(
-                                and_(
-                                    app_user_table.c.tenant_id == actor.tenant_id,
-                                    app_user_table.c.login_name == persona_login,
-                                )
-                            )
-                        ).first()
-                        persona_actor = Actor(
-                            tenant_id=actor.tenant_id,
-                            user_id=str(persona_user.id) if persona_user else actor.user_id,
-                            admin=False,
-                        )
-
-                    # Create conversation
-                    conv = QaService.create_conversation(persona_actor, {"title": f"Eval: {c_dict.get('caseKey')}"})
-                    conv_id = conv["conversationId"]
-
-                    # Submit run
-                    submitted = QaService.submit_run(
-                        persona_actor,
-                        conv_id,
-                        {
-                            "question": question_text,
-                            "mode": mode if mode in {"RAG", "AGENT"} else "RAG",
-                            "strictMode": manifest.get("strict", False),
-                            "configId": eval_config_id,
-                        },
-                        idempotency_key=f"eval:{result_id}:0",
+                    qa_detail, qa_run_ids = EvaluationRunner._run_qa_turns(
+                        actor, persona_actor, run_id, result_id, c_dict, manifest, evaluation_scope,
                     )
-                    qa_run_id = submitted["runId"]
-
-                    # Wait for completion. Agent runs have an explicit runtime deadline,
-                    # so evaluation waits slightly longer than that deadline.
-                    poll_limit = (
-                        float(os.getenv("AGENT_TIMEOUT_SECONDS", "120")) + 10.0
-                        if mode == "AGENT"
-                        else 30.0
-                    )
-                    poll_start = time.time()
-                    qa_detail = QaService.get_run(persona_actor, qa_run_id)
-                    while qa_detail.get("status") in {"QUEUED", "RUNNING", "WAITING_APPROVAL"} and (time.time() - poll_start) < poll_limit:
-                        time.sleep(0.5)
-                        qa_detail = QaService.get_run(persona_actor, qa_run_id)
+                    qa_run_id = qa_run_ids[-1]
+                    EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
 
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
                     status_str = qa_detail.get("status", "FAILED")
@@ -504,6 +486,7 @@ class EvaluationRunner:
                     metrics = EvaluationRunner._compute_retrieval_metrics(actor, c_dict, evidence_items, evidence_items)
                     metrics["durationMs"] = round(latency_ms, 2)
                     metrics["terminalStatus"] = status_str
+                    metrics["executedTurns"] = len(qa_run_ids)
 
                     # Match expectation
                     exp_status = expected_obj.get("status", "ANSWER")
@@ -527,11 +510,15 @@ class EvaluationRunner:
                         "claimsWithSupportedCitation": None,
                         "method": "STATUS_ONLY_V2",
                         "output": qa_detail,
+                        "qaRunIds": qa_run_ids,
                     }
 
                     if correctness == "UNDETERMINED" and manifest.get("judgeMode") == "LLM":
                         try:
+                            from app.qa.context import assert_run_sources_readable
+                            assert_run_sources_readable(persona_actor, qa_run_id)
                             judge_obj.update(judge_answer(actor.tenant_id, qa_run_id, question_obj, expected_obj, qa_detail))
+                            assert_run_sources_readable(persona_actor, qa_run_id)
                             correctness = judge_obj["correctness"]
                         except Exception as exc:
                             judge_obj["judgeError"] = type(exc).__name__
@@ -541,7 +528,7 @@ class EvaluationRunner:
                     with get_db_connection() as conn:
                         calls = conn.execute(select(model_call_table.c.settled_amount, model_call_table.c.pricing_snapshot).where(and_(
                             model_call_table.c.tenant_id == actor.tenant_id,
-                            model_call_table.c.run_id == qa_run_id,
+                            model_call_table.c.run_id.in_(qa_run_ids),
                         ))).fetchall()
                     amounts = [number(c.settled_amount) for c in calls
                                if c.settled_amount is not None and obj(c.pricing_snapshot).get("rate") != "fixed"]
@@ -554,7 +541,7 @@ class EvaluationRunner:
                             event_rows = conn.execute(
                                 select(run_event_table.c.stage, run_event_table.c.payload).where(and_(
                                     run_event_table.c.tenant_id == actor.tenant_id,
-                                    run_event_table.c.run_id == qa_run_id,
+                                    run_event_table.c.run_id.in_(qa_run_ids),
                                 ))
                             ).fetchall()
                             call_rows = conn.execute(
@@ -564,7 +551,7 @@ class EvaluationRunner:
                                     model_call_table.c.status,
                                 ).where(and_(
                                     model_call_table.c.tenant_id == actor.tenant_id,
-                                    model_call_table.c.run_id == qa_run_id,
+                                    model_call_table.c.run_id.in_(qa_run_ids),
                                 ))
                             ).fetchall()
 
@@ -637,6 +624,64 @@ class EvaluationRunner:
                     .values(status="COMPLETED", updated_at=now)
                 )
                 conn.commit()
+
+    @staticmethod
+    def _persona(actor, case):
+        login = str(case.get("persona", {}).get("loginName", "")).strip()
+        with get_db_connection() as conn:
+            user = conn.execute(select(app_user_table.c.id).where(and_(
+                app_user_table.c.tenant_id == actor.tenant_id,
+                app_user_table.c.login_name == login,
+                app_user_table.c.status == "ACTIVE",
+            ))).first()
+        if not user:
+            raise ApiException(409, "PERSONA_UNAVAILABLE", "评测身份不存在或已停用")
+        return Actor(actor.tenant_id, str(user.id), False)
+
+    @staticmethod
+    def _run_qa_turns(actor, persona, eval_run_id, result_id, case, manifest, scope):
+        from app.qa.service import QaService
+        question = case.get("question", {})
+        turns = maps(question.get("turns")) or [{"text": question.get("text", "")}]
+        with get_db_connection() as conn:
+            prior_conv = conn.execute(select(qa_run_table.c.conversation_id).where(and_(
+                qa_run_table.c.tenant_id == persona.tenant_id,
+                qa_run_table.c.owner_id == persona.user_id,
+                qa_run_table.c.idempotency_key == f"{persona.user_id}:eval:{result_id}:0",
+            ))).scalar()
+        conv = ({"conversationId": str(prior_conv)} if prior_conv else
+                QaService.create_conversation(persona, {"title": f"Eval: {case.get('caseKey')}"}))
+        run_ids = []
+        for index, turn in enumerate(turns):
+            EvaluationCatalog.check_snapshot(actor, scope["snapshotId"], check_current=True)
+            with get_db_connection() as conn:
+                status = conn.execute(select(eval_run_table.c.status).where(and_(
+                    eval_run_table.c.tenant_id == actor.tenant_id, eval_run_table.c.id == eval_run_id,
+                ))).scalar()
+            if status == "CANCELLED":
+                raise ApiException(409, "CANCELLED", "评测已取消")
+            submitted = QaService.submit_run(persona, conv["conversationId"], {
+                "question": str(turn.get("text", "")).strip(), "mode": manifest["mode"],
+                "strictMode": manifest.get("strict", False), "configId": manifest["configId"],
+            }, idempotency_key=f"eval:{result_id}:{index}", evaluation_scope=scope)
+            run_id = submitted["runId"]
+            run_ids.append(run_id)
+            deadline = time.monotonic() + float(os.getenv("AGENT_TIMEOUT_SECONDS", "120")) + 10
+            while True:
+                detail = QaService.get_run(persona, run_id)
+                if detail.get("status") not in {"QUEUED", "RUNNING", "WAITING_APPROVAL"}:
+                    break
+                with get_db_connection() as conn:
+                    status = conn.execute(select(eval_run_table.c.status).where(and_(
+                        eval_run_table.c.tenant_id == actor.tenant_id, eval_run_table.c.id == eval_run_id,
+                    ))).scalar()
+                if status == "CANCELLED" or time.monotonic() >= deadline:
+                    QaService.cancel_run(persona, run_id)
+                    raise ApiException(409, "CANCELLED" if status == "CANCELLED" else "QA_TIMEOUT", "评测问答已取消或超时")
+                time.sleep(0.5)
+            if detail.get("visibility") == "HIDDEN" or detail.get("status") in {"FAILED", "CANCELLED"}:
+                raise ApiException(409, "QA_EXECUTION_FAILED", "评测问答未成功完成")
+        return detail, run_ids
 
     @staticmethod
     def _update_result(

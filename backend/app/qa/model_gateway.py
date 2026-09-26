@@ -11,7 +11,8 @@ from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
 from app.qa.model_clients import get_chat_model, get_http_client
-from app.qa.runtime import AgentRuntimePolicy, estimate_tokens, retry_call
+from app.qa.runtime import AgentRuntimePolicy, retry_call
+from app.qa.model_usage import invoke_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,16 @@ MODEL_CONFIG_IDS = {
 
 
 class ModelGateway:
+    @staticmethod
+    def _invoke(llm, messages, tenant_id, run_id, purpose, alias, max_tokens):
+        return invoke_tracked(
+            lambda: llm.invoke(messages), tenant_id=tenant_id, run_id=run_id,
+            purpose=purpose, alias=alias, payload={"messages": [m.model_dump() for m in messages],
+                                                "tools": getattr(llm, "kwargs", {}).get("tools", [])},
+            max_output_tokens=max_tokens,
+            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+        )
+
     @classmethod
     def chat(
         cls,
@@ -36,10 +47,7 @@ class ModelGateway:
         deadline_epoch: Optional[float] = None,
     ) -> str:
         gateway_url = os.getenv("LITELLM_BASE_URL")
-        master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
         call_id = str(uuid.uuid4())
-        start_time = time.time()
-        now = datetime.now(timezone.utc)
 
         # Attempt to call LiteLLM Gateway via langchain_openai if configured
         if gateway_url:
@@ -70,11 +78,13 @@ class ModelGateway:
                 try:
                     response = retry_call(
                         f"llm:{model_alias}",
-                        lambda: llm.invoke(lc_messages),
+                        lambda: cls._invoke(llm, lc_messages, tenant_id, run_id, purpose, model_alias, max_tokens),
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
-                except Exception:
+                except Exception as exc:
+                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+                        raise
                     fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
                     if not fallback_alias or fallback_alias == model_alias:
                         raise
@@ -83,48 +93,16 @@ class ModelGateway:
                         raise
                     response = retry_call(
                         f"llm:{fallback_alias}",
-                        lambda: fallback.invoke(lc_messages),
+                        lambda: cls._invoke(fallback, lc_messages, tenant_id, run_id, purpose, fallback_alias, max_tokens),
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
                 content = str(response.content)
 
-                # Record in model_call table
-                duration_ms = int((time.time() - start_time) * 1000)
-                usage = getattr(response, "usage_metadata", None) or {}
-                token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
-                input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
-                output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
-                if input_tokens <= 0:
-                    input_tokens = estimate_tokens(messages)
-                if output_tokens <= 0:
-                    output_tokens = estimate_tokens(content)
-
-                cls._record_call(
-                    tenant_id=tenant_id,
-                    call_id=call_id,
-                    run_id=run_id,
-                    purpose=purpose,
-                    status="SUCCESS",
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    model_alias=model_alias,
-                )
                 return content
             except ApiException:
                 raise
             except Exception as e:
-                # Failure終态 - record failed call and raise
-                cls._record_call(
-                    tenant_id=tenant_id,
-                    call_id=call_id,
-                    run_id=run_id,
-                    purpose=purpose,
-                    status="FAILED",
-                    input_tokens=0,
-                    output_tokens=0,
-                    model_alias=model_alias,
-                )
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"大模型网关调用失败: {e}")
 
         if not is_test_env():
@@ -141,7 +119,6 @@ class ModelGateway:
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # Fallback for offline unit test environments
-        duration_ms = int((time.time() - start_time) * 1000)
         cls._record_call(
             tenant_id=tenant_id,
             call_id=call_id,
@@ -218,9 +195,7 @@ class ModelGateway:
         deadline_epoch: Optional[float] = None,
     ) -> Dict[str, Any]:
         call_id = str(uuid.uuid4())
-        start_time = time.time()
         gateway_url = os.getenv("LITELLM_BASE_URL")
-        master_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
 
         if cls._agent_mock_handler:
             result = cls._agent_mock_handler(messages)
@@ -282,11 +257,13 @@ class ModelGateway:
                 try:
                     response = retry_call(
                         f"llm-tools:{model_alias}",
-                        lambda: llm.invoke(lc_messages),
+                        lambda: cls._invoke(llm, lc_messages, tenant_id, run_id, purpose, model_alias, max_tokens),
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
-                except Exception:
+                except Exception as exc:
+                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+                        raise
                     fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
                     if not fallback_alias or fallback_alias == model_alias:
                         raise
@@ -296,7 +273,7 @@ class ModelGateway:
                     fallback_bound = fallback_model.bind_tools(tools, strict=True)
                     response = retry_call(
                         f"llm-tools:{fallback_alias}",
-                        lambda: fallback_bound.invoke(lc_messages),
+                        lambda: cls._invoke(fallback_bound, lc_messages, tenant_id, run_id, purpose, fallback_alias, max_tokens),
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -310,24 +287,6 @@ class ModelGateway:
                     }
                     for i, tc in enumerate(tool_calls)
                 ]
-                usage = getattr(response, "usage_metadata", None) or {}
-                token_usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
-                input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
-                output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
-                if input_tokens <= 0:
-                    input_tokens = estimate_tokens(messages)
-                if output_tokens <= 0:
-                    output_tokens = estimate_tokens(response.content or "") + estimate_tokens(formatted_calls)
-                cls._record_call(
-                    tenant_id,
-                    call_id,
-                    run_id,
-                    purpose,
-                    "SUCCESS",
-                    input_tokens,
-                    output_tokens,
-                    model_alias,
-                )
                 return {
                     "role": "assistant",
                     "content": response.content or "",
@@ -336,7 +295,6 @@ class ModelGateway:
             except ApiException:
                 raise
             except Exception as e:
-                cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"Agent大模型网关调用失败: {e}")
 
         if not is_test_env():
@@ -400,7 +358,7 @@ class ModelGateway:
             base = gateway_url.rstrip("/")
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
             try:
-                response = get_http_client().post(
+                response = invoke_tracked(lambda: get_http_client().post(
                     endpoint,
                     headers={"Authorization": f"Bearer {master_key}"},
                     json={
@@ -411,7 +369,10 @@ class ModelGateway:
                         "return_documents": False,
                     },
                     timeout=20.0,
-                )
+                ), tenant_id=tenant_id, run_id=run_id, purpose="RERANK", alias=model_alias,
+                    payload={"query": query, "documents": documents},
+                    usage_reader=lambda response: {"input_tokens": response.json()["usage"]["total_tokens"], "output_tokens": 0}
+                    if response.status_code == 200 and "total_tokens" in response.json().get("usage", {}) else {})
                 if response.status_code != 200:
                     raise ApiException(
                         503,
@@ -436,26 +397,10 @@ class ModelGateway:
                 if not normalized:
                     raise ApiException(502, "INVALID_MODEL_OUTPUT", "Reranker 未返回有效结果")
 
-                cls._record_call(
-                    tenant_id=tenant_id,
-                    call_id=call_id,
-                    run_id=run_id,
-                    purpose="RERANK",
-                    status="SUCCESS",
-                    input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
-                    output_tokens=0,
-                    model_alias=model_alias,
-                )
                 return normalized
             except ApiException:
-                cls._record_call(
-                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
-                )
                 raise
             except Exception as exc:
-                cls._record_call(
-                    tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
-                )
                 raise ApiException(503, "RERANK_UNAVAILABLE", f"Reranker 网关调用失败: {exc}")
 
         if not is_test_env():
@@ -515,11 +460,11 @@ class ModelGateway:
                         attempt_no=1,
                         status=status,
                         reserved_amount="0.000000",
-                        settled_amount="0.000000",
+                        settled_amount="0.000000" if is_test_env() else None,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         provider_request_id=f"req-{call_id[:8]}",
-                        pricing_snapshot={"rate": "fixed"},
+                        pricing_snapshot={"source": "TEST" if is_test_env() else "UNKNOWN"},
                         usage_detail={"model": model_alias},
                         reservation_authority="INTERNAL",
                         reservation_id=None,

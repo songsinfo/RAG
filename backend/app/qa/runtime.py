@@ -217,6 +217,8 @@ _RETRYABLE_CODES = {
 
 def is_retryable_exception(exc: Exception) -> bool:
     if isinstance(exc, ApiException):
+        if exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+            return False
         return exc.code in _RETRYABLE_CODES or exc.status_code in {429, 502, 503, 504}
     if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError)):
         return True
@@ -292,6 +294,8 @@ def retry_call(
 
 
 _NON_RETRYABLE_JOB_CODES = {
+    "BATCH_BUDGET_EXCEEDED",
+    "MODEL_PRICING_NOT_CONFIGURED",
     "CANCELLED",
     "USER_CANCELLED",
     "AGENT_TIMEOUT",

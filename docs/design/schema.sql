@@ -562,7 +562,7 @@ CREATE TABLE model_call (
   PRIMARY KEY (tenant_id, id),
   KEY ix_call_run (tenant_id,run_id),
   KEY ix_call_job (tenant_id,job_id),
-  CHECK ((run_id IS NULL) <> (job_id IS NULL)),
+  CONSTRAINT ck_model_call_owner CHECK (run_id IS NULL OR job_id IS NULL),
   CHECK (reserved_amount >= 0),
   CONSTRAINT fk_208 FOREIGN KEY (tenant_id) REFERENCES tenant (id),
   CONSTRAINT fk_209 FOREIGN KEY (tenant_id,run_id) REFERENCES qa_run (tenant_id,id),

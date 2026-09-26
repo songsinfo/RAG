@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["feat/enterprise-rag-retrieval", "feat/langchain-v1-performance", "feat/agent-runtime-hardening", "feat/langchain-prebuilt-agent", "feat/docling-hybrid-chunking"]
+    branches: ["main", "fix/rag-audit-correctness", "feat/enterprise-rag-retrieval", "feat/langchain-v1-performance", "feat/agent-runtime-hardening", "feat/langchain-prebuilt-agent", "feat/docling-hybrid-chunking"]
   pull_request:
-    branches: ["feat/python-migration"]
+    branches: ["main", "feat/python-migration"]
 
 jobs:
   backend:
@@ -27,6 +27,10 @@ jobs:
         env:
           REVIEW_ROOT: ${{ github.workspace }}
         run: python -m pytest ../docs/reviews/pr-stack-20260921/test_stack_review.py -q -p no:cacheprovider --tb=short
+      - name: RAG audit regressions
+        env:
+          REVIEW_ROOT: ${{ github.workspace }}
+        run: python -m pytest ../docs/reviews/2026-09-26-audit/test_audit.py -q -p no:cacheprovider --tb=short
       - name: Late-worker lease regression
         env:
           REVIEW_ROOT: ${{ github.workspace }}

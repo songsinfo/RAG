@@ -26,7 +26,7 @@ def rerank_hits(
             model_alias=model_alias,
         )
     except ApiException as exc:
-        if not fail_open:
+        if not fail_open or exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
             raise
         return hits[:top_k], [f"RERANK_FALLBACK:{exc.code}"]
 

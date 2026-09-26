@@ -16,7 +16,7 @@ from sqlalchemy import and_, select
 
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
+from app.identity.deps import Actor, assert_hits_still_readable
 from app.models import (
     context_segment_table,
     job_table,
@@ -28,6 +28,7 @@ from app.models import (
 from app.observability import add_span_event, agent_span
 from app.qa.job_checkpointer import JobCheckpointSaver
 from app.qa.execution import current_qa_execution, qa_lease_is_current
+from app.qa.context import conversation_memory, assert_run_sources_readable, run_document_scope
 from app.qa.claim_validator import INSTRUCTION, validate_claims
 from app.qa.guardrails import guard_retrieved_content
 from app.qa.model_gateway import ModelGateway
@@ -390,6 +391,7 @@ class LangGraphAgent:
     def _guard_runtime(cls, state: AgentState, ctx: AgentContext) -> Dict[str, int]:
         if ctx.is_cancelled_fn(ctx.actor.tenant_id, ctx.run_id):
             raise ApiException(409, "CANCELLED", "请求已取消")
+        assert_run_sources_readable(ctx.actor, ctx.run_id)
         return assert_runtime_budget(
             ctx.actor.tenant_id,
             ctx.run_id,
@@ -429,6 +431,7 @@ class LangGraphAgent:
         )
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, state["evidence"])
+        assert_run_sources_readable(actor, ctx.run_id)
 
         with agent_span("agent.model", {"agent.round": state["round"] + 1}):
             reply = ModelGateway.chat_tools(
@@ -788,49 +791,7 @@ class LangGraphAgent:
         current_run_id: str,
         max_turns: int = 4,
     ) -> List[Dict[str, Any]]:
-        with get_db_connection() as conn:
-            rows = conn.execute(
-                select(
-                    qa_run_table.c.id,
-                    qa_run_table.c.question,
-                    qa_run_table.c.result_json,
-                ).where(
-                    and_(
-                        qa_run_table.c.tenant_id == actor.tenant_id,
-                        qa_run_table.c.conversation_id == conversation_id,
-                        qa_run_table.c.owner_id == actor.user_id,
-                        qa_run_table.c.id != current_run_id,
-                        qa_run_table.c.status.in_(["SUCCEEDED", "COMPLETED"]),
-                    )
-                ).order_by(qa_run_table.c.created_at.desc()).limit(max_turns * 2)
-            ).fetchall()
-
-            visible_rows = []
-            for row in rows:
-                source_rows = conn.execute(
-                    select(run_source_table.c.document_id.distinct()).where(and_(
-                        run_source_table.c.tenant_id == actor.tenant_id,
-                        run_source_table.c.run_id == str(row.id),
-                    ))
-                ).fetchall()
-                if all(
-                    can_read_document(conn, actor, str(source.document_id))
-                    for source in source_rows
-                ):
-                    visible_rows.append(row)
-                if len(visible_rows) >= max_turns:
-                    break
-
-        messages: List[Dict[str, Any]] = []
-        for row in reversed(visible_rows):
-            question = str(row.question or "")
-            result = row.result_json or {}
-            answer = str(result.get("answer") or "") if isinstance(result, dict) else ""
-            if question:
-                messages.append({"role": "user", "content": question[:2000]})
-            if answer:
-                messages.append({"role": "assistant", "content": answer[:3000]})
-        return messages
+        return conversation_memory(actor, conversation_id, current_run_id, max_turns)
 
     @classmethod
     def _read_section(
@@ -845,10 +806,13 @@ class LangGraphAgent:
         with get_db_connection() as conn:
             if not qa_lease_is_current(conn, actor.tenant_id, run_id):
                 raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
-            from app.identity.deps import can_read_document
-
-            if not can_read_document(conn, actor, doc_id):
-                raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此文档")
+            scope = run_document_scope(conn, actor, run_id)
+            run = conn.execute(select(qa_run_table.c.segment_id).where(and_(
+                qa_run_table.c.tenant_id == actor.tenant_id, qa_run_table.c.id == run_id,
+            ))).first()
+            allowed_kbs = cls._resolve_allowed_kbs(actor, str(run.segment_id)) if run else []
+            assert_hits_still_readable(conn, actor, [{"documentId": doc_id, "buildId": build_id}],
+                                       kb_ids=allowed_kbs or None, document_ids=scope)
 
             unit = conn.execute(
                 select(source_unit_table).where(

@@ -1,7 +1,9 @@
 import json
+import uuid
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, Header, UploadFile, File, Form, status
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.identity.deps import Actor, get_current_actor, require_admin
 from app.knowledge.service import KnowledgeService
@@ -79,12 +81,12 @@ async def upload_document(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
-    content = await file.read()
+    content = await file.read(26214401)
     try:
         cfg = json.loads(buildConfig) if buildConfig else {}
     except Exception:
         cfg = {}
-    return KnowledgeService.upload_document(
+    return await run_in_threadpool(KnowledgeService.upload_document,
         actor=actor,
         kb_id=kbId,
         document_id=None,
@@ -103,13 +105,13 @@ async def upload_document_version(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     actor: Actor = Depends(require_admin),
 ):
-    doc = KnowledgeService.get_document(actor, doc_id)
-    content = await file.read()
+    doc = await run_in_threadpool(KnowledgeService.get_document, actor, doc_id)
+    content = await file.read(26214401)
     try:
         cfg = json.loads(buildConfig) if buildConfig else {}
     except Exception:
         cfg = {}
-    return KnowledgeService.upload_document(
+    return await run_in_threadpool(KnowledgeService.upload_document,
         actor=actor,
         kb_id=doc["kbId"],
         document_id=doc_id,
@@ -162,4 +164,3 @@ def update_document_acl(doc_id: str, payload: UpdateDocAclRequest, actor: Actor 
 @router.post("/admin/documents/{doc_id}/{action}")
 def document_lifecycle(doc_id: str, action: str, payload: LifecycleActionRequest, actor: Actor = Depends(require_admin)):
     return KnowledgeService.document_lifecycle(actor, doc_id, action, payload.expectedVersion)
-
