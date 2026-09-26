@@ -8,10 +8,10 @@ from typing import Any, Dict, Optional
 from sqlalchemy import and_, or_, select, update
 
 from app.db import get_db_connection
+from app.errors import ApiException
 from app.knowledge.artifacts import read_artifact
 from app.models import app_user_table, deletion_record_table, job_table, qa_run_table
 from app.qa.runtime import is_retryable_job_code
-from app.qa.model_usage import usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +69,10 @@ class DurableJobWorker:
                 self._run_qa(job)
             else:
                 self._fail(job, "UNSUPPORTED_JOB_KIND")
-        except Exception:
+        except Exception as exc:
             logger.exception("Job %s failed", job["id"])
-            self._fail(job, "WORKER_EXECUTION_FAILED")
+            code = exc.code if isinstance(exc, ApiException) else "WORKER_EXECUTION_FAILED"
+            self._fail(job, code)
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
@@ -135,12 +136,11 @@ class DurableJobWorker:
         from app.knowledge.service import KnowledgeService
         cp = job.get("checkpoint") or {}
         data = read_artifact(str(cp["storageKey"]))
-        with usage_scope(str(job["tenant_id"]), job_id=str(job["id"])):
-            KnowledgeService._execute_ingestion_job(
-                str(job["tenant_id"]), str(job["id"]), str(cp["documentId"]),
-                str(cp["versionId"]), str(cp["buildId"]), data, str(cp["filename"]),
-                lease_epoch=int(job["lease_epoch"]),
-            )
+        KnowledgeService._execute_ingestion_job(
+            str(job["tenant_id"]), str(job["id"]), str(cp["documentId"]),
+            str(cp["versionId"]), str(cp["buildId"]), data, str(cp["filename"]),
+            lease_epoch=int(job["lease_epoch"]),
+        )
 
     def _run_purge(self, job: Dict[str, Any]):
         from app.knowledge.service import KnowledgeService

@@ -155,6 +155,9 @@ def get_readable_build_records(
             document_table.c.kb_id,
             index_build_table.c.version_id,
             index_build_table.c.fence,
+            index_build_table.c.model_fingerprint,
+            index_build_table.c.embedding_dims,
+            index_build_table.c.capabilities,
         )
         .select_from(
             document_table.join(
@@ -190,6 +193,9 @@ def get_readable_build_records(
             "kbId": str(r.kb_id),
             "versionId": str(r.version_id),
             "indexEpoch": int(r.fence or 0),
+            "modelFingerprint": str(r.model_fingerprint) if r.model_fingerprint else None,
+            "embeddingDims": int(r.embedding_dims) if r.embedding_dims is not None else None,
+            "capabilities": r.capabilities if isinstance(r.capabilities, dict) else {},
         }
         for r in rows
     ]

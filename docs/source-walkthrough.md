@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-09-22，`feat/python-migration`，提交 `de2b2cf`。本文只补充文档，不修改业务行为。代码片段为原源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-09-22，`main` 分支。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -18,7 +18,7 @@
 | FastAPI | HTTP 路由、认证依赖、CSRF、错误响应 | [main.py](../backend/app/main.py) |
 | MySQL | 用户权限、文档版本、生效构建、任务和运行记录 | [models.py](../backend/app/models.py)、[db.py](../backend/app/db.py) |
 | Worker | 从数据库领取并执行耗时任务 | [worker.py](../backend/app/runtime/worker.py) |
-| Docling | 将 PDF/DOCX 等转换为 Markdown | [parser.py](../backend/app/knowledge/parser.py) |
+| Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
 | LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
 | LangGraph | Agent 的 model/tools 循环和断点恢复 | [agent.py](../backend/app/qa/agent.py) |
@@ -153,10 +153,10 @@ Documents.vue::upload()
   → DurableJobWorker._run_ingest()
       → read_artifact(storageKey)
       → KnowledgeService._execute_ingestion_job()
-          → parse_document()
-          → source_unit 入库
-          → chunk_units()
-          → chunk / chunk_span 入库
+          → parse_and_chunk_document()
+          → Docling /v1/chunk/hybrid/file
+          → adapt_docling_hybrid_chunks()
+          → source_unit / PARENT / CHILD / chunk_span 入库
           → MilvusHybridService.upsert_chunks()
           → index_build READY + document.active_build_id 切换
 ```
@@ -167,64 +167,47 @@ Documents.vue::upload()
 
 **这四个 ID 不要混用。** 查文件生命周期看 document；查上传原件看 version；查解析和索引内容看 build；查执行进度看 job。
 
-### 4.2 解析：字节 → source_unit
+### 4.2 统一解析与切块：字节 → Docling Hybrid Chunks
 
-打开 [parser.py](../backend/app/knowledge/parser.py) 的 `parse_document()`：
+打开 [parser.py](../backend/app/knowledge/parser.py) 的 `parse_and_chunk_document()`。当前所有支持格式都进入同一条路径：
 
-```python
-suffix = Path(filename).suffix.lower()
-if suffix in _TEXT_EXTENSIONS:
-    return parse_markdown(decode_utf8(file_bytes))
+```text
+file_bytes
+  → Docling Serve /v1/chunk/hybrid/file
+  → Docling Parser
+  → HybridChunker
+  → chunks JSON
+  → adapt_docling_hybrid_chunks()
 ```
 
-`.md / .markdown / .txt` 走 UTF-8 解码和本地 Markdown 解析。其他格式通过 `_docling_markdown()` 调 Docling `/v1/convert/file`，拿到 `document.md_content` 后也进入 `parse_markdown()`。
+Markdown、TXT、PDF、DOCX、Office 等不再分成“本地文本解析”和“二进制 Docling 解析”两条链路。请求会根据配置传入 OCR、表格结构、heading hierarchy、tokenizer、max_tokens 与 merge_peers 等参数。
 
-所以当前二进制文档走的是“Docling → Markdown → 本地单元解析”。解析得到的 Markdown 行号不自动等同于 PDF 原始页码或版面坐标；不能仅凭 `location` 字段存在，就认为完整保留了原文件布局。
+默认 Child 上限来自 `DOCLING_CHUNK_MAX_TOKENS=400`，默认 Parent 上限来自 `DOCLING_PARENT_MAX_TOKENS=1200`。这里单位是 token，不是字符；Child 的实际分割由 Docling HybridChunker 负责。
 
-`parse_markdown()` 会识别 `HEADING / TEXT / TABLE / CODE`。本例第一条数据形状类似：
+### 4.3 适配：Hybrid Chunks → source_unit / PARENT / CHILD / span
+
+打开 [chunker.py](../backend/app/knowledge/chunker.py) 的 `adapt_docling_hybrid_chunks()`。这个函数不再重新切 Child，而是把 Docling 已经生成的 Hybrid Chunk 适配到本项目的数据模型。
+
+核心规则：
+
+- 每个 Docling Hybrid Chunk 对应一个 CHILD。
+- 相邻、heading path 相同的 Child 会按 `parent_max_tokens` 组织成 PARENT。
+- 同一组 Child 会生成对应 SourceUnit。
+- `location` 保留 Docling 的 headings、captions、docItems、pageNumbers 和 metadata。
+- `chunk_span` 记录 CHILD 在 SourceUnit 中的偏移和原始 location，供 evidence provenance 使用。
+
+示意数据：
 
 ```json
 {
-  "unit_key": "h_1",
-  "kind": "HEADING",
-  "text_content": "订单重试规则",
-  "location": {"line": 1, "level": 1}
-}
-```
-
-后面三段分别成为 TEXT。真实对象还包含内容 hash；执行入库时为每个单元生成 `id` 并写入 `source_unit`。
-
-### 4.3 切块：source_unit → PARENT / CHILD / span
-
-打开 [chunker.py](../backend/app/knowledge/chunker.py)，依次看 `chunk_units()`、内部 `flush_parent_and_children()`、`append_child()` 和 `_split_text()`。
-
-```python
-def chunk_units(
-    units: List[Dict[str, Any]],
-    max_parent_chars: int = 2000,
-    max_child_chars: int = 400,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-```
-
-参数单位是字符，不是 tokenizer token。父块按标题和累计长度组织，子块限制长度；过长单元由 `_split_text()` 尽量沿句子、换行或空格切开，并保留单元内偏移。
-
-本例很短，默认参数下会形成一个父块和一个子块。父块连接单元时用双换行，子块组装时用单换行；因此不能假定两者文本逐字相同。
-
-子块数据形状：
-
-```json
-{
-  "id": "child-1",
-  "parent_id": "parent-1",
   "kind": "CHILD",
-  "ordinal": 1,
-  "text_content": "订单重试规则\n订单重试前必须检查幂等键。\n重试前应确认尚未达到重试次数上限。\n重试前需核对补偿日志，避免重复补偿。"
+  "parent_id": "parent-1",
+  "text_content": "订单重试前必须检查幂等键。",
+  "token_count": 12
 }
 ```
 
-对应的 `chunk_span` 不只是“这个 chunk 来自哪份文件”，还记录它覆盖的 `unit_id`、`start_cp`、`end_cp` 和位置。这里的偏移属于原文单元，不能直接拿来当模型最终 evidence 的偏移。
-
-两个实现细节：`max_parent_chars` 不是对单个超长原文单元的严格硬限制；`token_count` 使用字符长度近似估算，不是精确 tokenizer 结果。入库执行器当前直接调用 `chunk_units(raw_units)`，不要认为上传任意构建参数都会自动影响这两个默认长度。
+PARENT 主要用于检索后的上下文扩展；CHILD 才是索引和高精度召回单元。
 
 ### 4.4 建索引与发布：有向量不等于已生效
 
@@ -577,7 +560,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 
 ### 9.2 第一组：只看解析和切块
 
-在现有 IDE 的 Python 调试器里给 `parse_document()`、`chunk_units()` 打断点，运行：
+在现有 IDE 的 Python 调试器里给 `parse_and_chunk_document()`、`adapt_docling_hybrid_chunks()` 打断点，运行：
 
 ```powershell
 # 在仓库根目录打开 Windows 原生 PowerShell；需要已经安装 backend/.venv。
@@ -590,7 +573,7 @@ try {
 }
 ```
 
-断点要观察：`file_bytes → raw_units → chunks/spans → child_chunks`。先检查标题和文本如何分组，再检查长文本怎样切开，不必第一遍研究所有 SQL。
+断点要观察：`file_bytes → Docling Hybrid Chunks → units/chunks/spans → child_chunks`。重点看 Docling 返回的 headings/pageNumbers/num_tokens 如何被适配为 SourceUnit、Parent、Child 和 provenance。
 
 ### 9.3 第二组：看检索和回答
 

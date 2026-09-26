@@ -1,5 +1,8 @@
 # API、会话、页面与 Agent
 
+> **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 对应 PRD-01/03/04/07，评估与运维接口同时覆盖 PRD-05/06。API 前缀 /api/v1；JSON 使用 camelCase，ID 为 UUID，日期使用 UTC ISO-8601。以下是实现契约，尚未有运行中的接口。
 
 ## 1. 登录与统一协议

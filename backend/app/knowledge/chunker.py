@@ -42,7 +42,21 @@ def _group_location(group: List[Dict[str, Any]]) -> Dict[str, Any]:
         for item in group
         for value in item["location"].get("captions", [])
     ]
-    return {
+    metadata: Dict[str, Any] = {}
+    warnings: List[Any] = []
+    for item in group:
+        item_metadata = item["location"].get("metadata")
+        if not isinstance(item_metadata, dict):
+            continue
+        for key, value in item_metadata.items():
+            if key == "doclingWarnings" and isinstance(value, list):
+                warnings.extend(value)
+            elif key not in metadata:
+                metadata[key] = value
+    if warnings:
+        metadata["doclingWarnings"] = warnings
+
+    location = {
         "headings": headings,
         "pageNumbers": pages,
         "docItems": doc_items,
@@ -50,6 +64,9 @@ def _group_location(group: List[Dict[str, Any]]) -> Dict[str, Any]:
         "doclingChunkStart": int(group[0]["chunk_index"]) if group else 0,
         "doclingChunkEnd": int(group[-1]["chunk_index"]) if group else 0,
     }
+    if metadata:
+        location["metadata"] = metadata
+    return location
 
 
 def adapt_docling_hybrid_chunks(

@@ -1,6 +1,7 @@
 import hashlib
 import os
 import logging
+import struct
 import threading
 from typing import List, Dict, Any, Optional
 from pymilvus import DataType, Function, FunctionType, AnnSearchRequest, RRFRanker, CollectionSchema, FieldSchema
@@ -8,7 +9,7 @@ from sqlalchemy import select, and_, or_, exists
 from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.models import chunk_table, index_build_table, document_table, kb_grant_table, document_grant_table
+from app.models import chunk_table, index_build_table, document_table, kb_grant_table, document_grant_table, representation_table
 from app.retrieval.normalizer import normalize_terms
 from app.retrieval.ranking import rrf_fuse
 from app.retrieval.embedding import get_embeddings
@@ -100,6 +101,9 @@ class MilvusHybridService:
         doc_id: str,
         version_id: str,
         index_epoch: Optional[int] = None,
+        representations: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ):
         if not chunks:
             return
@@ -108,21 +112,65 @@ class MilvusHybridService:
         batch_size = max(1, min(512, int(os.getenv("MILVUS_UPSERT_BATCH_SIZE", "128"))))
         client = cls.get_client()
 
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start:start + batch_size]
-            texts = [c["text_content"] for c in batch]
-            embeddings = get_embeddings(texts, dim=1024, batch_size=batch_size, tenant_id=tenant_id)
+        representations = representations or {}
+        items: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            chunk_id = str(chunk["id"])
+            reps = representations.get(chunk_id) or [
+                {"kind": "ORIGINAL", "ordinal": 0, "text_content": chunk["text_content"]}
+            ]
+            for rep in reps:
+                kind = str(rep.get("kind") or "ORIGINAL").upper()
+                if kind not in {"ORIGINAL", "SUMMARY", "QUESTION"}:
+                    continue
+                items.append(
+                    {
+                        "chunk": chunk,
+                        "chunk_id": chunk_id,
+                        "kind": kind,
+                        "ordinal": int(rep.get("ordinal") or 0),
+                        "text_content": str(rep.get("text_content") or ""),
+                        "dense_vector": rep.get("dense_vector"),
+                    }
+                )
+
+        for start in range(0, len(items), batch_size):
+            batch = items[start:start + batch_size]
+            missing_indexes = [i for i, item in enumerate(batch) if not item.get("dense_vector")]
+            generated = []
+            if missing_indexes:
+                generated = get_embeddings(
+                    [batch[i]["text_content"] for i in missing_indexes],
+                    dim=1024,
+                    batch_size=batch_size,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    job_id=job_id,
+                )
+            generated_by_index = {
+                idx: vector for idx, vector in zip(missing_indexes, generated)
+            }
             records = []
 
-            for chunk, emb in zip(batch, embeddings):
-                chunk_id = str(chunk["id"])
-                norm = normalize_terms(chunk["text_content"])
+            for batch_index, item in enumerate(batch):
+                emb = item.get("dense_vector") or generated_by_index.get(batch_index)
+                if emb is None:
+                    raise ApiException(502, "INVALID_MODEL_OUTPUT", "缺少 representation embedding")
+                chunk = item["chunk"]
+                chunk_id = item["chunk_id"]
+                kind = item["kind"]
+                ordinal = item["ordinal"]
+                text_content = item["text_content"]
+                norm = normalize_terms(text_content)
+                record_key = f"{chunk_id}:{kind}:{ordinal}"
                 if epoch > 0:
                     record_id = hashlib.sha256(
-                        f"{tenant_id}:{build_id}:{epoch}:{chunk_id}".encode("utf-8")
+                        f"{tenant_id}:{build_id}:{epoch}:{record_key}".encode("utf-8")
                     ).hexdigest()
                 else:
-                    record_id = f"{tenant_id}:{build_id}:{chunk_id}"
+                    record_id = hashlib.sha256(
+                        f"{tenant_id}:{build_id}:{record_key}".encode("utf-8")
+                    ).hexdigest()
                 record = {
                     "id": record_id,
                     "parent_id": str(chunk.get("parent_id") or ""),
@@ -133,8 +181,9 @@ class MilvusHybridService:
                     "build_id": build_id,
                     "index_epoch": epoch,
                     "chunk_id": chunk_id,
-                    "representation_type": "ORIGINAL",
-                    "text_content": chunk["text_content"],
+                    "representation_type": kind,
+                    "representation_ordinal": ordinal,
+                    "text_content": text_content,
                     "normalized_terms": norm,
                     "dense_vector": emb,
                 }
@@ -217,6 +266,10 @@ class MilvusHybridService:
         rrf_enabled: bool = True,
         rrf_k: int = 60,
         allowed_build_epochs: Optional[Dict[str, int]] = None,
+        representations: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        num_candidates: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not allowed_build_ids:
             return []
@@ -239,8 +292,17 @@ class MilvusHybridService:
         dense_top_k = 0 if dense_top_k is None and mode == "BM25" else (dense_top_k if dense_top_k is not None else 30)
         sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
         fusion_top_k = fusion_top_k or 20
+        num_candidates = max(
+            max(dense_top_k, sparse_top_k, 1),
+            min(1000, int(num_candidates or 200)),
+        )
 
-        output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "text_content"]
+        representations = [str(value).upper() for value in (representations or ["ORIGINAL"])]
+        if not representations or not set(representations).issubset({"ORIGINAL", "SUMMARY", "QUESTION"}):
+            raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", "representation 类型无效")
+        rep_expr = ", ".join(f'"{value}"' for value in representations)
+
+        output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "representation_type", "text_content"]
 
         def normalize_result(res):
             hits = []
@@ -256,10 +318,19 @@ class MilvusHybridService:
                     "versionId": entity.get("version_id"),
                     "buildId": entity.get("build_id"),
                     "indexEpoch": int(entity.get("index_epoch") or 0),
+                    "representationType": entity.get("representation_type") or "ORIGINAL",
                     "text": entity.get("text_content"),
                     "score": float(item.get("distance", item.get("score", 0.0)) or 0.0) if isinstance(item, dict) else 0.0,
                 })
-            return hits
+            deduped = []
+            seen_chunks = set()
+            for hit in hits:
+                chunk_id = str(hit.get("chunkId") or "")
+                if not chunk_id or chunk_id in seen_chunks:
+                    continue
+                seen_chunks.add(chunk_id)
+                deduped.append(hit)
+            return deduped
 
         client = cls.get_client()
         if client:
@@ -287,23 +358,29 @@ class MilvusHybridService:
                     build_filter = " or ".join(build_clauses)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and ({build_filter}) '
-                        'and representation_type == "ORIGINAL"'
+                        f'and representation_type in [{rep_expr}]'
                     )
                 else:
                     build_ids_str = ", ".join(f'"{b}"' for b in allowed_build_ids)
                     filter_expr = (
                         f'tenant_id == "{tenant_id}" and build_id in [{build_ids_str}] '
-                        'and representation_type == "ORIGINAL"'
+                        f'and representation_type in [{rep_expr}]'
                     )
 
                 if mode == "DENSE":
-                    query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
+                    query_emb = get_embeddings(
+                        [query],
+                        dim=1024,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        job_id=job_id,
+                    )[0]
                     res = client.search(
                         collection_name=COLLECTION_NAME,
                         data=[query_emb],
                         anns_field="dense_vector",
-                        search_params={"metric_type": "COSINE", "params": {"ef": 64}},
-                        limit=max(1, dense_top_k),
+                        search_params={"metric_type": "COSINE", "params": {"ef": num_candidates}},
+                        limit=max(1, dense_top_k * max(1, len(representations))),
                         filter=filter_expr,
                         output_fields=output_fields,
                     )
@@ -315,35 +392,48 @@ class MilvusHybridService:
                         data=[query],
                         anns_field="sparse_vector",
                         search_params={"metric_type": "BM25"},
-                        limit=max(1, sparse_top_k),
+                        limit=max(1, sparse_top_k * max(1, len(representations))),
                         filter=filter_expr,
                         output_fields=output_fields,
                     )
                     return normalize_result(res)[:fusion_top_k]
 
-                query_emb = get_embeddings([query], dim=1024, tenant_id=tenant_id)[0]
-                dense_req = AnnSearchRequest(
+                # Fuse at canonical chunk level. Milvus-level hybrid RRF would
+                # treat ORIGINAL/SUMMARY/QUESTION as independent documents and let
+                # one chunk vote multiple times before deduplication.
+                candidate_multiplier = max(1, len(representations))
+                query_emb = get_embeddings(
+                    [query],
+                    dim=1024,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    job_id=job_id,
+                )[0]
+                dense_res = client.search(
+                    collection_name=COLLECTION_NAME,
                     data=[query_emb],
                     anns_field="dense_vector",
-                    param={"metric_type": "COSINE", "params": {"ef": 64}},
-                    limit=max(1, dense_top_k),
-                    expr=filter_expr,
-                )
-                sparse_req = AnnSearchRequest(
-                    data=[query],
-                    anns_field="sparse_vector",
-                    param={"metric_type": "BM25"},
-                    limit=max(1, sparse_top_k),
-                    expr=filter_expr,
-                )
-                res = client.hybrid_search(
-                    collection_name=COLLECTION_NAME,
-                    reqs=[dense_req, sparse_req],
-                    ranker=RRFRanker(k=rrf_k),
-                    limit=fusion_top_k,
+                    search_params={"metric_type": "COSINE", "params": {"ef": num_candidates}},
+                    limit=max(1, dense_top_k * candidate_multiplier),
+                    filter=filter_expr,
                     output_fields=output_fields,
                 )
-                return normalize_result(res)
+                sparse_res = client.search(
+                    collection_name=COLLECTION_NAME,
+                    data=[query],
+                    anns_field="sparse_vector",
+                    search_params={"metric_type": "BM25"},
+                    limit=max(1, sparse_top_k * candidate_multiplier),
+                    filter=filter_expr,
+                    output_fields=output_fields,
+                )
+                dense_hits = normalize_result(dense_res)[:dense_top_k]
+                sparse_hits = normalize_result(sparse_res)[:sparse_top_k]
+                return rrf_fuse(
+                    [dense_hits, sparse_hits],
+                    weights=[0.5, 0.5],
+                    rrf_k=rrf_k,
+                )[:fusion_top_k]
             except ApiException:
                 raise
             except Exception as e:
@@ -372,7 +462,7 @@ class MilvusHybridService:
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
-                if item["representation_type"] != "ORIGINAL":
+                if item["representation_type"] not in representations:
                     continue
                 text_lower = (item["text_content"] + " " + item["normalized_terms"]).lower()
                 score = sum(1.0 for t in query_terms if t in text_lower)
@@ -392,11 +482,17 @@ class MilvusHybridService:
             bm25_hits.sort(key=lambda x: x["bm25_score"], reverse=True)
 
         if mode in {"DENSE", "HYBRID"}:
-            query_emb = get_embeddings([query], dim=1024)[0]
+            query_emb = get_embeddings(
+                        [query],
+                        dim=1024,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        job_id=job_id,
+                    )[0]
             for item in cls._mock_store.values():
                 if not record_is_allowed(item):
                     continue
-                if item["representation_type"] != "ORIGINAL":
+                if item["representation_type"] not in representations:
                     continue
                 v = item["dense_vector"]
                 cos_sim = sum(a * b for a, b in zip(query_emb, v))
@@ -413,6 +509,20 @@ class MilvusHybridService:
                     "score": cos_sim,
                 })
             dense_hits.sort(key=lambda x: x["dense_score"], reverse=True)
+
+        def dedupe_canonical(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            output = []
+            seen = set()
+            for hit in items:
+                chunk_id = str(hit.get("chunkId") or "")
+                if not chunk_id or chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                output.append(hit)
+            return output
+
+        dense_hits = dedupe_canonical(dense_hits)
+        bm25_hits = dedupe_canonical(bm25_hits)
 
         if mode == "DENSE":
             return dense_hits[:min(dense_top_k, fusion_top_k)]
@@ -478,6 +588,52 @@ class MilvusHybridService:
                     }
                     for c in chunks
                 ]
+                rep_rows = conn.execute(
+                    select(
+                        representation_table.c.chunk_id,
+                        representation_table.c.kind,
+                        representation_table.c.ordinal,
+                        representation_table.c.text_content,
+                        representation_table.c.vector_bytes,
+                        representation_table.c.dims,
+                    ).where(
+                        and_(
+                            representation_table.c.tenant_id == tenant_id,
+                            representation_table.c.build_id == b.active_build_id,
+                        )
+                    )
+                ).fetchall()
+                representation_map: Dict[str, List[Dict[str, Any]]] = {}
+                for rep in rep_rows:
+                    item = {
+                        "kind": str(rep.kind),
+                        "ordinal": int(rep.ordinal or 0),
+                        "text_content": str(rep.text_content or ""),
+                    }
+                    if rep.vector_bytes and rep.dims:
+                        item["dense_vector"] = list(
+                            struct.unpack(f"<{int(rep.dims)}f", bytes(rep.vector_bytes))
+                        )
+                    representation_map.setdefault(str(rep.chunk_id), []).append(item)
+
+                if not is_test_env():
+                    if chunk_dicts and not representation_map:
+                        raise ApiException(
+                            409,
+                            "INDEX_REBUILD_REQUIRES_REINGEST",
+                            "活动构建缺少持久化 representation，不能在无作业 owner 的重建流程中重新调用 Embedding；请重新入库",
+                        )
+                    if any(
+                        not rep.get("dense_vector")
+                        for reps in representation_map.values()
+                        for rep in reps
+                    ):
+                        raise ApiException(
+                            409,
+                            "INDEX_REBUILD_REQUIRES_REINGEST",
+                            "活动构建 representation 缺少持久化向量，请重新入库",
+                        )
+
                 cls.upsert_chunks(
                     tenant_id=tenant_id,
                     build_id=str(b.active_build_id),
@@ -486,4 +642,5 @@ class MilvusHybridService:
                     doc_id=str(b.document_id),
                     version_id=str(b.version_id),
                     index_epoch=int(b.fence or 0),
+                    representations=representation_map or None,
                 )

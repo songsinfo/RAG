@@ -91,8 +91,9 @@ app.add_exception_handler(ApiException, api_exception_handler)
 async def csrf_middleware(request: Request, call_next):
     # Only protect mutating HTTP methods on API routes
     exempt_paths = {"/api/v1/auth/csrf", "/api/v1/health", "/health", "/docs", "/openapi.json"}
+    internal_service_call = request.url.path.startswith("/api/v1/internal/")
     if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.url.path.startswith("/api/v1"):
-        if request.url.path not in exempt_paths:
+        if request.url.path not in exempt_paths and not internal_service_call:
             # 1. Check Origin if provided
             origin = request.headers.get("origin")
             if origin:
@@ -126,6 +127,7 @@ from app.retrieval.router import router as retrieval_router
 from app.qa.router import router as qa_router
 from app.admin.config_router import router as config_router
 from app.evaluation.router import router as eval_router
+from app.model_budget_router import router as budget_router
 from app.identity.security import verify_csrf_token
 
 # Include routers
@@ -136,6 +138,7 @@ app.include_router(retrieval_router, prefix="/api/v1")
 app.include_router(qa_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(eval_router, prefix="/api/v1")
+app.include_router(budget_router, prefix="/api/v1")
 
 
 @app.exception_handler(Exception)

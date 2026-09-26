@@ -41,7 +41,7 @@ from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
 from app.evaluation.judge import judge_answer, RUBRIC_VERSION
-from app.qa.model_usage import model_prices, usage_scope
+from app.model_budget import BudgetService
 
 
 def check_no_model(config: Dict[str, Any]):
@@ -181,7 +181,7 @@ class EvaluationRunner:
                 if judge_mode == "LLM" or body.get("strict", False):
                     aliases.append("judge-main")
                 for alias in aliases:
-                    model_prices(alias)
+                    BudgetService.pricing(actor.tenant_id, alias)
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
                 input_tokens = total_turns * 30000 + total_questions * 30000
@@ -221,6 +221,9 @@ class EvaluationRunner:
         cap = number(body.get("maxCostCny", 10))
         if cap <= 0 or cap > 10:
             raise ApiException(400, "INVALID_BATCH_LIMIT", "批次费用上限需大于0且不超过10元")
+        max_model_calls = int(body.get("maxModelCalls", 1000))
+        if max_model_calls < 1 or max_model_calls > 1000:
+            raise ApiException(400, "INVALID_BATCH_LIMIT", "批次模型调用上限需在1到1000之间")
 
         if est.get("estimatedCostCny") is None:
             raise ApiException(409, "MODEL_PRICING_NOT_CONFIGURED", "价格未知不能启动付费评估，可先运行RETRIEVAL_ONLY")
@@ -235,6 +238,7 @@ class EvaluationRunner:
 
         manifest = dict(est)
         manifest["maxCostCny"] = cap
+        manifest["maxModelCalls"] = max_model_calls
         manifest["requesterId"] = actor.user_id
         manifest["environment"] = settings.ENVIRONMENT
 
@@ -266,7 +270,11 @@ class EvaluationRunner:
                     status="QUEUED",
                     stage="EVALUATING",
                     available_at=now,
-                    checkpoint={"runId": run_id, "maxCostCny": cap},
+                    checkpoint={
+                        "runId": run_id,
+                        "maxCostCny": cap,
+                        "maxModelCalls": max_model_calls,
+                    },
                     created_at=now,
                     updated_at=now,
                 )
@@ -358,6 +366,7 @@ class EvaluationRunner:
             mode = manifest.get("mode", "RAG")
             snapshot_id = str(run_row.snapshot_id)
             eval_config_id = str(run_row.config_id)
+            eval_job_id = str(run_row.job_id)
 
             snap_docs = conn.execute(
                 select(eval_snapshot_document_table.c.document_id).where(
@@ -433,14 +442,14 @@ class EvaluationRunner:
                 try:
                     if len(turns) > 1:
                         raise ApiException(409, "MULTITURN_REQUIRES_QA", "多轮题不能仅执行第一轮检索")
-                    with usage_scope(actor.tenant_id, job_id=str(run_row.job_id)):
-                        retrieval = RetrievalPipeline.retrieve(
-                            actor=persona_actor,
-                            query=question_text,
-                            document_ids=allowed_doc_ids,
-                            config_id=eval_config_id,
-                            run_id=None,
-                        )
+                    retrieval = RetrievalPipeline.retrieve(
+                        actor=persona_actor,
+                        query=question_text,
+                        document_ids=allowed_doc_ids,
+                        config_id=eval_config_id,
+                        run_id=None,
+                        job_id=eval_job_id,
+                    )
                     hits = retrieval["hits"]
                     EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
                     latency_ms = (time.perf_counter() - start_t) * 1000.0
@@ -655,15 +664,18 @@ class EvaluationRunner:
         for index, turn in enumerate(turns):
             EvaluationCatalog.check_snapshot(actor, scope["snapshotId"], check_current=True)
             with get_db_connection() as conn:
-                status = conn.execute(select(eval_run_table.c.status).where(and_(
+                eval_row = conn.execute(select(eval_run_table.c.status, eval_run_table.c.job_id).where(and_(
                     eval_run_table.c.tenant_id == actor.tenant_id, eval_run_table.c.id == eval_run_id,
-                ))).scalar()
-            if status == "CANCELLED":
+                ))).first()
+            if eval_row and eval_row.status == "CANCELLED":
                 raise ApiException(409, "CANCELLED", "评测已取消")
+            segment_id = QaService.get_conversation_detail(persona, conv["conversationId"])["currentSegmentId"]
             submitted = QaService.submit_run(persona, conv["conversationId"], {
                 "question": str(turn.get("text", "")).strip(), "mode": manifest["mode"],
-                "strictMode": manifest.get("strict", False), "configId": manifest["configId"],
-            }, idempotency_key=f"eval:{result_id}:{index}", evaluation_scope=scope)
+                "strictMode": manifest.get("strict", False), "segmentId": segment_id,
+            }, idempotency_key=f"eval:{result_id}:{index}", evaluation_scope=scope,
+                trusted_config_id=manifest["configId"],
+                trusted_evaluation_job_id=str(eval_row.job_id) if eval_row else None)
             run_id = submitted["runId"]
             run_ids.append(run_id)
             deadline = time.monotonic() + float(os.getenv("AGENT_TIMEOUT_SECONDS", "120")) + 10

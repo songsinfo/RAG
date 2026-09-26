@@ -1,5 +1,8 @@
 # 实施计划、运行预算与验收
 
+> **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 对应 PRD-00/06，整合其余 PRD 的外部验收。技术设计完成后按纵向流程编码，每阶段都提供启动方法、API 示例、真实调用链解释和实际失败记录。
 
 ## 1. 实现阶段

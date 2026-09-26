@@ -9,9 +9,19 @@ from typing import List, Dict, Any, Optional
 from app.config import settings, is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
-from app.models import model_call_table
+from sqlalchemy import and_, select
+from app.models import (
+    model_call_table,
+    qa_run_table,
+    run_source_table,
+    document_table,
+    app_user_table,
+    tenant_table,
+    job_table,
+)
 from app.qa.model_clients import get_chat_model, get_http_client
 from app.qa.runtime import AgentRuntimePolicy, retry_call
+from app.model_budget import BudgetService
 from app.qa.model_usage import invoke_tracked
 
 logger = logging.getLogger(__name__)
@@ -26,14 +36,111 @@ MODEL_CONFIG_IDS = {
 
 class ModelGateway:
     @staticmethod
-    def _invoke(llm, messages, tenant_id, run_id, purpose, alias, max_tokens):
-        return invoke_tracked(
-            lambda: llm.invoke(messages), tenant_id=tenant_id, run_id=run_id,
-            purpose=purpose, alias=alias, payload={"messages": [m.model_dump() for m in messages],
-                                                "tools": getattr(llm, "kwargs", {}).get("tools", [])},
-            max_output_tokens=max_tokens,
-            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
-        )
+    def assert_job_current(tenant_id: str, job_id: Optional[str]) -> None:
+        if not job_id:
+            return
+        with get_db_connection() as conn:
+            job = conn.execute(
+                select(
+                    job_table.c.status,
+                    job_table.c.cancel_requested_at,
+                ).where(
+                    and_(
+                        job_table.c.tenant_id == tenant_id,
+                        job_table.c.id == job_id,
+                    )
+                )
+            ).first()
+        if (
+            not job
+            or str(job.status) != "RUNNING"
+            or job.cancel_requested_at is not None
+        ):
+            raise ApiException(409, "CANCELLED", "后台任务已停止")
+
+    @staticmethod
+    def assert_run_sources_current(tenant_id: str, run_id: Optional[str], allow_eval_judge: bool = False) -> None:
+        if not run_id:
+            return
+        from app.identity.deps import Actor, can_read_document
+
+        with get_db_connection() as conn:
+            run = conn.execute(
+                select(
+                    qa_run_table.c.owner_id,
+                    qa_run_table.c.status,
+                    qa_run_table.c.budget_json,
+                ).where(
+                    and_(
+                        qa_run_table.c.tenant_id == tenant_id,
+                        qa_run_table.c.id == run_id,
+                    )
+                )
+            ).first()
+            terminal_judge = (run and allow_eval_judge and str(run.status) in {"SUCCEEDED", "COMPLETED"}
+                              and (run.budget_json or {}).get("evaluationJobId"))
+            if terminal_judge:
+                ModelGateway.assert_job_current(tenant_id, str(terminal_judge))
+            if not run or (str(run.status) not in {"QUEUED", "RUNNING", "WAITING_APPROVAL"} and not terminal_judge):
+                raise ApiException(409, "CANCELLED", "请求已停止")
+
+            user = conn.execute(
+                select(
+                    app_user_table.c.is_admin,
+                    tenant_table.c.security_epoch,
+                )
+                .select_from(
+                    app_user_table.join(
+                        tenant_table,
+                        tenant_table.c.id == app_user_table.c.tenant_id,
+                    )
+                )
+                .where(
+                    and_(
+                        app_user_table.c.tenant_id == tenant_id,
+                        app_user_table.c.id == run.owner_id,
+                        app_user_table.c.status == "ACTIVE",
+                    )
+                )
+            ).first()
+            if not user:
+                raise ApiException(409, "SOURCE_CHANGED", "问答用户已失效")
+            actor = Actor(
+                tenant_id=tenant_id,
+                user_id=str(run.owner_id),
+                admin=bool(user.is_admin),
+                security_epoch=int(user.security_epoch or 0),
+            )
+            from app.qa.context import run_document_scope
+            run_document_scope(conn, actor, run_id)
+            sources = conn.execute(
+                select(
+                    run_source_table.c.document_id,
+                    run_source_table.c.build_id,
+                    run_source_table.c.purpose,
+                )
+                .where(
+                    and_(
+                        run_source_table.c.tenant_id == tenant_id,
+                        run_source_table.c.run_id == run_id,
+                    )
+                )
+                .distinct()
+            ).fetchall()
+            for source in sources:
+                if not can_read_document(conn, actor, str(source.document_id)):
+                    raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
+                if str(source.purpose) != "HISTORY":
+                    current = conn.execute(
+                        select(document_table.c.active_build_id).where(
+                            and_(
+                                document_table.c.tenant_id == tenant_id,
+                                document_table.c.id == source.document_id,
+                            )
+                        )
+                    ).first()
+                    if not current or str(current.active_build_id or "") != str(source.build_id):
+                        raise ApiException(409, "SOURCE_CHANGED", "来源版本已变化，请重新提问")
 
     @classmethod
     def chat(
@@ -45,6 +152,7 @@ class ModelGateway:
         max_tokens: int = 2400,
         model_alias: str = "chat-main",
         deadline_epoch: Optional[float] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         gateway_url = os.getenv("LITELLM_BASE_URL")
         call_id = str(uuid.uuid4())
@@ -75,15 +183,25 @@ class ModelGateway:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
 
                 policy = AgentRuntimePolicy.from_env()
+
+                def invoke_primary():
+                    return invoke_tracked(
+                        lambda: llm.invoke(lc_messages), tenant_id=tenant_id, run_id=run_id,
+                        job_id=job_id, purpose=purpose, alias=model_alias,
+                        payload={"messages": messages, "tools": []},
+                        max_output_tokens=max_tokens,
+                        usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                    )
+
                 try:
                     response = retry_call(
                         f"llm:{model_alias}",
-                        lambda: cls._invoke(llm, lc_messages, tenant_id, run_id, purpose, model_alias, max_tokens),
+                        invoke_primary,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
                 except Exception as exc:
-                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "SOURCE_CHANGED", "MODEL_PRICING_NOT_CONFIGURED"}:
                         raise
                     fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
                     if not fallback_alias or fallback_alias == model_alias:
@@ -91,9 +209,19 @@ class ModelGateway:
                     fallback = get_chat_model(fallback_alias, max_tokens, timeout_seconds)
                     if fallback is None:
                         raise
+
+                    def invoke_fallback():
+                        return invoke_tracked(
+                            lambda: fallback.invoke(lc_messages), tenant_id=tenant_id, run_id=run_id,
+                            job_id=job_id, purpose=purpose, alias=fallback_alias,
+                            payload={"messages": messages, "tools": []},
+                            max_output_tokens=max_tokens,
+                            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                        )
+
                     response = retry_call(
                         f"llm:{fallback_alias}",
-                        lambda: cls._invoke(fallback, lc_messages, tenant_id, run_id, purpose, fallback_alias, max_tokens),
+                        invoke_fallback,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -115,6 +243,7 @@ class ModelGateway:
                 input_tokens=0,
                 output_tokens=0,
                 model_alias=model_alias,
+                job_id=job_id,
             )
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
@@ -128,6 +257,7 @@ class ModelGateway:
             input_tokens=30,
             output_tokens=30,
             model_alias=model_alias,
+            job_id=job_id,
         )
 
         # Deterministic simulation based on prompt
@@ -193,13 +323,14 @@ class ModelGateway:
         max_tokens: int = 1200,
         model_alias: str = "chat-main",
         deadline_epoch: Optional[float] = None,
+        job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         call_id = str(uuid.uuid4())
         gateway_url = os.getenv("LITELLM_BASE_URL")
 
         if cls._agent_mock_handler:
             result = cls._agent_mock_handler(messages)
-            cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias)
+            cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias, job_id=job_id)
             return result
 
         if gateway_url:
@@ -254,15 +385,25 @@ class ModelGateway:
                 llm = base_model.bind_tools(tools, strict=True)
 
                 policy = AgentRuntimePolicy.from_env()
+
+                def invoke_primary_tools():
+                    return invoke_tracked(
+                        lambda: llm.invoke(lc_messages), tenant_id=tenant_id, run_id=run_id,
+                        job_id=job_id, purpose=purpose, alias=model_alias,
+                        payload={"messages": messages, "tools": tools},
+                        max_output_tokens=max_tokens,
+                        usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                    )
+
                 try:
                     response = retry_call(
                         f"llm-tools:{model_alias}",
-                        lambda: cls._invoke(llm, lc_messages, tenant_id, run_id, purpose, model_alias, max_tokens),
+                        invoke_primary_tools,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
                 except Exception as exc:
-                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+                    if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "SOURCE_CHANGED", "MODEL_PRICING_NOT_CONFIGURED"}:
                         raise
                     fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
                     if not fallback_alias or fallback_alias == model_alias:
@@ -271,9 +412,19 @@ class ModelGateway:
                     if fallback_model is None:
                         raise
                     fallback_bound = fallback_model.bind_tools(tools, strict=True)
+
+                    def invoke_fallback_tools():
+                        return invoke_tracked(
+                            lambda: fallback_bound.invoke(lc_messages), tenant_id=tenant_id, run_id=run_id,
+                            job_id=job_id, purpose=purpose, alias=fallback_alias,
+                            payload={"messages": messages, "tools": tools},
+                            max_output_tokens=max_tokens,
+                            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                        )
+
                     response = retry_call(
                         f"llm-tools:{fallback_alias}",
-                        lambda: cls._invoke(fallback_bound, lc_messages, tenant_id, run_id, purpose, fallback_alias, max_tokens),
+                        invoke_fallback_tools,
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
@@ -298,11 +449,11 @@ class ModelGateway:
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"Agent大模型网关调用失败: {e}")
 
         if not is_test_env():
-            cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias)
+            cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias, job_id=job_id)
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # Default deterministic mock: first round search, second round answer
-        cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias)
+        cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias, job_id=job_id)
         has_tool_response = any(m.get("role") == "tool" for m in messages)
         if not has_tool_response:
             user_msg = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
@@ -346,6 +497,7 @@ class ModelGateway:
         documents: List[str],
         top_n: int,
         model_alias: str = "rerank-main",
+        job_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not documents:
             return []
@@ -369,10 +521,9 @@ class ModelGateway:
                         "return_documents": False,
                     },
                     timeout=20.0,
-                ), tenant_id=tenant_id, run_id=run_id, purpose="RERANK", alias=model_alias,
+                ), tenant_id=tenant_id, run_id=run_id, job_id=job_id, purpose="RERANK", alias=model_alias,
                     payload={"query": query, "documents": documents},
-                    usage_reader=lambda response: {"input_tokens": response.json()["usage"]["total_tokens"], "output_tokens": 0}
-                    if response.status_code == 200 and "total_tokens" in response.json().get("usage", {}) else {})
+                    usage_reader=lambda response: {"input_tokens": response.json().get("usage", {}).get("total_tokens"), "output_tokens": 0})
                 if response.status_code != 200:
                     raise ApiException(
                         503,
@@ -405,7 +556,7 @@ class ModelGateway:
 
         if not is_test_env():
             cls._record_call(
-                tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias
+                tenant_id, call_id, run_id, "RERANK", "FAILED", 0, 0, model_alias, job_id=job_id
             )
             raise ApiException(503, "RERANK_UNAVAILABLE", "未配置可用的 Reranker 网关")
 
@@ -431,6 +582,7 @@ class ModelGateway:
             input_tokens=max(1, (len(query) + sum(len(d) for d in documents)) // 4),
             output_tokens=0,
             model_alias=model_alias,
+            job_id=job_id,
         )
         return scored[: min(top_n, len(scored))]
 
@@ -445,33 +597,58 @@ class ModelGateway:
         input_tokens: int,
         output_tokens: int,
         model_alias: str,
+        job_id: Optional[str] = None,
     ):
         try:
             now = datetime.now(timezone.utc)
+            budget = BudgetService.settle_call(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                model_alias=model_alias,
+                call_status=status,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            if budget.get("reservationId"):
+                if status == "SUCCESS":
+                    persisted_status = "SETTLED"
+                elif status == "NOT_SENT":
+                    persisted_status = "NOT_SENT"
+                else:
+                    persisted_status = "UNKNOWN"
+            else:
+                persisted_status = status
             with get_db_connection() as conn:
                 conn.execute(
                     model_call_table.insert().values(
                         tenant_id=tenant_id,
                         id=call_id,
                         run_id=run_id,
-                        job_id=None,
+                        job_id=job_id,
                         purpose=purpose,
-                        model_config_id=MODEL_CONFIG_IDS.get(model_alias, model_alias),
+                        model_config_id=(
+                            (budget.get("pricing") or {}).get("configId")
+                            or MODEL_CONFIG_IDS.get(model_alias, model_alias)
+                        ),
                         attempt_no=1,
-                        status=status,
-                        reserved_amount="0.000000",
-                        settled_amount="0.000000" if is_test_env() else None,
+                        status=persisted_status,
+                        reserved_amount=str(budget.get("reservedAmount") or "0"),
+                        settled_amount=(
+                            str(budget.get("settledAmount"))
+                            if budget.get("settledAmount") is not None
+                            else None
+                        ),
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         provider_request_id=f"req-{call_id[:8]}",
-                        pricing_snapshot={"source": "TEST" if is_test_env() else "UNKNOWN"},
+                        pricing_snapshot=budget.get("pricing") or {},
                         usage_detail={"model": model_alias},
-                        reservation_authority="INTERNAL",
-                        reservation_id=None,
+                        reservation_authority=budget.get("authority") or "NONE",
+                        reservation_id=budget.get("reservationId"),
                         created_at=now,
                         updated_at=now,
                     )
                 )
                 conn.commit()
         except Exception:
-            logger.exception("Failed to persist model call %s", call_id)
+            logger.exception("Failed to settle/persist model call %s", call_id)

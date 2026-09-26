@@ -1,5 +1,8 @@
 # 检索、上下文与证据协议
 
+> **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
+
+
 对应 PRD-03，并由 PRD-01、02、04、05 约束。所有策略在 Java 中显式串联；框架默认 Retriever 不代替 ACL 和证据登记。
 
 ## 1. 配置与能力检查

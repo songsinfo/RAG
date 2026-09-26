@@ -13,7 +13,7 @@
 
 ## 运行前提
 
-1. evaluation 隔离环境的 MySQL、Elasticsearch、Docling 和后端已启动。
+1. evaluation 隔离环境的 MySQL、Milvus（含 etcd/MinIO）、Docling、LiteLLM 和 Python/FastAPI 后端已启动。
 2. 18 个来源已被确认是模拟资料或允许用于评测的脱敏资料，并已导入 evaluation 环境。
 3. 导入构建启用 embedding=true，Embedding 模型、维度与查询模型完全一致；否则 Dense/Hybrid 发布会失败关闭。
 4. .runtime/evaluation.env 已配置真实 Chat、Embedding 和 Reranker 服务。MODEL 类型配置中的 CNY 单价应改成实际服务价格，避免费用报告失真。

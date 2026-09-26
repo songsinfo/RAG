@@ -22,13 +22,19 @@ def rrf_fuse(
 
     for route_idx, route_hits in enumerate(ranked_lists):
         w = weights[route_idx]
-        for rank, hit in enumerate(route_hits, start=1):
+        seen = set()
+        unique_rank = 0
+        for hit in route_hits:
             hit_id = hit["id"]
+            if hit_id in seen:
+                continue
+            seen.add(hit_id)
+            unique_rank += 1
             if hit_id not in items_by_id:
                 items_by_id[hit_id] = dict(hit)
-            scores[hit_id] += w / (rrf_k + rank)
+            scores[hit_id] += w / (rrf_k + unique_rank)
 
-    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    sorted_ids = sorted(scores.keys(), key=lambda x: (-scores[x], str(x)))
     fused: List[Dict[str, Any]] = []
     for sid in sorted_ids:
         item = items_by_id[sid]

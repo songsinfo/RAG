@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,19 @@ import app.db as db
 import app.config as config
 
 
+def submit_test_run(actor, conv_id, body, **kwargs):
+    body = {"segmentId": QaService.get_conversation_detail(actor, conv_id)["currentSegmentId"], **body}
+    kwargs.setdefault("idempotency_key", str(uuid.uuid4()))
+    return QaService.submit_run(actor, conv_id, body, **kwargs)
+
+
+def set_prices(alias="chat-main"):
+    from app.models import config_revision_table
+    with db.engine.begin() as conn:
+        conn.execute(update(config_revision_table).where(config_revision_table.c.id == f"cfg-model-{alias}").values(
+            payload={"modelAlias": alias, "currency": "CNY", "inputPricePerMillion": 1, "outputPricePerMillion": 1}))
+
+
 def ingested(monkeypatch, tmp_path):
     doc = previous.queue_document(monkeypatch, tmp_path)
     worker = DurableJobWorker()
@@ -46,7 +60,7 @@ def test_strict_rag_rejects_empty_judge_verdicts(monkeypatch, tmp_path, verdicts
         return json.dumps({"verdicts": verdicts}) if kwargs["purpose"] == "JUDGE" else real_chat(**kwargs)
     monkeypatch.setattr(ModelGateway, "chat", chat)
     conv = QaService.create_conversation(ACTOR, {})
-    run = QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus", "strict": True})
+    run = submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus", "strict": True})
     result = QaService.get_run(ACTOR, run["runId"])
     assert result.get("verification") != "SUPPORTED", result
 
@@ -59,9 +73,9 @@ def test_strict_agent_actually_calls_judge(monkeypatch):
     })
     monkeypatch.setattr(ModelGateway, "chat", lambda **kw: calls.append(kw["purpose"]) or '{}')
     conv = QaService.create_conversation(ACTOR, {})
-    run = QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus", "mode": "AGENT", "strict": True})
+    run = submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus", "mode": "AGENT", "strict": True})
     result = QaService.get_run(ACTOR, run["runId"])
-    assert result.get("verification") != "SUPPORTED" or "JUDGE" in calls, (result, calls)
+    assert result.get("verification") != "SUPPORTED" and "JUDGE" in calls, (result, calls)
 
 
 def test_old_upload_cannot_replace_newer_published_version(monkeypatch, tmp_path):
@@ -84,11 +98,11 @@ def test_old_upload_cannot_replace_newer_published_version(monkeypatch, tmp_path
 def test_agent_does_not_reuse_previous_segment(monkeypatch, tmp_path):
     ingested(monkeypatch, tmp_path)
     conv = QaService.create_conversation(ACTOR, {})
-    QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus"})
+    submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus"})
     QaService.create_segment(ACTOR, conv["conversationId"], {"scope": {"mode": "ALL", "kbIds": []}})
     import app.qa.service as qa
     monkeypatch.setattr(qa, "is_test_env", lambda: False)
-    current = QaService.submit_run(ACTOR, conv["conversationId"], {"question": "New segment", "mode": "AGENT"})
+    current = submit_test_run(ACTOR, conv["conversationId"], {"question": "New segment", "mode": "AGENT"})
     messages = LangGraphAgent._conversation_memory(ACTOR, conv["conversationId"], current["runId"])
     assert messages == [], messages
 
@@ -96,14 +110,14 @@ def test_agent_does_not_reuse_previous_segment(monkeypatch, tmp_path):
 def test_regular_rag_followup_receives_history(monkeypatch, tmp_path):
     ingested(monkeypatch, tmp_path)
     conv = QaService.create_conversation(ACTOR, {})
-    QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus first question"})
+    submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus first question"})
     observed = []
     real_chat = ModelGateway.chat
     def capture(**kwargs):
         observed.append(kwargs["messages"])
         return real_chat(**kwargs)
     monkeypatch.setattr(ModelGateway, "chat", capture)
-    QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus: what about its limitations?"})
+    submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus: what about its limitations?"})
     assert "Milvus first question" in json.dumps(observed), observed
 
 
@@ -145,20 +159,18 @@ def test_ui_config_post_options_are_not_silently_ignored():
     assert cfg.rerank_enabled and not cfg.parent_expansion_enabled, cfg
 
 
-def test_unsupported_strategies_rejected_at_config_boundary():
+def test_remote_advanced_strategies_remain_supported():
     from app.retrieval.config import validate_retrieval_payload
-    for payload in ({"query": {"hyde": True}}, {"post": {"mmr": True}},
-                    {"retrieval": {"representations": ["ORIGINAL", "SUMMARY"]}}):
-        with pytest.raises(ApiException) as exc:
-            validate_retrieval_payload(payload)
-        assert exc.value.code == "UNSUPPORTED_STRATEGY"
+    cfg = validate_retrieval_payload({"query": {"rewrite": True, "hyde": True, "multiQuery": True},
+                                      "post": {"mmr": True}})
+    assert cfg.rewrite_enabled and cfg.hyde_enabled and cfg.multi_query_enabled and cfg.mmr_enabled
 
 
-def queued_qa(monkeypatch, scope=None):
+def queued_qa(monkeypatch, scope=None, job_id=None):
     import app.qa.service as qa
     monkeypatch.setattr(qa, "is_test_env", lambda: False)
     conv = QaService.create_conversation(ACTOR, {})
-    return QaService.submit_run(ACTOR, conv["conversationId"], {"question": "Milvus"}, evaluation_scope=scope)["runId"]
+    return submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus"}, evaluation_scope=scope, trusted_evaluation_job_id=job_id)["runId"]
 
 
 def test_external_retries_each_record_usage_and_stop_before_exceeding_budget(monkeypatch):
@@ -166,7 +178,7 @@ def test_external_retries_each_record_usage_and_stop_before_exceeding_budget(mon
     from app.qa.runtime import retry_call, AgentRuntimePolicy
     monkeypatch.setenv("AGENT_MAX_MODEL_CALLS", "2")
     monkeypatch.setenv("RAG_MONTHLY_BUDGET_CNY", "100")
-    monkeypatch.setenv("RAG_MODEL_PRICES_CNY", json.dumps({"chat-main": {"inputPerMillion": 1, "outputPerMillion": 2}}))
+    set_prices()
     run_id = queued_qa(monkeypatch)
     calls = []
     def request():
@@ -184,59 +196,60 @@ def test_external_retries_each_record_usage_and_stop_before_exceeding_budget(mon
     assert exc.value.code == "BUDGET_EXCEEDED"
     assert len(calls) == 2
     with db.engine.connect() as conn:
-        rows = conn.execute(select(model_call_table).where(model_call_table.c.run_id == run_id).order_by(model_call_table.c.attempt_no)).all()
-    assert [r.status for r in rows] == ["FAILED", "SUCCESS"]
-    assert [r.attempt_no for r in rows] == [1, 2]
+        rows = conn.execute(select(model_call_table).where(model_call_table.c.run_id == run_id).order_by(model_call_table.c.created_at)).all()
+    assert [r.status for r in rows] == ["UNKNOWN", "SETTLED"]
+    assert len({r.id for r in rows}) == 2
     assert rows[1].input_tokens == 5 and rows[1].output_tokens == 3
-    assert all(r.settled_amount is None for r in rows)
+    assert rows[0].settled_amount is None and rows[1].settled_amount is not None
 
 
 def test_batch_reservation_shared_by_multiple_qa_runs(monkeypatch):
     from app.qa.model_usage import invoke_tracked
-    monkeypatch.setenv("RAG_MODEL_PRICES_CNY", json.dumps({"chat-main": {"inputPerMillion": 1, "outputPerMillion": 1}}))
+    from app.models import job_table
+    set_prices()
     monkeypatch.setenv("RAG_MONTHLY_BUDGET_CNY", "100")
     with db.engine.begin() as conn:
-        conn.execute(eval_run_table.insert().values(tenant_id=ACTOR.tenant_id, id="audit-eval",
-            dataset_version_id="d", snapshot_id="s", config_id="c", job_id="j", status="RUNNING",
-            manifest_json={"maxCostCny": 0.0004}))
-    ids = [queued_qa(monkeypatch, {"evalRunId": "audit-eval"}) for _ in range(2)]
+        conn.execute(job_table.insert().values(tenant_id=ACTOR.tenant_id, id="audit-eval-job",
+            kind="EVALUATE", target_id="audit-eval", requested_by=ACTOR.user_id,
+            idempotency_key="audit-eval-job", request_hash=b"audit", status="RUNNING",
+            stage="EVALUATING", checkpoint={"maxCostCny": 0.0004, "maxModelCalls": 100}))
+    first = queued_qa(monkeypatch, job_id="audit-eval-job")
     actual = []
     def invoke(run_id):
         return invoke_tracked(lambda: actual.append(run_id), tenant_id=ACTOR.tenant_id,
             run_id=run_id, purpose="ANSWER", alias="chat-main", payload="x")
-    invoke(ids[0])
+    invoke(first)
+    with db.engine.begin() as conn:
+        conn.execute(update(qa_run_table).where(qa_run_table.c.id == first).values(status="SUCCEEDED"))
+    second = queued_qa(monkeypatch, job_id="audit-eval-job")
     with pytest.raises(ApiException) as exc:
-        invoke(ids[1])
-    assert exc.value.code == "BATCH_BUDGET_EXCEEDED"
-    assert actual == [ids[0]]
+        invoke(second)
+    assert exc.value.code == "BUDGET_EXCEEDED"
+    assert actual == [first]
 
 
-def test_unknown_production_prices_fail_before_external_call(monkeypatch):
-    import app.qa.model_usage as usage
-    monkeypatch.setattr(usage, "is_test_env", lambda: False)
-    monkeypatch.setenv("RAG_MODEL_PRICES_CNY", "{}")
+def test_unknown_prices_fail_before_external_call(monkeypatch):
+    from app.qa.model_usage import invoke_tracked
     sent = []
     with pytest.raises(ApiException) as exc:
-        usage.invoke_tracked(lambda: sent.append(1), tenant_id=ACTOR.tenant_id,
-            purpose="ANSWER", alias="chat-main", payload="test")
+        invoke_tracked(lambda: sent.append(1), tenant_id=ACTOR.tenant_id,
+            purpose="ANSWER", alias="unconfigured-model", payload="test")
     assert exc.value.code == "MODEL_PRICING_NOT_CONFIGURED" and sent == []
 
 
 def test_embedding_batches_belong_to_the_run(monkeypatch):
-    from app.qa.model_usage import usage_scope
     from app.retrieval import embedding
     run_id = queued_qa(monkeypatch)
     monkeypatch.setenv("LITELLM_BASE_URL", "http://synthetic/v1")
     class Response:
         status_code = 200
         def json(self):
-            return {"data": [{"embedding": [1.0] * 4}], "usage": {"total_tokens": 3}}
+            return {"data": [{"index": 0, "embedding": [1.0] * 4}], "usage": {"total_tokens": 3}}
     class Client:
         def post(self, *args, **kwargs):
             return Response()
     monkeypatch.setattr(embedding, "get_http_client", Client)
-    with usage_scope(ACTOR.tenant_id, run_id):
-        assert len(embedding.get_embeddings(["a", "b"], dim=4, batch_size=1)) == 2
+    assert len(embedding.get_embeddings(["a", "b"], dim=4, batch_size=1, tenant_id=ACTOR.tenant_id, run_id=run_id)) == 2
     with db.engine.connect() as conn:
         calls = conn.execute(select(model_call_table).where(model_call_table.c.run_id == run_id)).all()
     assert len(calls) == 2 and all(c.purpose == "EMBEDDING" and c.input_tokens == 3 for c in calls)
@@ -257,6 +270,7 @@ def test_eval_multiturn_uses_same_conversation_and_snapshot(monkeypatch):
     scope = {"snapshotId": "snap", "evalRunId": "eval", "documents": [{"documentId": "d", "buildId": "b"}]}
     monkeypatch.setattr(EvaluationCatalog, "check_snapshot", lambda *args, **kwargs: ["d"])
     monkeypatch.setattr(QaService, "create_conversation", lambda *args: {"conversationId": "one-conversation"})
+    monkeypatch.setattr(QaService, "get_conversation_detail", lambda *args: {"currentSegmentId": "segment"})
     def submit(actor, conv, body, **kw):
         submitted.append((actor.user_id, conv, body, kw))
         return {"runId": str(len(submitted))}
@@ -315,3 +329,31 @@ def test_eval_restart_reuses_existing_turns(monkeypatch, tmp_path):
     monkeypatch.setattr(QaService, "create_conversation", unexpected)
     _, resumed = EvaluationRunner._run_qa_turns(ACTOR, ACTOR, "eval", "res", case, manifest, scope)
     assert resumed == first
+
+
+def test_gateway_fallback_has_separate_reservation_and_actual_alias(monkeypatch):
+    from types import SimpleNamespace
+    set_prices()
+    set_prices("judge-main")
+    run_id = queued_qa(monkeypatch)
+    sent = []
+    class Primary:
+        def invoke(self, messages):
+            sent.append("chat-main")
+            raise RuntimeError("synthetic provider failure")
+    class Fallback:
+        def invoke(self, messages):
+            sent.append("judge-main")
+            return SimpleNamespace(content="answer", usage_metadata={"input_tokens": 5, "output_tokens": 2})
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://synthetic/v1")
+    monkeypatch.setenv("AGENT_FALLBACK_MODEL_ALIAS", "judge-main")
+    monkeypatch.setattr("app.qa.model_gateway.get_chat_model",
+                        lambda alias, *args: Primary() if alias == "chat-main" else Fallback())
+    assert ModelGateway.chat(ACTOR.tenant_id, run_id, "ANSWER", [{"role": "user", "content": "test"}]) == "answer"
+    with db.engine.connect() as conn:
+        rows = conn.execute(select(model_call_table).where(model_call_table.c.run_id == run_id)
+                            .order_by(model_call_table.c.created_at)).all()
+    assert sent == ["chat-main", "judge-main"]
+    assert [r.status for r in rows] == ["UNKNOWN", "SETTLED"]
+    assert [r.model_config_id for r in rows] == ["cfg-model-chat-main", "cfg-model-judge-main"]
+    assert len({r.reservation_id for r in rows}) == 2

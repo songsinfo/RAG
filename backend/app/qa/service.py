@@ -15,11 +15,13 @@ from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     tenant_table,
+    app_user_table,
     conversation_table,
     context_segment_table,
     segment_kb_table,
     qa_run_table,
     run_source_table,
+    run_dependency_table,
     run_event_table,
     model_call_table,
     feedback_table,
@@ -34,7 +36,7 @@ from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
 from app.qa.execution import current_qa_execution, qa_execution_scope, qa_lease_is_current
-from app.qa.context import conversation_memory, assert_run_sources_readable
+from app.qa.context import assert_run_sources_readable, run_document_scope
 from app.retrieval.pipeline import RetrievalPipeline
 
 
@@ -319,6 +321,31 @@ class QaService:
             conn.commit()
 
     @staticmethod
+    def _validate_strict_verdicts(claims: List[Dict[str, Any]], judge_json: Dict[str, Any]) -> None:
+        verdicts = judge_json.get("verdicts") if isinstance(judge_json, dict) else None
+        if not isinstance(verdicts, list):
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 verdicts 格式无效")
+
+        expected = {str(claim.get("id")) for claim in claims}
+        seen = set()
+        if len(verdicts) != len(expected):
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未覆盖全部 claim")
+
+        for verdict in verdicts:
+            if not isinstance(verdict, dict):
+                raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 verdict 格式无效")
+            claim_id = str(verdict.get("claimId", ""))
+            status = verdict.get("status")
+            if claim_id not in expected or claim_id in seen:
+                raise ApiException(422, "VERIFICATION_FAILED", "严格裁判 claimId 缺失、未知或重复")
+            seen.add(claim_id)
+            if status != "SUPPORTED":
+                raise ApiException(422, "VERIFICATION_FAILED", "存在未获原文支持或不确定的事实")
+
+        if seen != expected:
+            raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未覆盖全部 claim")
+
+    @staticmethod
     def create_segment(actor: Actor, conv_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
@@ -387,12 +414,16 @@ class QaService:
         conv_id: str,
         body: Dict[str, Any],
         idempotency_key: Optional[str] = None,
+        trusted_config_id: Optional[str] = None,
+        trusted_evaluation_job_id: Optional[str] = None,
         *,
         evaluation_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         question = str(body.get("question", "")).strip()
-        if not question:
-            raise ApiException(400, "INVALID_INPUT", "提问内容不能为空")
+        if not question or len(question) > 2000:
+            raise ApiException(400, "INVALID_INPUT", "提问内容不能为空且最多2000字符")
         validate_input(question)
 
         mode = body.get("mode", "RAG")
@@ -400,6 +431,8 @@ class QaService:
             raise ApiException(400, "INVALID_INPUT", "问答模式无效")
 
         strict_mode = bool(body.get("strictMode") or body.get("strict", False))
+        if body.get("configId") is not None:
+            raise ApiException(400, "INVALID_INPUT", "客户端不能覆盖检索配置")
         now = datetime.now(timezone.utc)
 
         with get_db_connection() as conn:
@@ -431,9 +464,30 @@ class QaService:
             ).first()
             if not seg:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "会话无上下文分段")
+            requested_segment_id = str(body.get("segmentId") or "").strip()
+            if not requested_segment_id:
+                raise ApiException(400, "INVALID_INPUT", "segmentId 必填")
+            if requested_segment_id != str(seg.id):
+                raise ApiException(409, "VERSION_CONFLICT", "上下文范围已改变")
+
+            # Serialize submissions for the same user, matching the Java
+            # pessimistic-lock contract before allocating turn numbers.
+            user_row = conn.execute(
+                select(app_user_table.c.id)
+                .where(
+                    and_(
+                        app_user_table.c.tenant_id == actor.tenant_id,
+                        app_user_table.c.id == actor.user_id,
+                        app_user_table.c.status == "ACTIVE",
+                    )
+                )
+                .with_for_update()
+            ).first()
+            if not user_row:
+                raise ApiException(403, "OPERATION_FORBIDDEN", "用户不可用")
 
             # 3. Idempotency check
-            scoped_key = f"{actor.user_id}:{idempotency_key}" if idempotency_key else None
+            scoped_key = f"{actor.user_id}:{idempotency_key}"
             req_hash = hashlib.sha256(f"{conv_id}:{seg.id}:{question}:{mode}:{strict_mode}".encode("utf-8")).digest()
             if evaluation_scope is not None:
                 req_hash = hashlib.sha256(req_hash + json.dumps(evaluation_scope, sort_keys=True).encode("utf-8")).digest()
@@ -457,18 +511,18 @@ class QaService:
                         "pollAfterMs": 1000,
                     }
 
-            # 4. Check concurrency: only one active run per conversation
+            # 4. Preserve the Java contract: one active online run per user.
             active_run = conn.execute(
                 select(qa_run_table.c.id).where(
                     and_(
                         qa_run_table.c.tenant_id == actor.tenant_id,
-                        qa_run_table.c.conversation_id == conv_id,
-                        qa_run_table.c.status.in_(["QUEUED", "RUNNING"]),
+                        qa_run_table.c.owner_id == actor.user_id,
+                        qa_run_table.c.status.in_(["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
                     )
                 )
             ).first()
             if active_run:
-                raise ApiException(409, "CONCURRENT_RUN", "当前会话已有正在执行的问答任务")
+                raise ApiException(409, "ACTIVE_RUN_EXISTS", "已有活动请求")
 
             # 5. Insert new run
             run_id = str(uuid.uuid4())
@@ -483,8 +537,9 @@ class QaService:
                 .order_by(qa_run_table.c.turn_no.desc())
             ).scalar() or 0
 
-            # Resolve retrieval config_id
-            config_id = body.get("configId")
+            # Resolve retrieval config_id. Only trusted internal callers
+            # (evaluation) may pin a historical published config.
+            config_id = trusted_config_id
             if not config_id:
                 t_row = conn.execute(
                     select(tenant_table.c.active_retrieval_config_id).where(tenant_table.c.id == actor.tenant_id)
@@ -507,12 +562,15 @@ class QaService:
                     strict_mode=strict_mode,
                     status="QUEUED",
                     stage="ROUTING",
-                    idempotency_key=scoped_key or run_id,
+                    idempotency_key=scoped_key,
                     request_hash=req_hash,
                     question=question,
                     result_json=None,
                     security_epoch=getattr(actor, "security_epoch", 0),
-                    budget_json={"evaluationScope": evaluation_scope} if evaluation_scope is not None else {},
+                    budget_json={
+                        **({"evaluationScope": evaluation_scope} if evaluation_scope is not None else {}),
+                        **({"evaluationJobId": trusted_evaluation_job_id} if trusted_evaluation_job_id else {}),
+                    },
                     terminal_reason=None,
                     cancel_requested_at=None,
                     started_at=None,
@@ -704,6 +762,8 @@ class QaService:
                 )
                 conn.commit()
 
+            history = QaService._rag_history(actor, seg_id, run_id)
+
             # 1. Routing
             decision = classify_question(question)
             QaService._record_event(actor.tenant_id, run_id, "ROUTED", {"route": decision.route.value, "reason": decision.reason})
@@ -767,15 +827,14 @@ class QaService:
                     ).fetchall()
                     allowed_kb_ids = [str(k.kb_id) for k in kbs]
 
-            memory = conversation_memory(actor, conv_id, run_id)
-            retrieval_query = "\n".join([m["content"] for m in memory if m["role"] == "user"] + [question])
             assert_run_sources_readable(actor, run_id)
             retrieval = RetrievalPipeline.retrieve(
                 actor=actor,
-                query=retrieval_query,
+                query=question,
                 kb_ids=allowed_kb_ids or None,
                 config_id=config_id,
                 run_id=run_id,
+                history=history,
             )
             hits = retrieval["hits"]
             QaService._record_event(
@@ -875,7 +934,7 @@ class QaService:
             assert_run_sources_readable(actor, run_id)
             messages = [
                 {"role": "system", "content": INSTRUCTION},
-                *memory,
+                *history,
                 {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
             ]
             raw_answer = ModelGateway.chat(
@@ -889,8 +948,8 @@ class QaService:
 
             try:
                 parsed_answer = json.loads(raw_answer)
-            except Exception:
-                parsed_answer = {"status": "NO_EVIDENCE", "claims": []}
+            except Exception as exc:
+                raise ApiException(502, "INVALID_MODEL_OUTPUT", "回答模型未返回合法 JSON") from exc
 
             # 6. Claim Validation
             QaService._record_event(actor.tenant_id, run_id, "VALIDATING")
@@ -935,12 +994,7 @@ class QaService:
             ],
         )
         try:
-            verdicts = json.loads(raw)["verdicts"]
-            expected = {c["id"] for c in claims}
-            if not isinstance(verdicts, list) or len(verdicts) != len(claims):
-                raise ValueError("裁判结果缺项")
-            if {v["claimId"] for v in verdicts} != expected or not all(v["status"] == "SUPPORTED" for v in verdicts):
-                raise ValueError("判定缺失、重复或未全部支持")
+            QaService._validate_strict_verdicts(claims, json.loads(raw))
         except (ValueError, TypeError, KeyError) as exc:
             raise ApiException(422, "VERIFICATION_FAILED", "严格裁判未完整确认所有事实") from exc
         assert_run_sources_readable(actor, run_id)
@@ -1180,6 +1234,131 @@ class QaService:
             )
             conn.commit()
             return True
+
+    @staticmethod
+    def _rag_history(actor: Actor, segment_id: str, current_run_id: str) -> List[Dict[str, str]]:
+        with get_db_connection() as conn:
+            scope = run_document_scope(conn, actor, current_run_id)
+            if not qa_lease_is_current(conn, actor.tenant_id, current_run_id):
+                raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已失效")
+            current_turn = conn.execute(
+                select(qa_run_table.c.turn_no).where(
+                    and_(
+                        qa_run_table.c.tenant_id == actor.tenant_id,
+                        qa_run_table.c.id == current_run_id,
+                    )
+                )
+            ).scalar()
+            if current_turn is None:
+                return []
+
+            rows = conn.execute(
+                select(
+                    qa_run_table.c.id,
+                    qa_run_table.c.turn_no,
+                    qa_run_table.c.question,
+                    qa_run_table.c.result_json,
+                )
+                .where(
+                    and_(
+                        qa_run_table.c.tenant_id == actor.tenant_id,
+                        qa_run_table.c.segment_id == segment_id,
+                        qa_run_table.c.turn_no < int(current_turn),
+                        qa_run_table.c.status.in_(["COMPLETED", "SUCCEEDED", "PARTIAL", "CONFLICT"]),
+                    )
+                )
+                .order_by(qa_run_table.c.turn_no.desc())
+                .limit(4)
+            ).fetchall()
+
+            messages: List[Dict[str, str]] = []
+            total_chars = 0
+            for row in reversed(rows):
+                source_rows = conn.execute(
+                    select(
+                        run_source_table.c.document_id,
+                        run_source_table.c.build_id,
+                    ).where(
+                        and_(
+                            run_source_table.c.tenant_id == actor.tenant_id,
+                            run_source_table.c.run_id == row.id,
+                        )
+                    ).distinct()
+                ).fetchall()
+                if any(not can_read_document(conn, actor, str(src.document_id)) for src in source_rows):
+                    continue
+                if scope is not None:
+                    assert_hits_still_readable(conn, actor, [
+                        {"documentId": src.document_id, "buildId": src.build_id} for src in source_rows
+                    ], document_ids=scope)
+
+                question = str(row.question or "").strip()
+                result = row.result_json if isinstance(row.result_json, dict) else {}
+                answer = str(result.get("answer") or "").strip()
+                next_chars = len(question) + len(answer)
+                if total_chars + next_chars > 4000:
+                    break
+                total_chars += next_chars
+
+                dep_exists = conn.execute(
+                    select(run_dependency_table.c.id).where(
+                        and_(
+                            run_dependency_table.c.tenant_id == actor.tenant_id,
+                            run_dependency_table.c.run_id == current_run_id,
+                            run_dependency_table.c.prior_run_id == row.id,
+                        )
+                    )
+                ).first()
+                if not dep_exists:
+                    conn.execute(
+                        run_dependency_table.insert().values(
+                            tenant_id=actor.tenant_id,
+                            id=str(uuid.uuid4()),
+                            run_id=current_run_id,
+                            prior_run_id=str(row.id),
+                            created_at=datetime.now(timezone.utc),
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+
+                for src in source_rows:
+                    inherited = conn.execute(
+                        select(run_source_table.c.id).where(
+                            and_(
+                                run_source_table.c.tenant_id == actor.tenant_id,
+                                run_source_table.c.run_id == current_run_id,
+                                run_source_table.c.document_id == src.document_id,
+                                run_source_table.c.build_id == src.build_id,
+                                run_source_table.c.purpose == "HISTORY",
+                            )
+                        )
+                    ).first()
+                    if not inherited:
+                        conn.execute(
+                            run_source_table.insert().values(
+                                tenant_id=actor.tenant_id,
+                                id=str(uuid.uuid4()),
+                                run_id=current_run_id,
+                                document_id=str(src.document_id),
+                                build_id=str(src.build_id),
+                                unit_id=None,
+                                evidence_id=None,
+                                purpose="HISTORY",
+                                span_json=None,
+                                payload_hash=None,
+                                send_status="PREPARED",
+                                created_at=datetime.now(timezone.utc),
+                                updated_at=datetime.now(timezone.utc),
+                            )
+                        )
+
+                if question:
+                    messages.append({"role": "user", "content": question[:2000]})
+                if answer:
+                    messages.append({"role": "assistant", "content": answer[:4000]})
+
+            conn.commit()
+            return messages
 
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:

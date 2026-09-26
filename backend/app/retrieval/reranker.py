@@ -12,6 +12,7 @@ def rerank_hits(
     model_alias: str,
     top_k: int,
     fail_open: bool,
+    job_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     if not hits:
         return [], []
@@ -24,9 +25,18 @@ def rerank_hits(
             documents=[str(h.get("text") or "") for h in hits],
             top_n=min(top_k, len(hits)),
             model_alias=model_alias,
+            job_id=job_id,
         )
     except ApiException as exc:
-        if not fail_open or exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
+        fallback_codes = {
+            "RERANK_UNAVAILABLE",
+            "MODEL_GATEWAY_UNAVAILABLE",
+            "MODEL_TIMEOUT",
+            "MODEL_PROVIDER_ERROR",
+            "MODEL_RETRYABLE",
+            "INVALID_MODEL_OUTPUT",
+        }
+        if not fail_open or exc.code not in fallback_codes:
             raise
         return hits[:top_k], [f"RERANK_FALLBACK:{exc.code}"]
 

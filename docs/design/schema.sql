@@ -213,6 +213,8 @@ CREATE TABLE index_build (
   model_fingerprint VARCHAR(255) NULL,
   embedding_dims INT NULL,
   capabilities JSON NOT NULL,
+  quality_warnings JSON NULL,
+  review_reason VARCHAR(2000) NULL,
   manifest_hash BINARY(32) NULL,
   fence BIGINT NOT NULL,
   published_at DATETIME(6) NULL,
@@ -342,7 +344,7 @@ CREATE TABLE job (
   PRIMARY KEY (tenant_id, id),
   UNIQUE KEY uq_job_idempotency (tenant_id,kind,idempotency_key),
   KEY ix_job_claim (status,available_at,lease_until),
-  CONSTRAINT chk_job_kind CHECK (kind IN ('INGEST','PURGE','RESTORE','EVALUATE','EXPORT','CLEANUP','QA_RUN')),
+  CONSTRAINT chk_job_kind CHECK (kind IN ('INGEST','PURGE','RESTORE','EVALUATE','EXPORT','CLEANUP','QA_RUN','SEARCH')),
   CONSTRAINT fk_40 FOREIGN KEY (tenant_id) REFERENCES tenant (id),
   CONSTRAINT fk_41 FOREIGN KEY (tenant_id,requested_by) REFERENCES app_user (tenant_id,id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -562,7 +564,7 @@ CREATE TABLE model_call (
   PRIMARY KEY (tenant_id, id),
   KEY ix_call_run (tenant_id,run_id),
   KEY ix_call_job (tenant_id,job_id),
-  CONSTRAINT ck_model_call_owner CHECK (run_id IS NULL OR job_id IS NULL),
+  CHECK ((run_id IS NULL) <> (job_id IS NULL)),
   CHECK (reserved_amount >= 0),
   CONSTRAINT fk_208 FOREIGN KEY (tenant_id) REFERENCES tenant (id),
   CONSTRAINT fk_209 FOREIGN KEY (tenant_id,run_id) REFERENCES qa_run (tenant_id,id),
