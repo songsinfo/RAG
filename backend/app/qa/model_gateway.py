@@ -1,3 +1,14 @@
+"""项目统一的模型调用网关。
+
+所有 Chat / Tool Calling / Rerank 都从这里出去，统一处理：
+- 任务/运行是否仍然有效；
+- 来源权限和版本是否发生变化；
+- 超时、重试、Fallback 模型；
+- Token/费用跟踪与结算；
+- 测试环境的确定性 mock。
+
+因此业务代码不应该绕过 ModelGateway 直接调用模型供应商。
+"""
 import json
 import logging
 import os
@@ -35,8 +46,12 @@ MODEL_CONFIG_IDS = {
 
 
 class ModelGateway:
+    """模型访问的单一出口，集中承载安全、预算、重试和可观测性。"""
+
     @staticmethod
     def assert_job_current(tenant_id: str, job_id: Optional[str]) -> None:
+        """外部模型调用前确认后台任务仍在 RUNNING 且没有被请求取消。"""
+        # 在线同步调用可能没有 job_id；有 job_id 的异步任务则必须校验 lease 生命周期。
         if not job_id:
             return
         with get_db_connection() as conn:
@@ -60,6 +75,7 @@ class ModelGateway:
 
     @staticmethod
     def assert_run_sources_current(tenant_id: str, run_id: Optional[str], allow_eval_judge: bool = False) -> None:
+        """模型调用前重新确认 run、用户、来源 ACL 和 build 版本仍然有效。"""
         if not run_id:
             return
         from app.identity.deps import Actor, can_read_document
@@ -77,6 +93,7 @@ class ModelGateway:
                     )
                 )
             ).first()
+            # 评估 Judge 发生在业务 QA 已经终态之后，所以允许一个非常窄的“终态仍可 Judge”例外。
             terminal_judge = (run and allow_eval_judge and str(run.status) in {"SUCCEEDED", "COMPLETED"}
                               and (run.budget_json or {}).get("evaluationJobId"))
             if terminal_judge:
@@ -105,6 +122,7 @@ class ModelGateway:
             ).first()
             if not user:
                 raise ApiException(409, "SOURCE_CHANGED", "问答用户已失效")
+            # 用 QA run 的真实 owner 重建 Actor，不能沿用管理员/评估发起者身份。
             actor = Actor(
                 tenant_id=tenant_id,
                 user_id=str(run.owner_id),
@@ -127,9 +145,12 @@ class ModelGateway:
                 )
                 .distinct()
             ).fetchall()
+            # run_source 不是永久授权：每次把来源送给外部模型前都重新检查当前 ACL。
             for source in sources:
                 if not can_read_document(conn, actor, str(source.document_id)):
                     raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
+                # HISTORY 允许引用当时记录的 build；当前轮实际检索来源则要求 active_build_id 仍一致，
+                # 避免文档更新后继续用旧 build 生成“当前答案”。
                 if str(source.purpose) != "HISTORY":
                     current = conn.execute(
                         select(document_table.c.active_build_id).where(
@@ -155,6 +176,7 @@ class ModelGateway:
         job_id: Optional[str] = None,
     ) -> str:
         gateway_url = os.getenv("LITELLM_BASE_URL")
+        # 每次实际/模拟调用都生成独立 call_id，用于预算预留、结算和 model_call 审计。
         call_id = str(uuid.uuid4())
 
         # Attempt to call LiteLLM Gateway via langchain_openai if configured
@@ -174,6 +196,7 @@ class ModelGateway:
                         lc_messages.append(AIMessage(content=content))
 
                 timeout_seconds = 30.0
+                # 单次请求超时不能突破 Agent 的整体 deadline；取两者更小值。
                 if deadline_epoch is not None:
                     timeout_seconds = max(1.0, min(30.0, deadline_epoch - time.time()))
                     if deadline_epoch <= time.time():
@@ -184,6 +207,7 @@ class ModelGateway:
 
                 policy = AgentRuntimePolicy.from_env()
 
+                # invoke_tracked 会在真正发送请求前再次执行预算/权限/任务有效性检查，并记录 usage。
                 def invoke_primary():
                     return invoke_tracked(
                         lambda: llm.invoke(lc_messages), tenant_id=tenant_id, run_id=run_id,
@@ -201,8 +225,10 @@ class ModelGateway:
                         deadline_epoch=deadline_epoch,
                     )
                 except Exception as exc:
+                    # 预算、取消、权限变化属于业务终止条件，绝不能通过 fallback 模型绕过去。
                     if isinstance(exc, ApiException) and exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "SOURCE_CHANGED", "MODEL_PRICING_NOT_CONFIGURED"}:
                         raise
+                    # 只有主模型的可重试/供应商错误才尝试 fallback；fallback 同样走 tracked + retry。
                     fallback_alias = os.getenv("AGENT_FALLBACK_MODEL_ALIAS", "").strip()
                     if not fallback_alias or fallback_alias == model_alias:
                         raise
@@ -233,6 +259,7 @@ class ModelGateway:
             except Exception as e:
                 raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"大模型网关调用失败: {e}")
 
+        # 生产环境没有模型网关时必须显式失败，不能偷偷启用本地假结果。
         if not is_test_env():
             cls._record_call(
                 tenant_id=tenant_id,
@@ -247,6 +274,7 @@ class ModelGateway:
             )
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
+        # 仅测试环境使用确定性模拟，目的是让单元测试不依赖真实模型/网络/费用。
         # Fallback for offline unit test environments
         cls._record_call(
             tenant_id=tenant_id,
@@ -310,6 +338,7 @@ class ModelGateway:
 
         return json.dumps({"answer": "OK"})
 
+    # 测试注入点：只用于 Agent 单元测试，不应在生产运行时设置。
     _agent_mock_handler = None  # Hook for test injection
 
     @classmethod
@@ -328,6 +357,7 @@ class ModelGateway:
         call_id = str(uuid.uuid4())
         gateway_url = os.getenv("LITELLM_BASE_URL")
 
+        # mock handler 优先返回确定性 tool call / answer，仍记录 model_call 以覆盖计费链测试。
         if cls._agent_mock_handler:
             result = cls._agent_mock_handler(messages)
             cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 50, 50, model_alias, job_id=job_id)
@@ -379,6 +409,7 @@ class ModelGateway:
                     timeout_seconds = max(1.0, min(30.0, deadline_epoch - time.time()))
                     if deadline_epoch <= time.time():
                         raise ApiException(408, "AGENT_TIMEOUT", "Agent 执行超过整体时间预算")
+                # bind_tools(strict=True) 让模型工具参数尽量遵守 schema，减少运行时脏参数。
                 base_model = get_chat_model(model_alias, max_tokens, timeout_seconds)
                 if base_model is None:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
@@ -428,6 +459,7 @@ class ModelGateway:
                         policy=policy,
                         deadline_epoch=deadline_epoch,
                     )
+                # 将 LangChain 不同版本的 ToolCall 统一成项目内部稳定结构。
                 tool_calls = getattr(response, "tool_calls", [])
                 formatted_calls = [
                     {
@@ -499,6 +531,7 @@ class ModelGateway:
         model_alias: str = "rerank-main",
         job_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        # 没有候选时不产生任何外部 rerank 调用和费用。
         if not documents:
             return []
 
@@ -508,6 +541,7 @@ class ModelGateway:
 
         if gateway_url:
             base = gateway_url.rstrip("/")
+            # 兼容 LITELLM_BASE_URL 是否已经包含 /v1。
             endpoint = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
             try:
                 response = invoke_tracked(lambda: get_http_client().post(
@@ -532,6 +566,7 @@ class ModelGateway:
                     )
                 payload = response.json()
                 results = payload.get("results") or payload.get("data") or []
+                # 只信任合法 index + score；供应商返回其他附加字段不进入内部排序协议。
                 normalized = []
                 for item in results:
                     idx = item.get("index")
@@ -599,8 +634,13 @@ class ModelGateway:
         model_alias: str,
         job_id: Optional[str] = None,
     ):
+        """结算并持久化一次模型调用。
+
+        这里捕获异常只写日志，不反向破坏已经完成的业务调用；账务缺口会通过 UNKNOWN 状态暴露。
+        """
         try:
             now = datetime.now(timezone.utc)
+            # 先结算预算，再把 reservation/pricing 快照和 usage 一起写入 model_call。
             budget = BudgetService.settle_call(
                 tenant_id=tenant_id,
                 call_id=call_id,
@@ -610,6 +650,7 @@ class ModelGateway:
                 output_tokens=output_tokens,
             )
             if budget.get("reservationId"):
+                # 有 reservation 时，model_call.status 反映“账务最终态”，不再简单等同于调用返回态。
                 if status == "SUCCESS":
                     persisted_status = "SETTLED"
                 elif status == "NOT_SENT":

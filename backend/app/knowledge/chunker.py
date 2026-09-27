@@ -1,9 +1,17 @@
+"""把 Docling HybridChunker 的结果适配为项目内部的 Parent-Child + Provenance 结构。
+
+重要边界：
+- child 的真正切分由 Docling 完成，本文件不再次把 child 重新切碎；
+- 本文件只做相邻 child 的 parent 分组、SourceUnit 组装和字符位置映射；
+- 这样既保留 HybridChunker 的语义切分，又支持 read_section、引用回溯和 parent expansion。
+"""
 import hashlib
 import uuid
 from typing import Any, Dict, List, Tuple
 
 
 def _heading_key(item: Dict[str, Any]) -> Tuple[str, ...]:
+    """把标题路径规范化成可比较的 tuple，用于判断相邻 chunk 是否属于同一章节。"""
     headings = item.get("headings")
     if not isinstance(headings, list):
         return ()
@@ -11,6 +19,7 @@ def _heading_key(item: Dict[str, Any]) -> Tuple[str, ...]:
 
 
 def _location(item: Dict[str, Any]) -> Dict[str, Any]:
+    """保留 Docling 给出的页码、标题、caption、doc item 等来源定位信息。"""
     location: Dict[str, Any] = {
         "doclingChunkIndex": int(item.get("chunk_index") or 0),
         "headings": list(_heading_key(item)),
@@ -25,7 +34,9 @@ def _location(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _group_location(group: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把一个 parent 分组内多个 child 的定位信息合并成 parent/SourceUnit 级 provenance。"""
     headings = list(group[0]["headings"]) if group else []
+    # 页码去重排序，保证同一输入得到稳定 metadata，方便比较和测试。
     pages = sorted({
         int(page)
         for item in group
@@ -44,6 +55,7 @@ def _group_location(group: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     metadata: Dict[str, Any] = {}
     warnings: List[Any] = []
+    # 普通 metadata 首个值优先；Docling warnings 则汇总，避免后续 child 的 warning 丢失。
     for item in group:
         item_metadata = item["location"].get("metadata")
         if not isinstance(item_metadata, dict):
@@ -74,16 +86,15 @@ def adapt_docling_hybrid_chunks(
     *,
     parent_max_tokens: int = 1200,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Adapt Docling HybridChunker output to the enterprise provenance schema.
+    """把 Docling HybridChunker 输出转换成项目内部追溯结构。
 
-    Docling HybridChunker owns all child splitting and token sizing. This adapter
-    only groups adjacent children with the same heading path into bounded parent
-    contexts and SourceUnits. That preserves read_section/provenance without
-    re-splitting HybridChunker output.
+    Docling 已经决定 child 的切分边界和 token 数；这里仅把“标题路径相同且 parent
+    token 不超预算”的相邻 child 合并为 parent 和 SourceUnit，不重新切 child。
     """
     if not items:
         return [], [], []
 
+    # 第一步：把 Docling 不同字段形态归一化，后续分组只处理稳定结构。
     normalized: List[Dict[str, Any]] = []
     for position, item in enumerate(items):
         text = str(item.get("text") or "").strip()
@@ -101,6 +112,7 @@ def adapt_docling_hybrid_chunks(
                 ),
                 "text": text,
                 "raw_text": raw_text,
+                # Docling 正常会返回 num_tokens；缺失时用字符数粗略兜底，仅用于 parent 预算估算。
                 "num_tokens": max(
                     1,
                     int(item.get("num_tokens") or max(1, len(text) // 4)),
@@ -110,6 +122,8 @@ def adapt_docling_hybrid_chunks(
             }
         )
 
+    # 第二步：构建 parent 分组。
+    # 分组只在“标题变化”或“parent token 预算超限”时断开。
     groups: List[List[Dict[str, Any]]] = []
     group: List[Dict[str, Any]] = []
     group_tokens = 0
@@ -119,6 +133,7 @@ def adapt_docling_hybrid_chunks(
         heading = item["headings"]
         would_exceed = bool(group) and group_tokens + item["num_tokens"] > parent_max_tokens
         heading_changed = bool(group) and heading != group_heading
+        # 任何一个条件触发都先结束当前 parent，再从当前 child 开始新 parent。
         if would_exceed or heading_changed:
             groups.append(group)
             group = []
@@ -131,12 +146,14 @@ def adapt_docling_hybrid_chunks(
     if group:
         groups.append(group)
 
+    # 第三步：为每个 parent 分组生成 SourceUnit、Parent chunk、Child chunk 和 span。
     units: List[Dict[str, Any]] = []
     chunks: List[Dict[str, Any]] = []
     spans: List[Dict[str, Any]] = []
     child_ordinal = 0
 
     for parent_ordinal, group in enumerate(groups, start=1):
+        # SourceUnit 表示可回读的原文段；child 的 span 都指向它。
         source_unit_id = str(uuid.uuid4())
         raw_parts = [item["raw_text"] for item in group]
         source_text = "\n\n".join(raw_parts)
@@ -160,6 +177,7 @@ def adapt_docling_hybrid_chunks(
             if heading_prefix
             else parent_body
         )
+        # Parent 只用于扩展上下文，不直接承载 source span；真正检索命中的是 child。
         parent_id = str(uuid.uuid4())
         chunks.append(
             {
@@ -188,6 +206,7 @@ def adapt_docling_hybrid_chunks(
                     "content_hash": hashlib.sha256(item["text"].encode("utf-8")).digest(),
                 }
             )
+            # span 使用 raw_text 在 source_text 中的字符偏移，保证引用可以回到原始段落。
             start = cursor
             end = start + len(item["raw_text"])
             spans.append(
@@ -201,6 +220,7 @@ def adapt_docling_hybrid_chunks(
                     "location": item["location"],
                 }
             )
+            # source_text 中 child 之间固定用两个换行拼接，所以游标同步跳过 2 个字符。
             cursor = end + 2  # "\n\n" separator in source_text
 
     return units, chunks, spans

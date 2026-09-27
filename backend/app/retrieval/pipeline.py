@@ -1,3 +1,17 @@
+"""检索主流水线。
+
+主流程：
+1. 读取并校验检索配置；
+2. 根据当前 Actor/评估快照计算真正可读的 build；
+3. 可选 Rewrite / Multi-Query / HyDE 生成检索查询；
+4. BM25 与 Dense 分路召回，再用 RRF 融合；
+5. 可选 Rerank、MMR、Parent Expansion；
+6. 应用上下文预算并补齐 provenance；
+7. 返回前再次做权限校验。
+
+最重要的安全边界：任何候选文本在离开应用进程交给外部模型（reranker/Judge/LLM）前，
+都必须重新确认当前仍可读，避免“检索时可读、发送时已撤权”的 TOCTOU 问题。
+"""
 import json
 import math
 import struct
@@ -18,6 +32,8 @@ from app.errors import ApiException
 
 
 class RetrievalPipeline:
+    """把多路检索、融合、重排、去冗余和上下文扩展串成一个稳定入口。"""
+
     @classmethod
     def retrieve(
         cls,
@@ -32,16 +48,20 @@ class RetrievalPipeline:
         limit_override: Optional[int] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
+        # 所有后续阶段只使用已经归一化/校验过的 RetrievalConfig。
         cfg = load_retrieval_config(actor.tenant_id, config_id)
 
         with get_db_connection() as conn:
             if run_id:
+                # 评估运行可能锁定固定 document/build 范围；在线检索则没有这个额外约束。
                 from app.qa.context import run_document_scope
                 run_scope = run_document_scope(conn, actor, run_id)
                 if run_scope is not None:
                     document_ids = run_scope if document_ids is None else list(set(document_ids).intersection(run_scope))
+            # 这里得到的是“当前 Actor 真正可读且生效”的 build，而不是仅按请求参数过滤。
             readable = get_readable_build_records(conn, actor, kb_ids, document_ids)
 
+        # MMR 需要原文向量计算文档间相似度，因此即使主检索是 BM25，也要求 dense 能力。
         needs_dense = cfg.mode in {"DENSE", "HYBRID"} or cfg.mmr_enabled
         if needs_dense:
             for row in readable:
@@ -64,11 +84,13 @@ class RetrievalPipeline:
                         "当前生效构建缺少检索所需 representation，请重新构建索引",
                     )
 
+        # 后续 Milvus 查询只允许命中这些 build，ACL/版本边界在这里转成检索层过滤条件。
         allowed_build_ids = [row["buildId"] for row in readable]
         allowed_build_epochs = {
             row["buildId"]: int(row.get("indexEpoch") or 0)
             for row in readable
         }
+        # “没有权限范围”是正常的空结果，不应该继续调用模型或向量服务。
         if not allowed_build_ids:
             return {
                 "hits": [],
@@ -78,6 +100,7 @@ class RetrievalPipeline:
             }
 
         warnings: List[str] = []
+        # independent_query 用于后续 rerank/MMR；query_variants 用于多路召回；HyDE 只进 dense 路。
         independent_query, query_variants, hyde_text = cls._prepare_queries(
             actor=actor,
             query=query,
@@ -88,6 +111,7 @@ class RetrievalPipeline:
             warnings=warnings,
         )
 
+        # BM25 与 Dense 视为独立 route：每个 query variant 都可以形成一条排名列表。
         # Match the Java route semantics: BM25 variants and dense variants
         # are independent RRF routes. HyDE contributes only to the dense family.
         ranked_lists: List[List[Dict[str, Any]]] = []
@@ -96,6 +120,7 @@ class RetrievalPipeline:
         use_dense = cfg.mode in {"DENSE", "HYBRID"}
 
         if use_sparse:
+            # Hybrid 时 sparse 家族总权重占 0.5，再平均分给每个 query variant。
             sparse_weight = (0.5 if use_dense else 1.0) / max(1, len(query_variants))
             for query_variant in query_variants:
                 route = MilvusHybridService.search(
@@ -120,6 +145,7 @@ class RetrievalPipeline:
 
         if use_dense:
             dense_queries = list(query_variants)
+            # HyDE 的“假想答案段落”只用于向量相似度，不参与 BM25 关键词检索。
             if hyde_text:
                 dense_queries.append(hyde_text)
             dense_weight = (0.5 if use_sparse else 1.0) / max(1, len(dense_queries))
@@ -144,6 +170,7 @@ class RetrievalPipeline:
                     ranked_lists.append(route)
                     route_weights.append(dense_weight)
 
+        # 只有多路结果时才做 RRF；单路直接保留原排名，避免无意义地重新打分。
         if not ranked_lists:
             hits = []
         elif len(ranked_lists) == 1:
@@ -155,8 +182,11 @@ class RetrievalPipeline:
                 rrf_k=cfg.rrf_k,
             )[:cfg.fusion_top_k]
 
+        # SUMMARY/QUESTION 等 representation 只用于匹配；真正给模型看的正文恢复成 ORIGINAL。
         hits = cls._hydrate_original_chunks(actor.tenant_id, hits)
 
+        # Reranker 是外部模型边界：候选文本离开应用进程前必须重新鉴权。
+        # 这是专门防止“检索后撤权”的竞态窗口。
         # Reranking is an external model boundary. Re-check every candidate
         # before any candidate text can leave the application process.
         with get_db_connection() as conn:
@@ -175,6 +205,7 @@ class RetrievalPipeline:
             )
             warnings.extend(rerank_warnings)
 
+        # MMR 放在 rerank 之后：先保证相关性，再从高质量候选里压低语义重复。
         if cfg.mmr_enabled and hits:
             hits = cls._mmr_select(
                 actor.tenant_id,
@@ -186,9 +217,11 @@ class RetrievalPipeline:
                 job_id=job_id,
             )
 
+        # Parent Expansion 最后做，避免大段 parent 文本影响前面的 rerank/MMR 排序。
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
 
+        # Parent 扩展可能让文本突然变大，所以必须在扩展后执行最终上下文预算。
         # Apply the legacy Java context budget after parent expansion.
         budgeted_hits: List[Dict[str, Any]] = []
         used_bytes = 0
@@ -197,6 +230,8 @@ class RetrievalPipeline:
             size = len(text_value.encode("utf-8"))
             if used_bytes + size > cfg.context_max_bytes:
                 if not budgeted_hits:
+                    # 最佳 parent 自己就超预算时，尝试退回它的 canonical child。
+                    # 这样既避免上下文为空，也不粗暴截断原文导致引用位置失真。
                     # Keep at least the best hit, but fall back to its canonical
                     # child text if an expanded parent alone exceeds the budget.
                     child_id = str(hit.get("chunkId") or "")
@@ -215,12 +250,14 @@ class RetrievalPipeline:
                 break
         hits = budgeted_hits
 
+        # 排名已经稳定后再补 provenance，避免前面每个阶段都携带大块定位元数据。
         hits = cls._attach_provenance(actor.tenant_id, hits)
         final_limit = cfg.final_top_k
         if limit_override is not None:
             final_limit = max(1, min(50, int(limit_override)))
         hits = hits[:final_limit]
 
+        # 返回给上游前最后一次鉴权：后续 QA 会把这些文本发送给生成模型。
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, hits, kb_ids, document_ids)
 
@@ -233,6 +270,7 @@ class RetrievalPipeline:
 
     @staticmethod
     def _hydrate_original_chunks(tenant_id: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把命中的派生 representation 恢复为 canonical ORIGINAL chunk 正文。"""
         chunk_ids = [str(hit.get("chunkId")) for hit in hits if hit.get("chunkId")]
         if not chunk_ids:
             return hits
@@ -269,8 +307,10 @@ class RetrievalPipeline:
         warnings: List[str],
     ) -> Tuple[str, List[str], Optional[str]]:
         original = query.strip()
+        # independent 是“脱离历史也能独立理解”的查询；默认就是原问题。
         independent = original
         variants = [original]
+        # Rewrite 只在存在历史时有意义，用来把“那它呢？”这类追问改成独立检索问题。
         if cfg.rewrite_enabled and history:
             messages = [
                 {
@@ -310,10 +350,13 @@ class RetrievalPipeline:
                     "MODEL_RETRYABLE",
                     "INVALID_MODEL_OUTPUT",
                 }
+                # 只有明确允许 fallback 且错误属于模型临时/格式问题时，才退回原查询。
+                # 权限、预算等业务错误不能被“降级”掩盖。
                 if not cfg.allow_rewrite_fallback or exc.code not in fallback_codes:
                     raise
                 warnings.append("REWRITE_SKIPPED")
 
+        # Multi-Query 生成等价问法提升召回，但不得改变原问题约束。
         if cfg.multi_query_enabled:
             raw = ModelGateway.chat(
                 actor.tenant_id,
@@ -347,6 +390,7 @@ class RetrievalPipeline:
                     break
 
         hyde_text: Optional[str] = None
+        # HyDE 生成“假想资料段落”作为 dense query；它不是事实，绝不能直接展示给用户。
         if cfg.hyde_enabled:
             hyde_text = ModelGateway.chat(
                 actor.tenant_id,
@@ -378,6 +422,7 @@ class RetrievalPipeline:
         run_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        # 0/1 个候选没有多样性选择空间，直接返回。
         if len(hits) <= 1:
             return hits[:count]
         chunk_ids = [str(hit.get("chunkId") or "") for hit in hits]
@@ -403,6 +448,7 @@ class RetrievalPipeline:
             if dims <= 0 or len(raw) != dims * 4:
                 continue
             vector_map[str(row.chunk_id)] = list(struct.unpack(f"<{dims}f", raw))
+        # MMR 必须基于同一套 ORIGINAL embedding；缺任何一个都不能悄悄跳过，否则结果不可解释。
         if any(chunk_id not in vector_map for chunk_id in chunk_ids):
             raise ApiException(409, "INDEX_CAPABILITY_MISSING", "MMR 缺少原文向量，请重新构建索引")
         doc_vectors = [vector_map[chunk_id] for chunk_id in chunk_ids]
@@ -416,6 +462,7 @@ class RetrievalPipeline:
             value = dot / (left_norm * right_norm)
             return max(-1.0, min(1.0, value))
 
+        # 先把原相关性分数 min-max 归一化到 0..1，才能与 0..1 的冗余相似度组合。
         raw_scores = [float(hit.get("score", 0.0) or 0.0) for hit in hits]
         min_score = min(raw_scores)
         max_score = max(raw_scores)
@@ -432,6 +479,7 @@ class RetrievalPipeline:
                     if max_score == min_score
                     else (raw_scores[idx] - min_score) / (max_score - min_score)
                 )
+                # 冗余取“与已选集合中最相似的那一个”，避免连续选出近重复段落。
                 redundancy = max(
                     (
                         (cosine(doc_vectors[idx], doc_vectors[chosen]) + 1.0) / 2.0
@@ -439,6 +487,7 @@ class RetrievalPipeline:
                     ),
                     default=0.0,
                 )
+                # λ 越大越偏相关性，越小越强调多样性。
                 score = lambda_value * relevance - (1.0 - lambda_value) * redundancy
                 if score > best_score:
                     best_score = score
@@ -497,6 +546,7 @@ class RetrievalPipeline:
 
         parent_map = {str(r.id): r for r in parent_rows}
         expanded: List[Dict[str, Any]] = []
+        # 多个 child 可能属于同一个 parent；同一 parent 只保留一次，避免上下文重复。
         seen_contexts = set()
 
         for hit in hits:
@@ -507,6 +557,7 @@ class RetrievalPipeline:
                 parent = parent_map.get(str(child.parent_id))
                 if parent and str(parent.build_id) == str(hit.get("buildId")):
                     parent_text = str(parent.text_content or "")
+                    # parent 过大时不截断拼接，而是保留 child，避免大段上下文挤掉其他证据。
                     if len(parent_text) <= cfg.parent_max_chars:
                         item["matchedText"] = str(hit.get("text") or "")
                         item["parentChunkId"] = str(parent.id)
@@ -531,6 +582,7 @@ class RetrievalPipeline:
 
     @staticmethod
     def _attach_provenance(tenant_id: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把最终命中映射回 SourceUnit/span，供引用展示和权限追踪使用。"""
         original_chunk_ids = [str(h.get("chunkId")) for h in hits if h.get("chunkId")]
         parent_ids = [str(h.get("parentChunkId")) for h in hits if h.get("parentChunkId")]
         if not original_chunk_ids and not parent_ids:

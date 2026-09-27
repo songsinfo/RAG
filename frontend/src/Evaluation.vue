@@ -4,6 +4,7 @@ import { api, rows, keyOf, pretty, terminal, type Row } from './api'
 import JsonView from './JsonView.vue'
 const error = ref(''), busy = ref(false), datasets = ref<Row[]>([]), snapshots = ref<Row[]>([]), configs = ref<Row[]>([]), datasetId = ref(''), versionId = ref(''), cases = ref<Row[]>([]), snapshotId = ref(''), configId = ref(''), repeats = ref(1), result = ref<any>(null), runId = ref(''), results = ref<Row[]>([]), comparisonIds = ref(''), selected = ref<any>(null), selectedOpen = ref(false), editorOpen = ref(false), editor = ref(''), editorTitle = ref(''), editorPath = ref(''), editorMethod = ref('POST'), estimate = ref<Row | null>(null), imported = ref('')
 let timer: ReturnType<typeof setTimeout> | undefined, disposed = false
+// 默认 HUMAN：避免用户仅仅打开页面/启动实验就产生 Judge 模型费用。
 const judgeMode = ref('HUMAN')
 async function act(fn: () => Promise<void>) { error.value = ''; busy.value = true; try { await fn() } catch (e) { error.value = String(e) } finally { busy.value = false } }
 async function load() { datasets.value = rows(await api('/admin/eval/datasets')); snapshots.value = rows(await api('/admin/eval/snapshots')); configs.value = rows(await api('/admin/configs')) }
@@ -11,12 +12,17 @@ function edit(title: string, path: string, body: unknown, method = 'POST') { edi
 async function save() { await act(async () => { result.value = await api(editorPath.value, editorMethod.value, JSON.parse(editor.value)); editorOpen.value = false; await load(); if (versionId.value) await loadCases() }) }
 async function loadCases() { cases.value = rows(await api(`/admin/eval/dataset-versions/${versionId.value}/cases`)) }
 async function freeze() { await act(async () => { result.value = await api(`/admin/eval/dataset-versions/${versionId.value}/freeze`, 'POST'); await loadCases() }) }
+// estimate 和 start 必须使用同一组参数；后端通过 estimateId 检测两步之间是否发生变化。
 function runBody() { return { datasetVersionId: versionId.value, snapshotId: snapshotId.value, configId: configId.value, repeats: repeats.value, judgeMode: judgeMode.value } }
 async function estimateRun() { await act(async () => { estimate.value = await api('/admin/eval/estimates', 'POST', runBody()); result.value = estimate.value }) }
+// 强制“先估算再启动”，避免绕过费用确认直接触发真实模型评估。
 async function start() { await act(async () => { if (!estimate.value) throw new Error('先估算费用，检查题集、快照和配置后再运行'); result.value = await api('/admin/eval/runs', 'POST', { ...runBody(), maxCostCny: 10, estimateId: estimate.value.estimateId || estimate.value.id }); runId.value = result.value.runId || result.value.id; estimate.value = null; poll() }) }
+// 同时刷新 run 汇总和逐题结果；终态后停止轮询。
 async function poll() { if (!runId.value || disposed) return; try { result.value = await api('/admin/eval/runs/' + runId.value); results.value = rows(await api(`/admin/eval/runs/${runId.value}/results`)); if (!terminal(result.value.status)) timer = setTimeout(poll, document.hidden ? 5000 : 1500) } catch (e) { error.value = String(e) } }
 async function importCases() { await act(async () => { const parsed = imported.value.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)); result.value = await api(`/admin/eval/dataset-versions/${versionId.value}/cases`, 'POST', { cases: parsed }); imported.value = ''; await loadCases() }) }
+// effectiveJudgment 已由后端按“人工最新值优先，否则自动值”合并，前端不重复实现规则。
 function effective(row: Row, dimension: string) { return row.effectiveJudgment?.[dimension] ?? '未评估' }
+// labels 默认空对象：只提交用户明确修改的维度，避免把其他人工标签误覆盖成 UNKNOWN。
 function review(row: Row) {
   edit(
     '人工复核（只提交明确修改的维度）',

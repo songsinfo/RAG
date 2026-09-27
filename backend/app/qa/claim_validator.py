@@ -1,3 +1,12 @@
+"""生成答案后的结构化 Claim 校验。
+
+这里不判断“语义上是否真的被证据支持”（strict Judge 才做），而是先保证：
+- 模型只能返回允许的结构；
+- 每个事实 claim 至少引用一个本次真实 evidenceId；
+- 引用字符区间合法且不越界；
+- NO_EVIDENCE / NEED_CLARIFICATION 不能夹带事实断言；
+- CONFLICT 必须引用真实存在的两个 claim。
+"""
 from typing import List, Dict, Any
 from app.errors import ApiException
 
@@ -11,9 +20,11 @@ INSTRUCTION = (
 
 
 def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str, Any]:
+    """把模型 JSON 转换成可展示答案；任何结构/引用异常都 fail-closed。"""
     if not isinstance(a, dict):
         raise ApiException(422, "INVALID_MODEL_EVIDENCE", "模型返回格式无效")
 
+    # 顶层拒绝额外字段，防止模型绕过协议塞入自由 answer/指令。
     allowed_keys = {"status", "claims", "gaps", "conflicts"}
     if not set(a.keys()).issubset(allowed_keys):
         raise ApiException(422, "INVALID_MODEL_EVIDENCE", "返回包含多余字段")
@@ -27,6 +38,7 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
     if not isinstance(claims, list) or len(claims) > 30:
         raise ApiException(422, "INVALID_MODEL_EVIDENCE", "claims 列表超长或无效")
 
+    # 声称已经回答/部分回答/冲突时必须至少有一个可追溯事实 claim。
     if status in {"COMPLETED", "PARTIAL", "CONFLICT"} and len(claims) == 0:
         raise ApiException(422, "INVALID_MODEL_EVIDENCE", "需要证据事实但未提供")
 
@@ -60,6 +72,7 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
             start = r.get("start")
             end = r.get("end")
 
+            # 只能引用本次检索/工具真实产生的 evidenceId，不能让模型自造来源。
             if eid not in evidence_map:
                 raise ApiException(422, "INVALID_MODEL_EVIDENCE", f"引用了不存在的证据编号: {eid}")
 
@@ -68,6 +81,7 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
                 raise ApiException(422, "INVALID_MODEL_EVIDENCE", "证据区间必须为整数")
             if not ev_text:
                 raise ApiException(422, "INVALID_MODEL_EVIDENCE", "引用的证据内容为空")
+            # 使用 Unicode code point 半开区间 [start,end)，与前端/后端切片约定一致。
             if start < 0 or end <= start or end > len(ev_text):
                 raise ApiException(
                     422,
@@ -93,6 +107,7 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
     if status == "CONFLICT" and len(conflicts) == 0:
         raise ApiException(422, "INVALID_MODEL_EVIDENCE", "冲突状态必须提供冲突对")
 
+    # 用户可见 answer 由已经校验过的 claims 重新渲染，不信任模型自行返回自由文本答案。
     if rendered_claims:
         answer_text = "\n\n".join(rendered_claims)
     elif status == "NEED_CLARIFICATION":

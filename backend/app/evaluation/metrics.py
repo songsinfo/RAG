@@ -1,13 +1,20 @@
+"""评估指标的纯计算实现。
+
+这里尽量保持“无数据库、无模型调用”的纯函数风格，方便用手算样例验证公式。
+特别注意所有分母为 0 的情况都返回 None，而不是 0；0 表示“测了但没命中”，
+None 表示“这个指标当前不适用/没有可计算样本”，两者在报告中语义完全不同。
+"""
 import math
 from typing import List, Set, Dict, Any, Optional, Union
 
 
 class EvaluationMetrics:
-    """Core IR and QA evaluation metrics algorithms."""
+    """检索、延迟分位数以及 Judge 校准相关指标。"""
 
     @staticmethod
     def ratio(numerator: int, denominator: int) -> Optional[float]:
         """Safely compute proportion. Returns None if denominator is 0."""
+        # 分母为 0 时不能返回 0.0，否则会把“没有样本”误解成“表现为 0”。
         return None if denominator == 0 else float(numerator) / denominator
 
     @staticmethod
@@ -27,6 +34,7 @@ class EvaluationMetrics:
         if k < 1:
             raise ValueError("k must be positive")
         result: Dict[str, Optional[float]] = {}
+        # 没有 Gold 事实组时，检索指标“不适用”，不能硬填 0。
         if not groups:
             result["hit"] = None
             result["recall"] = None
@@ -38,11 +46,13 @@ class EvaluationMetrics:
         if any(len(g) == 0 for g in groups):
             raise ValueError("Empty fact group")
 
+        # found 记录“已经命中的 Gold 事实组索引”，同一事实组被多个候选命中也只算一次。
         found: Set[int] = set()
         first_relevant_rank = 0
 
         for rank in range(min(k, len(ranked))):
             relevant = False
+            # 一个候选可能同时覆盖多个 Gold 事实组，因此这里不能命中一个后就 break。
             for g_idx, g_set in enumerate(groups):
                 if not g_set.isdisjoint(ranked[rank]):
                     found.add(g_idx)
@@ -70,6 +80,7 @@ class EvaluationMetrics:
         if any(g < 0 or g > 3 for g in ranked) or any(g < 0 or g > 3 for g in ideal):
             raise ValueError("Grade must be 0..3; unjudged is not zero")
 
+        # IDCG 使用同一组 relevance grade 的理想降序排列，作为归一化上界。
         sorted_ideal = sorted(ideal, reverse=True)
         denominator = EvaluationMetrics.dcg(sorted_ideal, k)
         if denominator == 0.0:
@@ -81,6 +92,7 @@ class EvaluationMetrics:
         """Compute Discounted Cumulative Gain (DCG@K)."""
         total = 0.0
         for i in range(min(k, len(grades))):
+            # 指数增益强调高相关文档；log2(i+2) 对越靠后的排名施加更大折损。
             total += (2.0 ** grades[i] - 1.0) / math.log2(i + 2)
         return total
 
@@ -92,6 +104,7 @@ class EvaluationMetrics:
         if not values:
             return None
         sorted_vals = sorted(values)
+        # 采用 nearest-rank，而不是插值分位数；小样本下 P95 往往就是最大值。
         idx = math.ceil(len(sorted_vals) * quantile) - 1
         return sorted_vals[idx]
 
@@ -101,6 +114,7 @@ class EvaluationMetrics:
         labels: List[str],
     ) -> Dict[str, Any]:
         """Return confusion matrix and raw agreement for comparable labeled pairs."""
+        # 行是人工标签（视为校准基准），列是自动 Judge 标签。
         matrix = {actual: {predicted: 0 for predicted in labels} for actual in labels}
         compared = 0
         agreed = 0
@@ -119,6 +133,7 @@ class EvaluationMetrics:
     @staticmethod
     def correctness_calibration(pairs: List[tuple[str, str]]) -> Dict[str, Any]:
         """Binary CORRECT calibration. UNDETERMINED pairs are excluded from FPR/FNR denominators."""
+        # UNDETERMINED 没有明确正负语义，不进入二分类 FPR/FNR 分母。
         judged = [
             (automatic, human)
             for automatic, human in pairs
@@ -127,9 +142,12 @@ class EvaluationMetrics:
         ]
         human_negative = sum(1 for _, human in judged if human != "CORRECT")
         human_positive = sum(1 for _, human in judged if human == "CORRECT")
+        # 正类定义为 CORRECT：
+        # FP = 人工认为不是 CORRECT，但自动 Judge 判成 CORRECT。
         false_positive = sum(
             1 for automatic, human in judged if automatic == "CORRECT" and human != "CORRECT"
         )
+        # FN = 人工认为是 CORRECT，但自动 Judge 没判成 CORRECT。
         false_negative = sum(
             1 for automatic, human in judged if automatic != "CORRECT" and human == "CORRECT"
         )
