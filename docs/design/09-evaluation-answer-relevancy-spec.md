@@ -1,6 +1,6 @@
 # 完整回答评估与 Answer Relevancy Spec
 
-状态：PROPOSED，2026-09-27。本文件定义下一轮实现，不代表能力已交付。
+状态：IMPLEMENTED_PENDING_VALIDATION，2026-09-27。EVAL-01 至 EVAL-05 已按本 Spec 落地；EVAL-06 的人工确认样本与真实模型校验仍需外部人工/预算条件。
 执行任务见 [tickets](../delivery/evaluation-answer-relevancy-tickets.md)。
 
 ## 1. 目标与范围
