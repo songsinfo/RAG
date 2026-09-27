@@ -18,7 +18,7 @@ from app.evaluation.runner import EvaluationRunner
 from app.evaluation.metrics import EvaluationMetrics
 from app.qa.model_gateway import ModelGateway
 from app.identity.deps import Actor
-from app.models import eval_result_table
+from app.models import eval_result_table, eval_run_table
 
 
 @pytest.mark.parametrize("fact,claim,label", [
@@ -262,4 +262,68 @@ def test_review_accepts_partial_dimension_labels():
         "reason": "human review",
     })
     assert saved["labels"] == {"answerRelevance": "OFF_TOPIC"}
+
+
+def test_planned_success_denominator_separates_execution_failure_from_semantic_unknown():
+    actor = Actor(tenant_id="tenant-demo-1", user_id="user-admin-1", admin=True)
+    now = datetime.now(timezone.utc)
+    run_id = "run-v2-denominator"
+    with get_db_connection() as conn:
+        conn.execute(eval_run_table.insert().values(
+            tenant_id=actor.tenant_id,
+            id=run_id,
+            dataset_version_id="dataset",
+            snapshot_id="snapshot",
+            config_id="config",
+            job_id="job",
+            status="COMPLETED",
+            manifest_json={
+                "mode": "RAG",
+                "rubricVersion": RUBRIC_VERSION,
+                "inputContractVersion": INPUT_CONTRACT_VERSION,
+                "evaluationScope": EVALUATION_SCOPE,
+                "relevancePolicy": "OBSERVE_ONLY",
+            },
+            metrics_json=None,
+            created_at=now,
+            updated_at=now,
+        ))
+        rows = [
+            ("result-v2-success", "COMPLETED", {"taskSuccess": True, "costCny": 0.1},
+             {"correctness": "CORRECT", "answerRelevance": {"verdict": "ON_TOPIC", "reason": "ok"}}),
+            ("result-v2-unknown", "COMPLETED", {"taskSuccess": None, "costCny": 0.1},
+             {"correctness": "UNDETERMINED", "answerRelevance": {"verdict": "UNCERTAIN", "reason": "unknown"}}),
+            # Error paths historically persisted taskSuccess=False. It must not enter the semantic denominator.
+            ("result-v2-failed", "FAILED", {"taskSuccess": False, "costCny": 0.1},
+             {"correctness": "WRONG"}),
+        ]
+        for i, (rid, status, metrics, judge) in enumerate(rows):
+            conn.execute(eval_result_table.insert().values(
+                tenant_id=actor.tenant_id,
+                id=rid,
+                eval_run_id=run_id,
+                dataset_version_id="dataset",
+                case_id=f"case-v2-{i}",
+                repeat_no=0,
+                status=status,
+                metrics_json=metrics,
+                judge_json=judge,
+                error_code="QA_EXECUTION_FAILED" if status == "FAILED" else None,
+                created_at=now,
+                updated_at=now,
+            ))
+        conn.commit()
+
+    metrics = EvaluationRunner.aggregate(actor, run_id)
+    assert metrics["planned"] == 3
+    assert metrics["successful"] == 1
+    assert metrics["judgedCases"] == 1
+    assert metrics["unknown"] == 2
+    assert metrics["executionFailed"] == 1
+    assert metrics["taskSuccessRate"] == 1.0
+    assert metrics["plannedTaskSuccessRate"] == 1.0 / 3.0
+    assert metrics["judgmentCoverage"] == 1.0 / 3.0
+    assert metrics["answerRelevance"]["counts"]["ON_TOPIC"] == 1
+    assert metrics["answerRelevance"]["counts"]["UNCERTAIN"] == 1
+    assert metrics["answerRelevance"]["unevaluated"] == 1
 
