@@ -994,7 +994,9 @@ class EvaluationRunner:
                 reviewed_correct += int(human_correctness == "CORRECT")
 
             if semantic_mode:
-                if isinstance(m.get("taskSuccess"), bool):
+                # Execution and semantic judgment are separate axes. A failed/pending execution
+                # cannot become a semantic WRONG merely because an error path stored taskSuccess=False.
+                if str(r.status) == "COMPLETED" and isinstance(m.get("taskSuccess"), bool):
                     judged += 1
                     success_count += int(m["taskSuccess"] is True)
                 else:
