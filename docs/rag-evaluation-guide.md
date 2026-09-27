@@ -68,11 +68,27 @@ flowchart TD
 | 问题 | 用户实际输入 | `question.text`，另支持存储 `turns` |
 | 用户身份 | 定义该用户能看什么资料 | `persona.loginName` |
 | 预期行为 | 应回答、部分回答、拒答还是指出冲突 | `expected.status` |
+| 拒答依据 | ABSTAIN 为什么不可答；v2 自动判 CORRECT 的必要 Gold | `expected.abstainReason` |
 | 必需事实 | 定义答案要覆盖哪些要点 | `expected.factPoints` |
 | 证据组 | 定义每个要点的可接受原文来源 | `expected.evidenceGroups` |
 | 标注状态 | 区分草稿、自动核查与人工审核 | `annotationStatus` |
 
 下面是符合本项目字段形状的教学示例。内容为虚构，ID 是占位符；导入前必须替换成实际入库记录，并保证引文能在指定版本中定位。
+
+对于 `expected.status="ABSTAIN"`，v2 还要求非空 `expected.abstainReason` 才允许自动 Judge 将其判为 CORRECT。只有状态没有拒答 Gold 原因时，即使模型认为拒答合理，综合结果也保持 `UNDETERMINED`。例如：
+
+```json
+{
+  "expected": {
+    "status": "ABSTAIN",
+    "abstainReason": "当前固定知识库快照不包含未来实时天气数据，无法可靠给出明日降雨量。",
+    "factPoints": [],
+    "evidenceGroups": []
+  }
+}
+```
+
+
 
 ```json
 {
@@ -254,7 +270,7 @@ LLM 评审应输入问题、必需事实、实际断言和引用证据，并输�
 
 终态不匹配判为 `WRONG`；匹配时只是具备继续评估语义的条件。HUMAN 模式保留 `UNDETERMINED`，等待人工复核。
 
-新运行在状态检查通过后调用 `judge-main`，使用 `full-answer-and-relevance-v2`。输入不再只有 claims/evidence，而是同时包含用户实际看到的 `answerText`、最后问题、真实多轮 `conversationContext`、题型 expectation、标准事实、claims 与 evidence。评分范围固定为 `FINAL_TURN_WITH_HISTORY`：历史用于理解指代和约束，只评分最后一轮回答。
+新运行在状态检查通过后调用 `judge-main`，使用 `full-answer-and-relevance-v2`。输入不再只有 claims/evidence，而是同时包含用户实际看到的 `answerText`、最后问题、真实多轮 `conversationContext`、题型 expectation、标准事实、claims 与 evidence。评分范围固定为 `FINAL_TURN_WITH_HISTORY`：历史用于理解指代和约束，只评分最后一轮回答。历史正文在重新发送给 Judge 前，会对每个实际参与历史的 QA run 再执行一次 `assert_run_sources_readable()`；任一历史来源撤权、快照文档或生效构建变化都会失败关闭，不会继续把旧正文发送给 Judge。
 
 v2 一次调用同时返回：
 
@@ -262,7 +278,7 @@ v2 一次调用同时返回：
 - 每个回答断言：`SUPPORTED / UNSUPPORTED / UNCERTAIN`。
 - `answerRelevance`：`ON_TOPIC / PARTLY_OFF_TOPIC / OFF_TOPIC / UNCERTAIN`。
 - `claimAlignment`：`ALIGNED / MISMATCH / UNCERTAIN`，用于检查正文与 claims 双向一致。
-- `expectationAssessment`：`SATISFIED / VIOLATED / UNCERTAIN`，按 ANSWER / PARTIAL / ABSTAIN / CONFLICT 的 Gold 规则判断。
+- `expectationAssessment`：`SATISFIED / VIOLATED / UNCERTAIN`，按 ANSWER / PARTIAL / ABSTAIN / CONFLICT 的 Gold 规则判断。ABSTAIN 自动判成功前必须有 `expected.abstainReason`；缺失时按 Gold 不充分处理。
 
 Relevancy 是 **OBSERVE_ONLY**：它独立展示，不会因为“切题”而抬高 correctness，也不会因为“偏题”直接覆盖已有事实证据。正文与 claims 不一致时，如果没有足够证据证明业务答案本身错误，综合结果保持 `UNDETERMINED` 并进入人工复核；已有明确矛盾、无依据断言或题型违反仍判 `WRONG`。拒答没有事实性 claims 时 `faithfulness=null`，不会伪造满分。
 
@@ -272,7 +288,7 @@ Relevancy 是 **OBSERVE_ONLY**：它独立展示，不会因为“切题”而�
 
 ### 4.4 人工复核怎么保留历史
 
-本项目通过 `eval_review` 追加复核记录，不覆盖原自动结果。汇总使用每道结果的最新复核标签。
+本项目通过 `eval_review` 追加复核记录，不覆盖原自动结果。Correctness、Answer Relevancy、Expectation Assessment 按维度独立采用最新人工标签；一次复核没有提交的维度继续沿用之前的人工值或自动值，不会被默认的 UNDETERMINED/UNCERTAIN 覆盖。当前前端复核编辑器从空 `labels: {}` 开始，只提交人工明确填写的维度。
 
 建议复核理由至少包括：哪一项事实错误或遗漏、依据哪段证据、为何修正标签。复核为 `PARTIAL` 或 `WRONG` 的题，在严格成功率中都不算成功；复核为 `UNDETERMINED` 仍属于未判定。
 
@@ -346,7 +362,7 @@ router.py
 
 题集冻结记录内容 hash。语料快照记录文档、版本、当前 build、来源 hash、构建配置、环境和权限 epoch。估算阶段会核对当前 build 和权限 epoch 是否变化。
 
-运行 manifest 包含题集版本、快照 ID、检索配置及载荷、分区、重复次数、模式、严格模式、裁判模式、规则版本、预算和环境等。
+运行 manifest 包含题集版本、快照 ID、检索配置及载荷、分区、重复次数、模式、严格模式、裁判模式、`rubricVersion`、`inputContractVersion`、`evaluationScope`、`relevancePolicy`、预算和环境等。
 
 这些记录有助于复现，但不意味着模型供应商版本、全部提示词、运行时依赖和执行范围已经完全锁定。完整实验仍应记录代码提交、部署版本和真实模型配置。
 
