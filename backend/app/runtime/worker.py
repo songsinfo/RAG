@@ -1,3 +1,14 @@
+"""持久化后台任务 Worker。
+
+通过数据库 job 表实现可恢复的异步任务执行，而不是依赖进程内线程：
+- claim 时加行锁并递增 lease_epoch；
+- heartbeat 延长租约；
+- lease 过期后其他 worker 可接管；
+- 失败只对“可重试错误”重新入队；
+- 所有写回都带当前 lease_epoch，防止旧 worker 晚到后覆盖新 worker 结果。
+
+这套 lease_epoch 机制是防止“僵尸 worker 写回”的关键。
+"""
 import logging
 import os
 import socket
@@ -17,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class DurableJobWorker:
+    """从 job 表竞争任务并执行 INGEST / PURGE / EVALUATE / QA_RUN。"""
     def __init__(
         self,
         worker_id: Optional[str] = None,
@@ -25,6 +37,7 @@ class DurableJobWorker:
         max_attempts: int = 3,
         kinds: Optional[set[str]] = None,
     ):
+        # 默认 worker_id 由主机名 + PID 组成，便于日志定位具体执行进程。
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
@@ -36,6 +49,7 @@ class DurableJobWorker:
         self._stop.set()
 
     def run_forever(self):
+        """持续轮询；当前没有任务时按 poll_seconds 休眠，避免空转占 CPU。"""
         logger.info("Durable worker started: %s", self.worker_id)
         while not self._stop.is_set():
             try:
@@ -47,10 +61,12 @@ class DurableJobWorker:
                 self._stop.wait(self.poll_seconds)
 
     def run_once(self) -> bool:
+        """竞争一个任务并完整执行一次；返回 False 表示当前无可执行任务。"""
         job = self._claim_one()
         if not job:
             return False
         heartbeat_stop = threading.Event()
+        # 业务执行可能持续数十秒/数分钟，因此独立 heartbeat 线程持续续租。
         heartbeat = threading.Thread(
             target=self._heartbeat_loop,
             args=(job, heartbeat_stop),
@@ -74,12 +90,15 @@ class DurableJobWorker:
             code = exc.code if isinstance(exc, ApiException) else "WORKER_EXECUTION_FAILED"
             self._fail(job, code)
         finally:
+            # 无论业务成功/失败都停止 heartbeat，避免任务结束后继续续租。
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
+        # 业务执行统一先落 FAILED，再由这里根据错误类型决定是否重新 QUEUED。
         self._requeue_failed_if_retryable(job)
         return True
 
     def _claim_one(self) -> Optional[Dict[str, Any]]:
+        """用 FOR UPDATE SKIP LOCKED 原子竞争一个可执行/租约过期任务。"""
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             row = conn.execute(
@@ -92,11 +111,13 @@ class DurableJobWorker:
                 ))
                 .order_by(job_table.c.created_at.asc())
                 .limit(1)
+                # 多 worker 并发时，已被其他事务锁住的任务直接跳过，减少互相等待。
                 .with_for_update(skip_locked=True)
             ).first()
             if not row:
                 return None
             job = dict(row._mapping)
+            # 每次重新 claim 都递增 epoch；旧 worker 后续写回若带旧 epoch 会被 WHERE 条件拒绝。
             next_epoch = int(job.get("lease_epoch") or 0) + 1
             conn.execute(
                 update(job_table)
@@ -110,6 +131,8 @@ class DurableJobWorker:
             return job
 
     def _heartbeat_loop(self, job: Dict[str, Any], stop: threading.Event):
+        """周期延长 lease；rowcount=0 代表租约已丢失，立即停止续租。"""
+        # 在租约 1/3 周期续租，给数据库短暂抖动留出余量。
         interval = max(5.0, self.lease_seconds / 3.0)
         while not stop.wait(interval):
             now = datetime.now(timezone.utc)
@@ -151,6 +174,7 @@ class DurableJobWorker:
         )
 
     def _run_evaluate(self, job: Dict[str, Any]):
+        """按任务创建者重新构建 Actor；用户失效后不能继续跑评估。"""
         from app.evaluation.runner import EvaluationRunner
         from app.identity.deps import Actor
 
@@ -165,6 +189,7 @@ class DurableJobWorker:
                     app_user_table.c.id == job["requested_by"],
                 ))
             ).first()
+        # 创建任务时有权限，不代表执行时仍有效；异步边界必须重新确认用户状态。
         if not user or str(user.status) != "ACTIVE":
             self._fail(job, "REQUESTER_NOT_ACTIVE")
             return
@@ -178,6 +203,7 @@ class DurableJobWorker:
         EvaluationRunner._execute_run(actor, str(job["target_id"]))
 
     def _run_qa(self, job: Dict[str, Any]):
+        """执行排队中的 QA run，并把 job_id / lease_epoch 传到底层用于防旧 worker 写回。"""
         from app.identity.deps import Actor
         from app.qa.service import QaService
 
@@ -210,6 +236,7 @@ class DurableJobWorker:
         )
 
     def _requeue_failed_if_retryable(self, job: Dict[str, Any]):
+        """仅对临时性失败进行指数退避后重新入队。"""
         with get_db_connection() as conn:
             row = conn.execute(
                 select(
@@ -224,12 +251,14 @@ class DurableJobWorker:
             ).first()
             if not row or str(row.status) != "FAILED":
                 return
+            # 达到最大尝试次数、确定性错误、或 lease 已换代时都禁止重试。
             if int(row.attempt or 0) >= self.max_attempts:
                 return
             if not is_retryable_job_code(str(row.error_code or "")):
                 return
             if int(row.lease_epoch or 0) != int(job.get("lease_epoch") or 0):
                 return
+            # 2,4,8... 秒指数退避，上限 60 秒，避免故障时持续热循环。
             delay_seconds = min(60, 2 ** max(0, int(row.attempt or 1) - 1))
             now = datetime.now(timezone.utc)
             conn.execute(
@@ -247,6 +276,7 @@ class DurableJobWorker:
                     updated_at=now,
                 )
             )
+            # job 重试时同步把 QA run 从 FAILED 拉回 QUEUED，保持两张表状态一致。
             if job.get("kind") == "QA_RUN":
                 conn.execute(
                     update(qa_run_table)
@@ -266,6 +296,7 @@ class DurableJobWorker:
             conn.commit()
 
     def _fail(self, job: Dict[str, Any], code: str):
+        """将当前 lease 对应的任务标记失败；旧 lease 无法修改新 worker 的任务。"""
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             conn.execute(
