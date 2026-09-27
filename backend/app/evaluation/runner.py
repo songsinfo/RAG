@@ -1204,9 +1204,48 @@ class EvaluationRunner:
                     ).order_by(eval_review_table.c.created_at.asc())
                 ).fetchall()
                 item["reviews"] = [
-                    {"id": str(x.id), "labels": obj(x.labels_json), "reason": x.reason_text}
+                    {
+                        "id": str(x.id),
+                        "labels": obj(x.labels_json),
+                        "reason": x.reason_text,
+                        "reviewerId": str(x.reviewer_id),
+                        "createdAt": x.created_at.isoformat() if x.created_at else None,
+                    }
                     for x in rev_rows
                 ]
+                latest_labels: Dict[str, str] = {}
+                latest_review_meta: Dict[str, Dict[str, Any]] = {}
+                for review in rev_rows:
+                    for key, value in obj(review.labels_json).items():
+                        if value is not None:
+                            latest_labels[str(key)] = str(value)
+                            latest_review_meta[str(key)] = {
+                                "reviewId": str(review.id),
+                                "reviewerId": str(review.reviewer_id),
+                                "createdAt": review.created_at.isoformat() if review.created_at else None,
+                                "reason": review.reason_text,
+                            }
+                judge = item["judge"]
+                auto_relevance = judge.get("answerRelevance") if isinstance(judge.get("answerRelevance"), dict) else None
+                automatic = {
+                    "correctness": judge.get("correctness"),
+                    "answerRelevance": auto_relevance.get("verdict") if auto_relevance else None,
+                    "expectationAssessment": (
+                        judge.get("expectationAssessment", {}).get("verdict")
+                        if isinstance(judge.get("expectationAssessment"), dict)
+                        else None
+                    ),
+                }
+                effective = dict(automatic)
+                for dimension in ("correctness", "answerRelevance", "expectationAssessment"):
+                    if dimension in latest_labels:
+                        effective[dimension] = latest_labels[dimension]
+                item["automaticJudgment"] = automatic
+                item["humanJudgment"] = {
+                    "labels": latest_labels,
+                    "byDimension": latest_review_meta,
+                }
+                item["effectiveJudgment"] = effective
                 res.append(item)
             return res
 
