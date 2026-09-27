@@ -1,3 +1,16 @@
+"""问答业务主服务。
+
+这是普通 RAG 和 Agent 共用的运行状态机：
+submit_run 只负责校验并把请求持久化为 QA_RUN job；
+execute_queued_run 由 DurableJobWorker 抢占后执行；
+_execute_run 再完成路由、历史构建、检索/Agent、生成、claim 校验、可选 strict Judge 与最终落库。
+
+核心原则：
+- 客户端不能覆盖服务端检索配置；
+- 每个异步写回都受 job lease 保护；
+- 历史/检索来源在真正送模型前重新鉴权；
+- 生成结果必须先做 claim/evidence 校验，再进入最终状态。
+"""
 import hashlib
 import json
 import logging
@@ -41,9 +54,11 @@ from app.retrieval.pipeline import RetrievalPipeline
 
 
 class QaService:
+    """会话、QA run 生命周期和 RAG/Agent 执行入口。"""
+
     @staticmethod
     def recover_unfinished_runs():
-        """Keep durable QA_RUN jobs recoverable; fail only legacy orphan runs."""
+        """启动恢复：有持久化 QA_RUN job 的继续可恢复；只有“孤儿 run”才标失败。"""
         try:
             now = datetime.now(timezone.utc)
             durable_job_exists = exists().where(
@@ -83,7 +98,7 @@ class QaService:
         conv_id = str(uuid.uuid4())
         seg_id = str(uuid.uuid4())
 
-        # Determine scope
+        # 会话 scope 只描述允许检索的 KB 范围，不等于最终权限；检索时仍会按 Actor ACL 再过滤。
         scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
         if not scope and "kbIds" in body:
             scope = {"mode": "SELECTED" if body.get("kbIds") else "ALL", "kbIds": body.get("kbIds", [])}
@@ -159,6 +174,7 @@ class QaService:
     @staticmethod
     def list_conversations(actor: Actor) -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
+            # 只取当前 turn 之前已经完成的最近 4 轮，不把失败/未完成回答混入历史。
             rows = conn.execute(
                 select(
                     conversation_table.c.id,
@@ -419,11 +435,16 @@ class QaService:
         *,
         evaluation_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """创建一个可恢复的 QA run，并同步创建对应 DurableJob。
+
+        这里不直接做检索/模型调用；生产环境真正执行由 Worker 完成。
+        """
         if not idempotency_key or len(idempotency_key) > 128:
             raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
         question = str(body.get("question", "")).strip()
         if not question or len(question) > 2000:
             raise ApiException(400, "INVALID_INPUT", "提问内容不能为空且最多2000字符")
+        # 输入 guard 在任何持久化/模型调用之前执行，避免明显危险内容进入后续链路。
         validate_input(question)
 
         mode = body.get("mode", "RAG")
@@ -431,6 +452,7 @@ class QaService:
             raise ApiException(400, "INVALID_INPUT", "问答模式无效")
 
         strict_mode = bool(body.get("strictMode") or body.get("strict", False))
+        # 客户端不能自由指定历史/隐藏检索配置；只有内部可信调用（评估）可 pin config。
         if body.get("configId") is not None:
             raise ApiException(400, "INVALID_INPUT", "客户端不能覆盖检索配置")
         now = datetime.now(timezone.utc)
@@ -450,7 +472,8 @@ class QaService:
             if not conv:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "会话不存在")
 
-            # 2. Check latest segment
+            # 2. 只允许向最新 segment 追加问题。
+            # segmentId 相当于上下文范围的乐观版本号，防止前端在 scope 已变化后继续用旧范围。
             seg = conn.execute(
                 select(context_segment_table)
                 .where(
@@ -470,6 +493,7 @@ class QaService:
             if requested_segment_id != str(seg.id):
                 raise ApiException(409, "VERSION_CONFLICT", "上下文范围已改变")
 
+            # 同一用户提交前加悲观锁，保证 turn_no 分配和“单活动 run”检查不会并发穿透。
             # Serialize submissions for the same user, matching the Java
             # pessimistic-lock contract before allocating turn numbers.
             user_row = conn.execute(
@@ -486,7 +510,7 @@ class QaService:
             if not user_row:
                 raise ApiException(403, "OPERATION_FORBIDDEN", "用户不可用")
 
-            # 3. Idempotency check
+            # 3. 幂等键按 user 作用域隔离；同 key + 不同请求体必须报冲突，不能悄悄复用旧结果。
             scoped_key = f"{actor.user_id}:{idempotency_key}"
             req_hash = hashlib.sha256(f"{conv_id}:{seg.id}:{question}:{mode}:{strict_mode}".encode("utf-8")).digest()
             if evaluation_scope is not None:
@@ -511,7 +535,7 @@ class QaService:
                         "pollAfterMs": 1000,
                     }
 
-            # 4. Preserve the Java contract: one active online run per user.
+            # 4. 同一用户只允许一个活动中的在线 run，避免会话 turn 顺序和预算并发失控。
             active_run = conn.execute(
                 select(qa_run_table.c.id).where(
                     and_(
@@ -524,7 +548,7 @@ class QaService:
             if active_run:
                 raise ApiException(409, "ACTIVE_RUN_EXISTS", "已有活动请求")
 
-            # 5. Insert new run
+            # 5. 先落 qa_run，再落 durable job；两者在同一事务提交，避免出现“有 run 无 job”。
             run_id = str(uuid.uuid4())
             max_turn = conn.execute(
                 select(qa_run_table.c.turn_no)
@@ -537,6 +561,8 @@ class QaService:
                 .order_by(qa_run_table.c.turn_no.desc())
             ).scalar() or 0
 
+            # 普通在线问答固定使用租户当前 active config；
+            # 只有内部评估调用才允许 pin 历史已发布 config，保证实验可复现。
             # Resolve retrieval config_id. Only trusted internal callers
             # (evaluation) may pin a historical published config.
             config_id = trusted_config_id
@@ -601,6 +627,7 @@ class QaService:
             )
             conn.commit()
 
+        # 测试环境同步执行只是为了单测方便；不能据此理解为生产请求在线程内跑完。
         if is_test_env():
             QaService.execute_queued_run(actor, run_id)
 
@@ -619,8 +646,10 @@ class QaService:
         job_id: Optional[str] = None,
         lease_epoch: Optional[int] = None,
     ):
+        """Worker 执行入口：先确认 lease，再把异常中断的 run 恢复成可重放状态。"""
         with qa_execution_scope(job_id, lease_epoch):
             with get_db_connection() as conn:
+                # 旧 worker 租约已失效时直接退出，绝不能继续写业务状态。
                 if not qa_lease_is_current(conn, actor.tenant_id, run_id):
                     return
 
@@ -647,6 +676,8 @@ class QaService:
                         ))
                     ).first()
                     checkpoint = dict(job_row.checkpoint or {}) if job_row and job_row.checkpoint else {}
+                    # Agent 有 LangGraph checkpoint 时可以从节点边界恢复；
+                    # 普通 RAG 没有可恢复中间态，只能清理来源/事件后重新执行。
                     has_agent_checkpoint = (
                         str(row.mode) == "AGENT"
                         and isinstance(checkpoint.get("langgraph"), dict)
@@ -699,6 +730,7 @@ class QaService:
 
     @staticmethod
     def _record_event(tenant_id: str, run_id: str, stage: str, payload: Optional[Dict[str, Any]] = None):
+        """追加运行事件；事件写失败不反向阻断主问答链路。"""
         try:
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
@@ -744,6 +776,7 @@ class QaService:
         strict_mode: bool,
         config_id: str,
     ):
+        """执行一次完整 QA 状态机。"""
         now = datetime.now(timezone.utc)
         try:
             with get_db_connection() as conn:
@@ -762,9 +795,10 @@ class QaService:
                 )
                 conn.commit()
 
+            # 历史不是直接从 conversation 文本拼出来，而是逐轮验证来源当前仍可读后再继承。
             history = QaService._rag_history(actor, seg_id, run_id)
 
-            # 1. Routing
+            # 1. 先做轻量问题路由：非知识库问题不进入检索/模型主链，节省费用。
             decision = classify_question(question)
             QaService._record_event(actor.tenant_id, run_id, "ROUTED", {"route": decision.route.value, "reason": decision.reason})
 
@@ -786,6 +820,7 @@ class QaService:
             if QaService._is_cancelled(actor.tenant_id, run_id):
                 return
 
+            # Agent 和普通 RAG 共用最终 claim 校验、strict Judge、输出 guard 和 finalize 契约。
             if mode == "AGENT":
                 from app.qa.agent import LangGraphAgent
                 agent_res = LangGraphAgent.run(
@@ -803,7 +838,7 @@ class QaService:
                 QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", agent_res)
                 return
 
-            # 2. Scope + ACL + config-driven retrieval pipeline
+            # 2. 普通 RAG：先解析 segment 的 KB scope，再交给 RetrievalPipeline 做 ACL + 多路检索。
             QaService._record_event(actor.tenant_id, run_id, "RETRIEVING", {"configId": config_id})
             with get_db_connection() as conn:
                 seg = conn.execute(
@@ -827,6 +862,7 @@ class QaService:
                     ).fetchall()
                     allowed_kb_ids = [str(k.kb_id) for k in kbs]
 
+            # 读取历史后、发起新检索前再确认 inherited sources 仍可读。
             assert_run_sources_readable(actor, run_id)
             retrieval = RetrievalPipeline.retrieve(
                 actor=actor,
@@ -849,6 +885,7 @@ class QaService:
                 },
             )
 
+            # 没有证据时直接返回 NO_EVIDENCE，禁止模型凭参数知识“猜答案”。
             if not hits:
                 no_ev_res = {
                     "status": "NO_EVIDENCE",
@@ -872,10 +909,13 @@ class QaService:
             if QaService._is_cancelled(actor.tenant_id, run_id):
                 return
 
-            # 3. Context assembly with exact retrieval provenance.
+            # 3. 把最终检索 hit 固化为 evidence，并把 document/build/sourceUnit 记录到 run_source。
+            # 之后 claim 引用只认这些已经固化的 evidenceId。
             evidence = []
             evidence_map = {}
             with get_db_connection() as conn:
+                # 这是第二次 ACL/build 检查：检索已经完成，但 evidence 尚未持久化/送模型。
+                # 解决检索与生成之间发生撤权的 TOCTOU 问题。
                 # A second ACL + active-build check happens immediately before
                 # evidence is persisted and sent to any external model.
                 assert_hits_still_readable(conn, actor, hits, allowed_kb_ids or None)
@@ -926,12 +966,13 @@ class QaService:
                     )
                 conn.commit()
 
-            # 4. Generation
+            # 4. 生成前做最后一次来源权限检查；撤权优先于已经完成的检索结果。
             # Final pre-send authorization check. Revocation wins even after retrieval.
             with get_db_connection() as conn:
                 assert_hits_still_readable(conn, actor, evidence, allowed_kb_ids or None)
             QaService._record_event(actor.tenant_id, run_id, "GENERATING")
             assert_run_sources_readable(actor, run_id)
+            # 历史 + 当前问题 + evidence 一起发送；文档内容在 system prompt 中被明确声明为不可信数据。
             messages = [
                 {"role": "system", "content": INSTRUCTION},
                 *history,
@@ -951,19 +992,20 @@ class QaService:
             except Exception as exc:
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "回答模型未返回合法 JSON") from exc
 
-            # 6. Claim Validation
+            # 5. 模型返回 JSON 后，claim 引用必须绑定到真实 evidenceId 和合法字符区间。
+            # Claim Validation
             QaService._record_event(actor.tenant_id, run_id, "VALIDATING")
             validated = validate_claims(parsed_answer, evidence_map)
             validated["evidence"] = evidence
             validated["warnings"] = retrieval["warnings"]
 
-            # 7. The same verification contract applies to RAG and Agent.
+            # 6. strictMode 时再用 judge-main 做语义支持判断；RAG/Agent 使用同一验证契约。
             QaService._verify_answer(actor, run_id, validated, strict_mode)
 
-            # 8. Output Guard
+            # 7. 最终展示文本再过输出 guard，防止敏感/异常内容直接返回。
             validate_output(validated.get("answer", ""))
 
-            # 9. Finalize
+            # 8. 最终状态与 DurableJob 一起 fenced 提交，防止旧 worker 晚到覆盖新执行者。
             QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", validated)
 
         except ApiException as e:
@@ -978,13 +1020,16 @@ class QaService:
 
     @staticmethod
     def _verify_answer(actor, run_id, result, strict_mode):
+        """strictMode 的第二层语义校验：逐 claim 判断其引用证据是否真正支持。"""
         assert_run_sources_readable(actor, run_id)
         result["verification"] = "STRUCTURAL_ONLY"
         claims = result.get("claims", [])
+        # 非 strict 只做结构校验；没有事实 claims 时也没有语义支持率可判。
         if not strict_mode or not claims:
             return
         if QaService._is_cancelled(actor.tenant_id, run_id):
             raise ApiException(409, "CANCELLED", "请求已取消")
+        # Judge 调用前后都检查来源，避免裁判过程中来源被撤权却仍把结果视为有效。
         raw = ModelGateway.chat(
             tenant_id=actor.tenant_id, run_id=run_id, purpose="JUDGE",
             model_alias="judge-main", max_tokens=2400,
@@ -1002,6 +1047,7 @@ class QaService:
 
     @staticmethod
     def _mark_waiting_approval(tenant_id: str, run_id: str) -> bool:
+        """Agent HITL 暂停：同时把 job/run 置 WAITING_APPROVAL，并释放 worker lease。"""
         now = datetime.now(timezone.utc)
         current = current_qa_execution()
         with get_db_connection() as conn:
@@ -1055,6 +1101,7 @@ class QaService:
 
     @staticmethod
     def resolve_tool_approval(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """写入一次性 LangGraph resume payload，并把运行重新排回 QUEUED。"""
         from app.qa.agent import LangGraphAgent
 
         tool_call_id = str(body.get("toolCallId") or "").strip()
@@ -1122,6 +1169,7 @@ class QaService:
         terminal_reason: str,
         result_json: Dict[str, Any],
     ) -> bool:
+        """成功终态提交；有 worker context 时必须携带当前 lease_epoch 做 fencing。"""
         now = datetime.now(timezone.utc)
         current = current_qa_execution()
         with get_db_connection() as conn:
@@ -1139,6 +1187,7 @@ class QaService:
                     ))
                     .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
                 )
+                # rowcount != 1 说明 lease 已被别人接管，本 worker 的“成功结果”必须丢弃。
                 if fenced.rowcount != 1:
                     conn.rollback()
                     return False
@@ -1174,6 +1223,7 @@ class QaService:
 
     @staticmethod
     def _fail_run(tenant_id: str, run_id: str, error_code: str) -> bool:
+        """失败终态提交，与成功路径使用同样的 lease fencing。"""
         now = datetime.now(timezone.utc)
         current = current_qa_execution()
         with get_db_connection() as conn:
@@ -1237,6 +1287,7 @@ class QaService:
 
     @staticmethod
     def _rag_history(actor: Actor, segment_id: str, current_run_id: str) -> List[Dict[str, str]]:
+        """构建最多 4 轮、4000 字符的授权历史，并登记 HISTORY 依赖。"""
         with get_db_connection() as conn:
             scope = run_document_scope(conn, actor, current_run_id)
             if not qa_lease_is_current(conn, actor.tenant_id, current_run_id):
@@ -1285,6 +1336,7 @@ class QaService:
                         )
                     ).distinct()
                 ).fetchall()
+                # 任一历史来源已经撤权，则整轮历史跳过，不能只保留“看起来无敏感内容”的回答文本。
                 if any(not can_read_document(conn, actor, str(src.document_id)) for src in source_rows):
                     continue
                 if scope is not None:
@@ -1296,6 +1348,7 @@ class QaService:
                 result = row.result_json if isinstance(row.result_json, dict) else {}
                 answer = str(result.get("answer") or "").strip()
                 next_chars = len(question) + len(answer)
+                # 历史预算按最近轮次优先；超过总字符预算后停止继续向前扩展。
                 if total_chars + next_chars > 4000:
                     break
                 total_chars += next_chars
@@ -1309,6 +1362,7 @@ class QaService:
                         )
                     )
                 ).first()
+                # 显式记录 run_dependency，后续可追踪“当前答案依赖了哪些历史回答”。
                 if not dep_exists:
                     conn.execute(
                         run_dependency_table.insert().values(
@@ -1333,6 +1387,8 @@ class QaService:
                             )
                         )
                     ).first()
+                    # 将历史使用过的 document/build 继承到当前 run_source，purpose=HISTORY。
+                    # 后续每次模型调用可以统一重新鉴权这些来源。
                     if not inherited:
                         conn.execute(
                             run_source_table.insert().values(
