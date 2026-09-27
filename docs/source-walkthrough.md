@@ -506,11 +506,14 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
       ├─ 检索模式 → RetrievalPipeline.retrieve()
       └─ RAG/AGENT → QaService.create_conversation / submit_run / get_run
   → _compute_retrieval_metrics()
-  → 状态检查 + 可选 judge_answer()
-  → 保存单题结果 → aggregate() → export_run()/compare()
+  → 状态检查
+  → LLM 模式：重校验最终及历史 QA run 来源权限
+  → judge_answer() 使用完整 answerText + 实际 conversationContext
+  → 保存 correctness / Answer Relevancy / claimAlignment / expectationAssessment
+  → aggregate() 合并按维度人工复核 → export_run()/compare()
 ```
 
-对本例，金标准应有“幂等键、重试次数上限、补偿日志”三个事实组。只找到一组也可能 Hit@5=1；模型只答出一项不应算完整成功。`judgeMode=HUMAN` 默认保留待复核结果，LLM 模式才进行语义裁判。
+对本例，金标准应有“幂等键、重试次数上限、补偿日志”三个事实组。只找到一组也可能 Hit@5=1；模型只答出一项不应算完整成功。`judgeMode=HUMAN` 默认保留待复核结果，LLM 模式才进行语义裁判。v2 Judge 评分的是最后一轮完整用户可见回答，历史只用于理解指代；历史回答在重新送 Judge 前会逐个 QA run 再检查来源权限。对于 `ABSTAIN`，只有状态还不够，自动判 CORRECT 还要求 Gold 中存在明确的 `expected.abstainReason`。
 
 指标、API 示例、成功率分母、快照范围、多轮执行限制和门禁详见 [RAG 评估完整说明](rag-evaluation-guide.md)。这里优先理解它怎样调用已读过的问答服务，而不是另外实现一套独立 RAG。
 
