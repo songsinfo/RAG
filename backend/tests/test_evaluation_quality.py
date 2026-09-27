@@ -6,8 +6,17 @@ import importlib.util
 from pathlib import Path
 
 from app.db import get_db_connection
-from app.evaluation.judge import parse_verdicts
+from app.evaluation.judge import (
+    parse_verdicts,
+    parse_full_answer_verdicts,
+    judge_answer,
+    RUBRIC_VERSION,
+    INPUT_CONTRACT_VERSION,
+    EVALUATION_SCOPE,
+)
 from app.evaluation.runner import EvaluationRunner
+from app.evaluation.metrics import EvaluationMetrics
+from app.qa.model_gateway import ModelGateway
 from app.identity.deps import Actor
 from app.models import eval_result_table
 
@@ -94,3 +103,163 @@ def test_release_gate_rejects_unknowns_and_retrieval_only():
     report["metrics"]["totalCostCny"] = 1.5
     report["manifest"]["mode"] = "RETRIEVAL_ONLY"
     assert gate.failures(report, 0.9, 2)
+
+
+def _v2_payload(fact="COVERED", claim="SUPPORTED", relevance="ON_TOPIC",
+                alignment="ALIGNED", expectation="SATISFIED"):
+    return json.dumps({
+        "facts": [{"index": 0, "verdict": fact}],
+        "claims": [{"index": 0, "verdict": claim}],
+        "answerRelevance": {"verdict": relevance, "reason": "relevance reason"},
+        "claimAlignment": {"verdict": alignment, "reason": "alignment reason"},
+        "expectationAssessment": {"verdict": expectation, "reason": "expectation reason"},
+        "reason": "overall",
+    })
+
+
+def test_v2_relevance_is_observe_only_for_correctness():
+    result = parse_full_answer_verdicts(
+        _v2_payload(relevance="OFF_TOPIC"),
+        ["gold"],
+        [{"text": "claim"}],
+        "ANSWER",
+    )
+    assert result["correctness"] == "CORRECT"
+    assert result["answerRelevance"]["verdict"] == "OFF_TOPIC"
+    assert result["rubricVersion"] == RUBRIC_VERSION
+
+
+def test_v2_claim_alignment_mismatch_fails_closed_without_inventing_wrongness():
+    result = parse_full_answer_verdicts(
+        _v2_payload(alignment="MISMATCH"),
+        ["gold"],
+        [{"text": "claim"}],
+        "ANSWER",
+    )
+    assert result["correctness"] == "UNDETERMINED"
+    assert result["claimAlignment"]["verdict"] == "MISMATCH"
+
+
+def test_v2_explicit_failure_wins_over_alignment_uncertainty():
+    result = parse_full_answer_verdicts(
+        _v2_payload(fact="CONTRADICTED", alignment="MISMATCH"),
+        ["gold"],
+        [{"text": "claim"}],
+        "ANSWER",
+    )
+    assert result["correctness"] == "WRONG"
+
+
+def test_v2_abstain_can_be_correct_without_claims_or_faithfulness():
+    raw = json.dumps({
+        "facts": [],
+        "claims": [],
+        "answerRelevance": {"verdict": "ON_TOPIC", "reason": "explains refusal"},
+        "claimAlignment": {"verdict": "ALIGNED", "reason": "no factual claims"},
+        "expectationAssessment": {"verdict": "SATISFIED", "reason": "matches gold abstain reason"},
+        "reason": "valid abstention",
+    })
+    result = parse_full_answer_verdicts(raw, [], [], "ABSTAIN")
+    assert result["correctness"] == "CORRECT"
+    assert result["faithfulness"] is None
+
+
+def test_full_answer_judge_sends_real_answer_history_and_contract(monkeypatch):
+    captured = {}
+
+    def fake_chat(**kwargs):
+        captured.update(kwargs)
+        return _v2_payload()
+
+    monkeypatch.setattr(ModelGateway, "chat", fake_chat)
+    result = judge_answer(
+        "tenant",
+        "run",
+        "follow-up question",
+        {"status": "ANSWER", "factPoints": ["gold"]},
+        {
+            "answer": "the exact user-visible answer",
+            "claims": [{"text": "claim"}],
+            "evidence": [{"evidenceId": "E1", "text": "source"}],
+        },
+        answer_text="the exact user-visible answer",
+        answer_present=True,
+        conversation_context=[
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": "follow-up question"},
+        ],
+    )
+    payload = json.loads(captured["messages"][1]["content"])
+    assert payload["answerText"] == "the exact user-visible answer"
+    assert payload["conversationContext"][1]["content"] == "earlier answer"
+    assert payload["inputContractVersion"] == INPUT_CONTRACT_VERSION
+    assert payload["evaluationScope"] == EVALUATION_SCOPE
+    assert result["correctness"] == "CORRECT"
+
+
+def test_missing_and_blank_answers_are_distinct_and_do_not_call_model(monkeypatch):
+    def should_not_call(**kwargs):
+        raise AssertionError("model must not be called")
+
+    monkeypatch.setattr(ModelGateway, "chat", should_not_call)
+    missing = judge_answer(
+        "tenant", "run", "q",
+        {"status": "ANSWER", "factPoints": ["gold"]},
+        {"claims": [], "evidence": []},
+        answer_present=False,
+    )
+    blank = judge_answer(
+        "tenant", "run", "q",
+        {"status": "ANSWER", "factPoints": ["gold"]},
+        {"answer": "   ", "claims": [], "evidence": []},
+        answer_text="   ",
+        answer_present=True,
+    )
+    assert missing["correctness"] == "UNDETERMINED"
+    assert missing["inputFailureReason"] == "MISSING_ANSWER_TEXT"
+    assert blank["correctness"] == "WRONG"
+    assert blank["inputFailureReason"] == "BLANK_ANSWER"
+
+
+def test_calibration_formulas_exclude_undetermined_pairs():
+    correctness = EvaluationMetrics.correctness_calibration([
+        ("CORRECT", "WRONG"),
+        ("WRONG", "CORRECT"),
+        ("CORRECT", "CORRECT"),
+        ("UNDETERMINED", "CORRECT"),
+    ])
+    assert correctness["compared"] == 3
+    assert correctness["falsePositiveRate"] == 1.0
+    assert correctness["falseNegativeRate"] == 0.5
+    assert correctness["agreementRate"] == 1.0 / 3.0
+
+    relevance = EvaluationMetrics.categorical_comparison(
+        [("ON_TOPIC", "ON_TOPIC"), ("OFF_TOPIC", "PARTLY_OFF_TOPIC")],
+        ["ON_TOPIC", "PARTLY_OFF_TOPIC", "OFF_TOPIC", "UNCERTAIN"],
+    )
+    assert relevance["compared"] == 2
+    assert relevance["agreementRate"] == 0.5
+    assert relevance["confusionMatrix"]["PARTLY_OFF_TOPIC"]["OFF_TOPIC"] == 1
+
+
+def test_review_accepts_partial_dimension_labels():
+    actor = Actor(tenant_id="tenant-demo-1", user_id="user-admin-1", admin=True)
+    now = datetime.now(timezone.utc)
+    result_id = "result-relevance-review"
+    with get_db_connection() as conn:
+        conn.execute(eval_result_table.insert().values(
+            tenant_id=actor.tenant_id, id=result_id, eval_run_id="run-relevance-review",
+            dataset_version_id="dataset", case_id="case", repeat_no=0,
+            status="COMPLETED", metrics_json={"taskSuccess": None, "costCny": None},
+            judge_json={"correctness": "UNDETERMINED",
+                        "answerRelevance": {"verdict": "ON_TOPIC", "reason": "auto"}},
+            created_at=now, updated_at=now,
+        ))
+        conn.commit()
+    saved = EvaluationRunner.review(actor, result_id, {
+        "labels": {"answerRelevance": "OFF_TOPIC"},
+        "reason": "human review",
+    })
+    assert saved["labels"] == {"answerRelevance": "OFF_TOPIC"}
+
