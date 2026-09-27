@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 
 from app.db import get_db_connection
+from app.errors import ApiException
 from app.evaluation.judge import (
     parse_verdicts,
     parse_full_answer_verdicts,
@@ -359,4 +360,3 @@ def test_planned_success_denominator_separates_execution_failure_from_semantic_u
     assert metrics["answerRelevance"]["counts"]["ON_TOPIC"] == 1
     assert metrics["answerRelevance"]["counts"]["UNCERTAIN"] == 1
     assert metrics["answerRelevance"]["unevaluated"] == 1
-
