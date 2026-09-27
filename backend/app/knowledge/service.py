@@ -1,3 +1,16 @@
+"""知识库文档生命周期与入库主服务。
+
+核心链路：
+upload_document → 保存原始 Artifact → 创建 immutable Version/Build → Durable INGEST job
+→ Docling 解析/HybridChunker → SourceUnit/Chunk/Span → Representation/Embedding
+→ Milvus 索引 → 原子发布 active_build_id。
+
+删除链路采用 trash → purge 两阶段：
+- trash 只让文档立即不可读，并推进 security/lifecycle epoch；
+- purge 才真正删除向量、文件、数据库正文，并取消所有依赖该来源的 QA/Agent 状态。
+
+所有长任务都通过 lease_epoch 防止旧 worker 晚到写回。
+"""
 import hashlib
 import json
 import mimetypes
@@ -50,6 +63,8 @@ from app.models import (
 
 
 class KnowledgeService:
+    """知识库 ACL、上传入库、索引构建、恢复、删除与清理服务。"""
+
     @staticmethod
     def _propagate_deletion_to_peers(
         origin_system: str,
@@ -738,6 +753,7 @@ class KnowledgeService:
         mode: str,
         readers: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """接收上传并创建可恢复的 INGEST job；真正解析/索引由 Worker 执行。"""
         if not actor.admin:
             raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
 
@@ -757,6 +773,7 @@ class KnowledgeService:
             if not doc:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
+            # 前端必须带自己读到的 row_version；状态已被别人修改时拒绝覆盖。
             if int(doc.row_version) != expected_version:
                 raise ApiException(409, "CONCURRENT_CONFLICT", "文档版本冲突")
 
@@ -922,6 +939,7 @@ class KnowledgeService:
             raise ApiException(400, "INVALID_INPUT", "需要最多80字符的 Idempotency-Key")
 
         now = datetime.now(timezone.utc)
+        # 幂等键按用户隔离；请求哈希还包含文件 SHA 和 build_config，防止同 key 偷换内容。
         scoped_idempotency = f"{actor.user_id}:{idempotency_key}"
         source_sha256 = hashlib.sha256(file_bytes).hexdigest()
         req_hash = hashlib.sha256(
@@ -929,7 +947,7 @@ class KnowledgeService:
         ).digest()
 
         with get_db_connection() as conn:
-            # 1. Check idempotency
+            # 1. 先查幂等，重复上传同一请求直接返回已有 job，不重复保存文件/建索引。
             existing_job = conn.execute(
                 select(job_table).where(
                     and_(
@@ -963,7 +981,7 @@ class KnowledgeService:
             if not kb:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "知识库不存在")
 
-            # 3. Create or find Document
+            # 3. 新文档先创建逻辑 Document；真正可检索版本要等 build READY 后才切 active_build_id。
             doc_id = document_id or str(uuid.uuid4())
             if not document_id:
                 conn.execute(
@@ -982,7 +1000,7 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
-                # Creator gets default grant
+                # 新文档默认 RESTRICT，并只给创建者显式 grant；管理员身份本身不等于正文读取权。
                 conn.execute(
                     document_grant_table.insert().values(
                         tenant_id=actor.tenant_id,
@@ -1007,7 +1025,7 @@ class KnowledgeService:
                 if not existing_doc or str(existing_doc.status) != "LIVE" or str(existing_doc.kb_id) != kb_id:
                     raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
-            # 4. Save Artifact
+            # 4. 原始文件先作为不可变 Artifact 保存；后续失败重试都从这份源文件确定性重建。
             art_id = str(uuid.uuid4())
             storage_key, sha256_bytes, size_bytes = save_artifact(
                 actor.tenant_id, filename, file_bytes, document_id=doc_id, artifact_id=art_id
@@ -1027,7 +1045,7 @@ class KnowledgeService:
                 )
             )
 
-            # 5. Create Version
+            # 5. 每次上传产生新的 immutable document version，不原地覆盖旧版本。
             version_id = str(uuid.uuid4())
             max_v = conn.execute(
                 select(document_version_table.c.version_no)
@@ -1152,6 +1170,7 @@ class KnowledgeService:
 
     @staticmethod
     def _lease_filter(tenant_id: str, job_id: str, lease_epoch: Optional[int]):
+        """构造异步任务的 fencing 条件；有 lease_epoch 时只允许当前 RUNNING worker 写回。"""
         clauses = [
             job_table.c.tenant_id == tenant_id,
             job_table.c.id == job_id,
@@ -1176,6 +1195,7 @@ class KnowledgeService:
 
     @staticmethod
     def _reset_unpublished_build(conn, tenant_id: str, doc_id: str, build_id: str):
+        """清理一次崩溃重试留下的派生数据；已 READY/已发布 build 绝不能被重置。"""
         build = conn.execute(
             select(index_build_table.c.status).where(
                 and_(
@@ -1198,6 +1218,8 @@ class KnowledgeService:
         if str(build.status) == "READY" or (doc and str(doc.active_build_id or "") == build_id):
             raise ApiException(409, "BUILD_ALREADY_PUBLISHED", "已发布构建不能作为恢复残留重建")
 
+        # 这里能安全重建，是因为所有这些表都是由 immutable source artifact 派生出来的；
+        # active/READY build 属于已发布事实，禁止使用这条恢复路径清理。
         # Safe restart point: unpublished build data is derived from the immutable
         # source artifact, so remove partial rows and deterministically rebuild it.
         conn.execute(delete(representation_table).where(and_(
@@ -1228,8 +1250,11 @@ class KnowledgeService:
         filename: str,
         lease_epoch: Optional[int] = None,
     ):
+        """完整执行一次入库状态机：解析 → 持久化 → 表征/向量 → 索引 → 发布。"""
         now = datetime.now(timezone.utc)
         try:
+            # Docling 是昂贵外部调用，调用前先检查 lease，避免旧 worker 浪费资源。
+            # build_config 从 build 绑定的 config revision 读取，重试时参数保持不变。
             # Reject stale workers before the potentially expensive Docling call
             # and load the immutable build configuration used for chunking.
             with get_db_connection() as conn:
@@ -1259,13 +1284,14 @@ class KnowledgeService:
                 )
                 conn.commit()
 
-            # Every input format is parsed by Docling and split by HybridChunker.
+            # 所有格式统一走 Docling + HybridChunker；这里不再按文件类型走多套 parser/chunker。
             raw_units, chunks, spans = parse_and_chunk_document(
                 file_bytes,
                 filename,
                 build_config,
             )
 
+            # Docling warning 不直接吞掉；先收集，必要时把 build/job 停在 NEEDS_REVIEW 等人工确认。
             quality_warnings: List[Dict[str, Any]] = []
             for unit in raw_units:
                 location = unit.get("location") if isinstance(unit, dict) else {}
@@ -1288,6 +1314,7 @@ class KnowledgeService:
                     )
                 ).first()
                 checkpoint = dict(checkpoint_row.checkpoint or {}) if checkpoint_row else {}
+                # 首次发现质量 warning 时停止发布；只有显式 warningsAccepted 后重跑才继续。
                 if quality_warnings and not checkpoint.get("warningsAccepted"):
                     checkpoint["qualityWarnings"] = quality_warnings[:100]
                     conn.execute(
@@ -1322,12 +1349,13 @@ class KnowledgeService:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
 
+                # 崩溃恢复采用“删除未发布派生数据后从原 Artifact 重建”，保证结果确定且幂等。
                 # Recovery is idempotent: partial rows from a crashed attempt are
                 # removed only for an unpublished build, then rebuilt from artifact.
                 KnowledgeService._reset_unpublished_build(conn, tenant_id, doc_id, build_id)
                 conn.commit()
 
-            # Remove partial vectors from a previous crashed attempt as well.
+            # MySQL 派生行和 Milvus 向量必须一起清理，否则重试会留下重复/脏索引。
             from app.retrieval.milvus_service import MilvusHybridService
             MilvusHybridService.delete_by_build(
                 tenant_id,
@@ -1358,6 +1386,7 @@ class KnowledgeService:
                         "created_at": now,
                         "updated_at": now,
                     })
+                # 批量写入控制单次 SQL 体积，避免大文档一次 insert 过大。
                 for start in range(0, len(unit_rows), 500):
                     conn.execute(source_unit_table.insert(), unit_rows[start:start + 500])
                 conn.execute(
@@ -1414,12 +1443,14 @@ class KnowledgeService:
                 )
                 conn.commit()
 
+            # 只有 CHILD 参与检索表示；PARENT 仅用于命中后的上下文扩展。
             child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
             if child_chunks:
                 representation_map: Dict[str, List[Dict[str, Any]]] = {}
                 representation_items: List[Dict[str, Any]] = []
                 for chunk in child_chunks:
                     chunk_id = str(chunk["id"])
+                    # ORIGINAL 永远存在；SUMMARY / QUESTION 是可选派生表示，只用于提高召回。
                     reps = [
                         {
                             "kind": "ORIGINAL",
@@ -1428,6 +1459,7 @@ class KnowledgeService:
                         }
                     ]
 
+                    # 派生表征不能添加新事实，因此 prompt 强制“只概括/只基于资料”。
                     if bool(build_config.get("summary", False)):
                         raw_summary = ModelGateway.chat(
                             tenant_id=tenant_id,
@@ -1496,6 +1528,7 @@ class KnowledgeService:
                     for rep in reps:
                         representation_items.append({"chunk_id": chunk_id, **rep})
 
+                # 所有 representation 一次批量 embedding，向量维度固定为 1024 并写入 build 能力。
                 vectors = get_embeddings(
                     [item["text_content"] for item in representation_items],
                     dim=1024,
@@ -1941,6 +1974,7 @@ class KnowledgeService:
 
     @staticmethod
     def document_lifecycle(actor: Actor, doc_id: str, action: str, expected_version: int) -> Dict[str, Any]:
+        """文档 trash / restore / purge 状态机，使用 row_version 做乐观并发控制。"""
         if not actor.admin:
             raise ApiException(403, "OPERATION_FORBIDDEN", "需要维护权限")
         if action not in ("trash", "restore", "purge"):
@@ -1970,10 +2004,12 @@ class KnowledgeService:
             if action == "purge" and state != "TRASHED":
                 raise ApiException(409, "INVALID_STATE", "文档状态不允许此操作")
 
+            # lifecycle_epoch 每次生命周期变化递增，使长任务/缓存能识别“同 ID 但时代已变化”。
             new_fence = int(doc.lifecycle_epoch or 0) + 1
             new_row_version = expected_version + 1
 
             if action == "trash":
+                # TRASH 先让文档从权限/检索层不可见，并提升 tenant security_epoch 使旧快照失效。
                 conn.execute(
                     update(document_table)
                     .where(
@@ -2014,6 +2050,7 @@ class KnowledgeService:
                 return {"documentId": doc_id, "status": "TRASHED"}
 
             elif action == "restore":
+                # restore 不重新解析源文件；只在原 active build 和 Artifact 仍完整时恢复索引可用性。
                 if not doc.active_build_id:
                     raise ApiException(409, "RESTORE_NOT_READY", "文档没有已发布构建")
 
@@ -2256,6 +2293,7 @@ class KnowledgeService:
         del_rec_id: str,
         lease_epoch: Optional[int] = None,
     ):
+        """不可逆物理清理：删除向量/文件/正文，并使所有依赖该来源的运行失效。"""
         now = datetime.now(timezone.utc)
         if lease_epoch is not None:
             with get_db_connection() as lease_conn:
@@ -2263,11 +2301,11 @@ class KnowledgeService:
                     return
         empty_hash = hashlib.sha256(b"").digest()
 
-        # 1. Delete from Milvus
+        # 1. 先从 Milvus 删除，避免数据库已清空但旧向量仍被检索到。
         from app.retrieval.milvus_service import MilvusHybridService
         MilvusHybridService.delete_by_document(tenant_id, doc_id)
 
-        # 2. Delete private artifact files & scrub MySQL
+        # 2. 删除私有 Artifact 文件，再清理 MySQL 中可恢复正文。
         with get_db_connection() as conn:
             if lease_epoch is not None and not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                 return
@@ -2282,7 +2320,7 @@ class KnowledgeService:
             for art in artifacts:
                 delete_artifact(str(art.storage_key))
 
-            # 3. Scrub MySQL content
+            # 3. 查出所有依赖该文档的历史 QA run，并清除问题/答案等可泄漏内容。
             affected_runs_stmt = (
                 select(
                     qa_run_table.c.id,
@@ -2326,6 +2364,8 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
+                # PURGE 是隐私硬边界：递增 QA job lease_epoch，立即废掉仍在运行的旧 worker；
+                # 同时删除 LangGraph checkpoint/resume，防止已清理正文从 checkpoint 中复活。
                 # Purge is a privacy boundary: invalidate the QA execution lease
                 # and atomically destroy LangGraph history/pending writes/resume data.
                 conn.execute(
