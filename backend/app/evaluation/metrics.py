@@ -94,3 +94,53 @@ class EvaluationMetrics:
         sorted_vals = sorted(values)
         idx = math.ceil(len(sorted_vals) * quantile) - 1
         return sorted_vals[idx]
+
+    @staticmethod
+    def categorical_comparison(
+        pairs: List[tuple[str, str]],
+        labels: List[str],
+    ) -> Dict[str, Any]:
+        """Return confusion matrix and raw agreement for comparable labeled pairs."""
+        matrix = {actual: {predicted: 0 for predicted in labels} for actual in labels}
+        compared = 0
+        agreed = 0
+        for automatic, human in pairs:
+            if automatic not in labels or human not in labels:
+                continue
+            matrix[human][automatic] += 1
+            compared += 1
+            agreed += int(automatic == human)
+        return {
+            "compared": compared,
+            "agreementRate": EvaluationMetrics.ratio(agreed, compared),
+            "confusionMatrix": matrix,
+        }
+
+    @staticmethod
+    def correctness_calibration(pairs: List[tuple[str, str]]) -> Dict[str, Any]:
+        """Binary CORRECT calibration. UNDETERMINED pairs are excluded from FPR/FNR denominators."""
+        judged = [
+            (automatic, human)
+            for automatic, human in pairs
+            if automatic in {"CORRECT", "PARTIAL", "WRONG"}
+            and human in {"CORRECT", "PARTIAL", "WRONG"}
+        ]
+        human_negative = sum(1 for _, human in judged if human != "CORRECT")
+        human_positive = sum(1 for _, human in judged if human == "CORRECT")
+        false_positive = sum(
+            1 for automatic, human in judged if automatic == "CORRECT" and human != "CORRECT"
+        )
+        false_negative = sum(
+            1 for automatic, human in judged if automatic != "CORRECT" and human == "CORRECT"
+        )
+        base = EvaluationMetrics.categorical_comparison(
+            judged, ["CORRECT", "PARTIAL", "WRONG"]
+        )
+        base.update({
+            "falsePositiveRate": EvaluationMetrics.ratio(false_positive, human_negative),
+            "falseNegativeRate": EvaluationMetrics.ratio(false_negative, human_positive),
+            "falsePositives": false_positive,
+            "falseNegatives": false_negative,
+        })
+        return base
+

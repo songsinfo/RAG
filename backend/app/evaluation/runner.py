@@ -40,7 +40,14 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
-from app.evaluation.judge import judge_answer, RUBRIC_VERSION
+from app.evaluation.judge import (
+    judge_answer,
+    RUBRIC_VERSION,
+    LEGACY_RUBRIC_VERSION,
+    INPUT_CONTRACT_VERSION,
+    EVALUATION_SCOPE,
+    RELEVANCE_POLICY,
+)
 from app.model_budget import BudgetService
 
 
@@ -184,8 +191,10 @@ class EvaluationRunner:
                     BudgetService.pricing(actor.tenant_id, alias)
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
-                input_tokens = total_turns * 30000 + total_questions * 30000
-                output_tokens = total_turns * 6000 + total_questions * 1800
+                # v2 Judge sees the complete final answer plus actual conversation history.
+                # Keep this conservative: answer/retrieval work plus one larger semantic Judge payload.
+                input_tokens = total_turns * 30000 + total_questions * 42000
+                output_tokens = total_turns * 6000 + total_questions * 2800
                 ceiling = round((input_tokens * 0.00002 + output_tokens * 0.00006), 4)
                 cost_status = "ESTIMATE_NOT_BILL"
 
@@ -198,6 +207,9 @@ class EvaluationRunner:
                 "mode": mode,
                 "judgeMode": judge_mode,
                 "rubricVersion": RUBRIC_VERSION,
+                "inputContractVersion": INPUT_CONTRACT_VERSION,
+                "evaluationScope": EVALUATION_SCOPE,
+                "relevancePolicy": RELEVANCE_POLICY,
                 "strict": bool(body.get("strict", False)),
                 "plannedQuestions": len(cases_rows) * repeats,
                 "plannedTurns": turns * repeats,
@@ -526,7 +538,26 @@ class EvaluationRunner:
                         try:
                             from app.qa.context import assert_run_sources_readable
                             assert_run_sources_readable(persona_actor, qa_run_id)
-                            judge_obj.update(judge_answer(actor.tenant_id, qa_run_id, question_obj, expected_obj, qa_detail))
+                            judge_rubric = str(manifest.get("rubricVersion") or LEGACY_RUBRIC_VERSION)
+                            judge_contract = str(manifest.get("inputContractVersion") or INPUT_CONTRACT_VERSION)
+                            answer_present = "answer" in qa_detail
+                            answer_text = qa_detail.get("answer") if answer_present else None
+                            conversation_context = EvaluationRunner._judge_conversation_context(
+                                persona_actor, qa_run_ids
+                            )
+                            final_question = str(qa_detail.get("question") or question_text)
+                            judge_obj.update(judge_answer(
+                                actor.tenant_id,
+                                qa_run_id,
+                                final_question,
+                                expected_obj,
+                                qa_detail,
+                                answer_text=answer_text,
+                                answer_present=answer_present,
+                                conversation_context=conversation_context,
+                                rubric_version=judge_rubric,
+                                input_contract_version=judge_contract,
+                            ))
                             assert_run_sources_readable(persona_actor, qa_run_id)
                             correctness = judge_obj["correctness"]
                         except Exception as exc:
@@ -696,6 +727,49 @@ class EvaluationRunner:
         return detail, run_ids
 
     @staticmethod
+    def _judge_conversation_context(persona: Actor, qa_run_ids: List[str]) -> List[Dict[str, str]]:
+        """Build the exact prior user/assistant history plus the final user turn.
+
+        The final assistant answer is scored separately as answerText and is therefore not duplicated here.
+        """
+        if not qa_run_ids:
+            return []
+
+        # History is about to be re-sent to an external Judge. Revalidate every
+        # contributing QA run at send time so revoked/changed sources fail closed.
+        from app.qa.context import assert_run_sources_readable
+        for history_run_id in qa_run_ids:
+            assert_run_sources_readable(persona, str(history_run_id))
+
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(
+                    qa_run_table.c.id,
+                    qa_run_table.c.question,
+                    qa_run_table.c.result_json,
+                ).where(and_(
+                    qa_run_table.c.tenant_id == persona.tenant_id,
+                    qa_run_table.c.owner_id == persona.user_id,
+                    qa_run_table.c.id.in_(qa_run_ids),
+                ))
+            ).fetchall()
+        by_id = {str(r.id): r for r in rows}
+        messages: List[Dict[str, str]] = []
+        for index, rid in enumerate(qa_run_ids):
+            row = by_id.get(str(rid))
+            if not row:
+                continue
+            question = str(row.question or "").strip()
+            if question:
+                messages.append({"role": "user", "content": question})
+            if index < len(qa_run_ids) - 1:
+                result = obj(row.result_json)
+                if "answer" in result:
+                    answer = "" if result.get("answer") is None else str(result.get("answer"))
+                    messages.append({"role": "assistant", "content": answer})
+        return messages
+
+    @staticmethod
     def _update_result(
         actor: Actor,
         result_id: str,
@@ -838,7 +912,7 @@ class EvaluationRunner:
 
     @staticmethod
     def aggregate(actor: Actor, run_id: str) -> Dict[str, Any]:
-        """Aggregate run metrics across all case results."""
+        """Aggregate execution, semantic, relevance, calibration, retrieval, latency, and cost metrics."""
         with get_db_connection() as conn:
             rows = conn.execute(
                 select(eval_result_table).where(
@@ -848,17 +922,44 @@ class EvaluationRunner:
                     )
                 )
             ).fetchall()
+            run_row = conn.execute(
+                select(eval_run_table.c.manifest_json).where(
+                    and_(eval_run_table.c.tenant_id == actor.tenant_id, eval_run_table.c.id == run_id)
+                )
+            ).first()
+            result_ids = [str(r.id) for r in rows]
+            reviews = []
+            if result_ids:
+                reviews = conn.execute(
+                    select(eval_review_table).where(and_(
+                        eval_review_table.c.tenant_id == actor.tenant_id,
+                        eval_review_table.c.result_id.in_(result_ids),
+                    )).order_by(eval_review_table.c.created_at.asc(), eval_review_table.c.id.asc())
+                ).fetchall()
 
-            reviews = conn.execute(select(eval_review_table).where(and_(
-                eval_review_table.c.tenant_id == actor.tenant_id,
-                eval_review_table.c.result_id.in_([str(r.id) for r in rows]),
-            )).order_by(eval_review_table.c.created_at.asc(), eval_review_table.c.id.asc())).fetchall()
-        latest_reviews = {str(r.result_id): obj(r.labels_json) for r in reviews}
+        # Reviews are append-only and may cover only one dimension. Merge the newest value per dimension.
+        latest_reviews: Dict[str, Dict[str, str]] = {}
+        reviewed_result_ids: Set[str] = set()
+        for review in reviews:
+            rid = str(review.result_id)
+            reviewed_result_ids.add(rid)
+            target = latest_reviews.setdefault(rid, {})
+            for key, value in obj(review.labels_json).items():
+                if value is not None:
+                    target[str(key)] = str(value)
+
+        manifest = obj(run_row.manifest_json) if run_row else {}
+        mode = str(manifest.get("mode", ""))
+        semantic_mode = mode in {"RAG", "AGENT"}
 
         total = len(rows)
         completed = sum(1 for r in rows if r.status == "COMPLETED")
         failed = sum(1 for r in rows if r.status == "FAILED")
+        pending = sum(1 for r in rows if r.status == "PENDING")
         success_count = 0
+        judged = 0
+        semantic_unknown = 0
+
         hit_sum = 0.0
         recall_sum = 0.0
         mrr_sum = 0.0
@@ -866,33 +967,87 @@ class EvaluationRunner:
         retrieval_n = 0
         ndcg_n = 0
         durations: List[float] = []
+
         agent_cases = 0
         agent_turns = 0
         agent_tool_calls = 0
         agent_input_tokens = 0
         agent_output_tokens = 0
         agent_timeouts = 0
-        judged = 0
+
         known_cost = 0.0
         unknown_cost = 0
         reviewed_correct = 0
 
+        relevance_labels = ["ON_TOPIC", "PARTLY_OFF_TOPIC", "OFF_TOPIC", "UNCERTAIN"]
+        final_relevance_counts = {label: 0 for label in relevance_labels}
+        auto_relevance_counts = {label: 0 for label in relevance_labels}
+        relevance_assessed = 0
+        auto_relevance_assessed = 0
+        correctness_pairs: List[Tuple[str, str]] = []
+        relevance_pairs: List[Tuple[str, str]] = []
+        human_correctness_labels = 0
+        human_relevance_labels = 0
+
         for r in rows:
             m = obj(r.metrics_json)
-            label = latest_reviews.get(str(r.id), {}).get("correctness")
-            if label:
-                m["taskSuccess"] = label == "CORRECT" if label != "UNDETERMINED" else None
-                reviewed_correct += int(label == "CORRECT")
-            if isinstance(m.get("taskSuccess"), bool):
-                judged += 1
+            judge = obj(r.judge_json)
+            labels = latest_reviews.get(str(r.id), {})
+
+            auto_correctness = str(judge.get("correctness") or m.get("correctness") or "")
+            human_correctness = labels.get("correctness")
+            if human_correctness:
+                human_correctness_labels += 1
+                if auto_correctness:
+                    correctness_pairs.append((auto_correctness, human_correctness))
+                m["taskSuccess"] = (
+                    human_correctness == "CORRECT"
+                    if human_correctness != "UNDETERMINED"
+                    else None
+                )
+                reviewed_correct += int(human_correctness == "CORRECT")
+
+            if semantic_mode:
+                # Execution and semantic judgment are separate axes. A failed/pending execution
+                # cannot become a semantic WRONG merely because an error path stored taskSuccess=False.
+                if str(r.status) == "COMPLETED" and isinstance(m.get("taskSuccess"), bool):
+                    judged += 1
+                    success_count += int(m["taskSuccess"] is True)
+                else:
+                    semantic_unknown += 1
+            else:
+                # Preserve existing retrieval-mode success semantics without presenting them as QA judgment.
+                if isinstance(m.get("taskSuccess"), bool):
+                    judged += 1
+                    success_count += int(m["taskSuccess"] is True)
+
+            auto_rel_obj = judge.get("answerRelevance")
+            auto_rel = (
+                str(auto_rel_obj.get("verdict"))
+                if isinstance(auto_rel_obj, dict) and auto_rel_obj.get("verdict") in relevance_labels
+                else None
+            )
+            if auto_rel:
+                auto_relevance_counts[auto_rel] += 1
+                auto_relevance_assessed += 1
+
+            human_rel = labels.get("answerRelevance")
+            if human_rel in relevance_labels:
+                human_relevance_labels += 1
+                if auto_rel:
+                    relevance_pairs.append((auto_rel, human_rel))
+            final_rel = human_rel if human_rel in relevance_labels else auto_rel
+            if final_rel:
+                final_relevance_counts[final_rel] += 1
+                relevance_assessed += 1
+
             cost = m.get("costCny")
             if isinstance(cost, (int, float)):
                 known_cost += cost
             else:
                 unknown_cost += 1
                 known_cost += float(m.get("knownCostCny") or 0.0)
-            if m.get("taskSuccess") is True:
-                success_count += 1
+
             if isinstance(m.get("durationMs"), (int, float)):
                 durations.append(float(m["durationMs"]))
             if isinstance(m.get("recall"), (int, float)):
@@ -903,6 +1058,7 @@ class EvaluationRunner:
             if isinstance(m.get("ndcg"), (int, float)):
                 ndcg_n += 1
                 ndcg_sum += float(m["ndcg"])
+
             trajectory = m.get("agentTrajectory")
             if isinstance(trajectory, dict):
                 agent_cases += 1
@@ -915,16 +1071,61 @@ class EvaluationRunner:
         p50 = EvaluationMetrics.percentile(durations, 0.5) if durations else None
         p95 = EvaluationMetrics.percentile(durations, 0.95) if durations else None
 
+        correctness_calibration = EvaluationMetrics.correctness_calibration(correctness_pairs)
+        correctness_calibration["humanLabeled"] = human_correctness_labels
+        correctness_calibration["comparisonCoverage"] = EvaluationMetrics.ratio(
+            correctness_calibration["compared"], human_correctness_labels
+        )
+
+        relevance_calibration = EvaluationMetrics.categorical_comparison(
+            relevance_pairs, relevance_labels
+        )
+        relevance_calibration["humanLabeled"] = human_relevance_labels
+        relevance_calibration["comparisonCoverage"] = EvaluationMetrics.ratio(
+            relevance_calibration["compared"], human_relevance_labels
+        )
+
+        relevance_denominator = total if semantic_mode else 0
+        relevance_summary = {
+            "policy": manifest.get("relevancePolicy") or (
+                RELEVANCE_POLICY if manifest.get("rubricVersion") == RUBRIC_VERSION else None
+            ),
+            "counts": final_relevance_counts,
+            "assessed": relevance_assessed if semantic_mode else 0,
+            "unevaluated": (relevance_denominator - relevance_assessed) if semantic_mode else 0,
+            "coverage": EvaluationMetrics.ratio(relevance_assessed, relevance_denominator),
+            "automatic": {
+                "counts": auto_relevance_counts,
+                "assessed": auto_relevance_assessed if semantic_mode else 0,
+                "unevaluated": (relevance_denominator - auto_relevance_assessed) if semantic_mode else 0,
+                "coverage": EvaluationMetrics.ratio(auto_relevance_assessed, relevance_denominator),
+            },
+        }
+
         return {
             "planned": total,
             "completed": completed,
             "failed": failed,
+            "executionFailed": failed,
+            "pending": pending,
             "notCompleted": total - completed - failed,
+            "completionCoverage": EvaluationMetrics.ratio(completed, total),
+            # Backward-compatible denominator: only already-judged results.
             "taskSuccessRate": EvaluationMetrics.ratio(success_count, judged),
+            "plannedTaskSuccessRate": (
+                EvaluationMetrics.ratio(success_count, total) if semantic_mode else None
+            ),
+            "successful": success_count if semantic_mode else None,
+            "unknown": semantic_unknown if semantic_mode else None,
             "judgedCases": judged,
             "judgmentCoverage": EvaluationMetrics.ratio(judged, total),
-            "humanReviewedCases": len(latest_reviews),
+            "humanReviewedCases": len(reviewed_result_ids),
             "humanCorrectCases": reviewed_correct,
+            "answerRelevance": relevance_summary,
+            "judgeCalibration": {
+                "correctness": correctness_calibration,
+                "answerRelevance": relevance_calibration,
+            },
             "hitAt5": (hit_sum / retrieval_n) if retrieval_n else None,
             "recallAt5": (recall_sum / retrieval_n) if retrieval_n else None,
             "mrr": (mrr_sum / retrieval_n) if retrieval_n else None,
@@ -1019,9 +1220,48 @@ class EvaluationRunner:
                     ).order_by(eval_review_table.c.created_at.asc())
                 ).fetchall()
                 item["reviews"] = [
-                    {"id": str(x.id), "labels": obj(x.labels_json), "reason": x.reason_text}
+                    {
+                        "id": str(x.id),
+                        "labels": obj(x.labels_json),
+                        "reason": x.reason_text,
+                        "reviewerId": str(x.reviewer_id),
+                        "createdAt": x.created_at.isoformat() if x.created_at else None,
+                    }
                     for x in rev_rows
                 ]
+                latest_labels: Dict[str, str] = {}
+                latest_review_meta: Dict[str, Dict[str, Any]] = {}
+                for review in rev_rows:
+                    for key, value in obj(review.labels_json).items():
+                        if value is not None:
+                            latest_labels[str(key)] = str(value)
+                            latest_review_meta[str(key)] = {
+                                "reviewId": str(review.id),
+                                "reviewerId": str(review.reviewer_id),
+                                "createdAt": review.created_at.isoformat() if review.created_at else None,
+                                "reason": review.reason_text,
+                            }
+                judge = item["judge"]
+                auto_relevance = judge.get("answerRelevance") if isinstance(judge.get("answerRelevance"), dict) else None
+                automatic = {
+                    "correctness": judge.get("correctness"),
+                    "answerRelevance": auto_relevance.get("verdict") if auto_relevance else None,
+                    "expectationAssessment": (
+                        judge.get("expectationAssessment", {}).get("verdict")
+                        if isinstance(judge.get("expectationAssessment"), dict)
+                        else None
+                    ),
+                }
+                effective = dict(automatic)
+                for dimension in ("correctness", "answerRelevance", "expectationAssessment"):
+                    if dimension in latest_labels:
+                        effective[dimension] = latest_labels[dimension]
+                item["automaticJudgment"] = automatic
+                item["humanJudgment"] = {
+                    "labels": latest_labels,
+                    "byDimension": latest_review_meta,
+                }
+                item["effectiveJudgment"] = effective
                 res.append(item)
             return res
 
@@ -1058,9 +1298,28 @@ class EvaluationRunner:
     def review(actor: Actor, result_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         EvaluationCatalog.require_admin(actor)
         labels = body.get("labels") if isinstance(body.get("labels"), dict) else {"correctness": body.get("label")}
-        correctness = labels.get("correctness")
-        if correctness not in {"CORRECT", "PARTIAL", "WRONG", "UNDETERMINED"}:
-            raise ApiException(400, "INVALID_INPUT", "人工正确性标签无效")
+        allowed_correctness = {"CORRECT", "PARTIAL", "WRONG", "UNDETERMINED"}
+        allowed_relevance = {"ON_TOPIC", "PARTLY_OFF_TOPIC", "OFF_TOPIC", "UNCERTAIN"}
+        allowed_expectation = {"SATISFIED", "VIOLATED", "UNCERTAIN"}
+
+        normalized: Dict[str, str] = {}
+        if labels.get("correctness") is not None:
+            value = str(labels.get("correctness")).strip().upper()
+            if value not in allowed_correctness:
+                raise ApiException(400, "INVALID_INPUT", "人工正确性标签无效")
+            normalized["correctness"] = value
+        if labels.get("answerRelevance") is not None:
+            value = str(labels.get("answerRelevance")).strip().upper()
+            if value not in allowed_relevance:
+                raise ApiException(400, "INVALID_INPUT", "人工 Answer Relevancy 标签无效")
+            normalized["answerRelevance"] = value
+        if labels.get("expectationAssessment") is not None:
+            value = str(labels.get("expectationAssessment")).strip().upper()
+            if value not in allowed_expectation:
+                raise ApiException(400, "INVALID_INPUT", "人工题型评价标签无效")
+            normalized["expectationAssessment"] = value
+        if not normalized:
+            raise ApiException(400, "INVALID_INPUT", "至少提交一个人工评估维度")
 
         reason = str(body.get("reason", "")).strip()
         now = datetime.now(timezone.utc)
@@ -1081,7 +1340,7 @@ class EvaluationRunner:
                     id=review_id,
                     result_id=result_id,
                     reviewer_id=actor.user_id,
-                    labels_json=labels,
+                    labels_json=normalized,
                     reason_text=reason,
                     created_at=now,
                     updated_at=now,
@@ -1089,7 +1348,7 @@ class EvaluationRunner:
             )
             conn.commit()
 
-        return {"reviewId": review_id}
+        return {"reviewId": review_id, "labels": normalized}
 
     @staticmethod
     def export_run(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1130,7 +1389,11 @@ class EvaluationRunner:
 
         runs = [EvaluationRunner.get_run(actor, rid) for rid in run_ids]
         first_m = runs[0].get("manifest", {})
-        comparison_fields = ("datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats", "environment", "judgeMode", "rubricVersion")
+        comparison_fields = (
+            "datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats",
+            "environment", "judgeMode", "rubricVersion", "inputContractVersion",
+            "evaluationScope", "relevancePolicy",
+        )
         differences = [key for key in comparison_fields if any(
             r.get("manifest", {}).get(key) != first_m.get(key) for r in runs
         )]
