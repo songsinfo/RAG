@@ -19,9 +19,9 @@ async function importCases() { await act(async () => { const parsed = imported.v
 function effective(row: Row, dimension: string) { return row.effectiveJudgment?.[dimension] ?? '未评估' }
 function review(row: Row) {
   edit(
-    '人工复核（初标不预填自动结论）',
+    '人工复核（只提交明确修改的维度）',
     '/admin/eval/results/' + keyOf(row) + '/reviews',
-    { labels: { correctness: 'UNDETERMINED', answerRelevance: 'UNCERTAIN', expectationAssessment: 'UNCERTAIN' }, reason: '' },
+    { labels: {}, reason: '' },
   )
 }
 onMounted(() => act(load)); onUnmounted(() => { disposed = true; clearTimeout(timer) })
