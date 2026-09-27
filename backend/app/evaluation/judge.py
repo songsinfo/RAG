@@ -145,7 +145,7 @@ def parse_full_answer_verdicts(raw, facts, claims, expectation):
         or assessment["verdict"] == "VIOLATED"
         or (expectation == "ANSWER" and "MISSING" in fs)
     )
-    insufficient_gold = expectation in {"ANSWER", "PARTIAL", "CONFLICT"} and not facts
+    insufficient_gold = expectation in {"ANSWER", "PARTIAL"} and not facts
     extraction_gap = expectation != "ABSTAIN" and bool(facts) and not claims
     uncertain = (
         "UNCERTAIN" in fs
@@ -305,9 +305,9 @@ def judge_answer(
         "answerText": answer_text,
         "conversationContext": history,
         "expectation": {
+            **expected,
             "status": expectation,
             "referenceFacts": facts,
-            "answerPoints": expected.get("answerPoints", []),
         },
         "referenceFacts": facts,
         "claims": claims,
