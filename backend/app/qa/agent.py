@@ -1,3 +1,12 @@
+"""LangGraph Agent 主循环。
+
+Agent 只做两件事：
+1. 模型节点决定“继续调用工具还是给最终答案”；
+2. 工具节点执行受控的 search_knowledge / read_section，并把结果以 evidence 形式回填。
+
+运行时通过 max_rounds、max_tool_calls、重复调用检测、deadline、Token/模型调用预算、
+来源权限复核和 HITL interrupt 共同保证 Agent 不会无限循环或越权读取。
+"""
 import hashlib
 import json
 import os
@@ -42,6 +51,7 @@ from app.qa.runtime import (
 from app.retrieval.pipeline import RetrievalPipeline
 
 
+# Prompt 版本进入运行事件，方便回放/对比时知道 Agent 当时使用哪套行为约束。
 AGENT_PROMPT_VERSION = os.getenv("AGENT_PROMPT_VERSION", "agent-v1.1")
 
 
@@ -100,6 +110,7 @@ AGENT_TOOLS = [
 
 
 class AgentState(TypedDict):
+    """LangGraph 节点间传递的状态；这里只存“可恢复的业务状态”，不放连接/事务对象。"""
     messages: List[Dict[str, Any]]
     round: int
     tool_calls_count: int
@@ -113,6 +124,7 @@ class AgentState(TypedDict):
 
 @dataclass(frozen=True)
 class AgentContext:
+    """不参与 checkpoint 的运行时依赖，例如 Actor、deadline、事件回调和策略。"""
     actor: Actor
     run_id: str
     conversation_id: str
@@ -125,11 +137,14 @@ class AgentContext:
 
 
 class LangGraphAgent:
+    """可恢复、可中断、受预算约束的知识库 Agent。"""
+
     _graph = None
     _graph_lock = threading.Lock()
 
     @classmethod
     def _get_graph(cls):
+        """懒加载并缓存图结构；图结构固定，运行状态由 checkpointer 按 run_id 隔离。"""
         if cls._graph is not None:
             return cls._graph
         with cls._graph_lock:
@@ -139,6 +154,7 @@ class LangGraphAgent:
             builder = StateGraph(AgentState, context_schema=AgentContext)
             builder.add_node("model", cls._model_step)
             builder.add_node("tools", cls._tools_step)
+            # 固定拓扑：model → (tools → model)* → END。
             builder.add_edge(START, "model")
             builder.add_conditional_edges(
                 "model",
@@ -146,6 +162,7 @@ class LangGraphAgent:
                 {"tools": "tools", END: END},
             )
             builder.add_edge("tools", "model")
+            # 使用数据库 checkpointer，worker/进程重启后可以从最近节点边界恢复。
             cls._graph = builder.compile(checkpointer=JobCheckpointSaver())
             return cls._graph
 
@@ -162,6 +179,7 @@ class LangGraphAgent:
         config_id: str,
     ) -> Dict[str, Any]:
         policy = AgentRuntimePolicy.from_env()
+        # 整体 deadline 从 Agent 启动时固定，后续每次模型/工具重试都不能突破它。
         deadline_epoch = time.time() + policy.overall_timeout_seconds
         graph = cls._get_graph()
         configurable = {
@@ -177,8 +195,10 @@ class LangGraphAgent:
             "configurable": configurable,
         }
 
+        # 先看持久化 checkpoint，再决定是全新执行、HITL resume 还是故障恢复。
         snapshot = graph.get_state(graph_config)
         resume_payload = cls._consume_resume_payload(actor.tenant_id, run_id)
+        # 人工审批通过/拒绝后用 Command(resume=...) 恢复 interrupt 的返回值。
         if resume_payload is not None:
             graph_input: Any = Command(resume=resume_payload)
             record_event_fn(
@@ -187,6 +207,7 @@ class LangGraphAgent:
                 "AGENT_RESUMED",
                 {"source": "langgraph_interrupt", "promptVersion": AGENT_PROMPT_VERSION},
             )
+        # 有状态且还有 next，说明上次 worker 在节点之间退出，可直接从 checkpoint 接着跑。
         elif snapshot.values and snapshot.next:
             # Native LangGraph checkpoint resume after a transient worker/process failure.
             graph_input = None
@@ -196,6 +217,7 @@ class LangGraphAgent:
                 "AGENT_RESUMED",
                 {"source": "langgraph_checkpoint", "next": list(snapshot.next), "promptVersion": AGENT_PROMPT_VERSION},
             )
+        # 图已完成但业务 worker 重放时，优先复用 checkpoint 里的最终答案，避免重复调用模型。
         elif snapshot.values and not snapshot.next:
             # A completed graph should normally have finalized the QA run already.
             # Reuse the persisted final state if the worker is replayed after commit.
@@ -204,6 +226,7 @@ class LangGraphAgent:
                 return final_answer
             graph_input = None
         else:
+            # 新运行只注入授权后的历史；历史内容被明确标记为“不可信数据”。
             memory = cls._conversation_memory(actor, conversation_id, run_id)
             graph_input = {
                 "messages": [
@@ -267,10 +290,13 @@ class LangGraphAgent:
                 # Persist before advancing to the next node. This is also the
                 # correct durability choice for HITL and avoids concurrent
                 # checkpoint writes racing application DB writes.
+                # sync 保证“推进到下一节点”之前 checkpoint 已持久化；
+                # 对 HITL 和 worker 崩溃恢复都比异步落盘更安全。
                 durability="sync",
             )
 
         snapshot = graph.get_state(graph_config)
+        # 图暂停不等于失败；把 interrupt 暴露给上层，由人工审批接口后续 resume。
         if snapshot.interrupts:
             pending = snapshot.interrupts[0].value
             record_event_fn(
@@ -295,6 +321,7 @@ class LangGraphAgent:
 
     @staticmethod
     def _consume_resume_payload(tenant_id: str, run_id: str) -> Optional[Dict[str, Any]]:
+        """原子读取并删除一次性 resume payload，避免 worker 重放重复消费审批结果。"""
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             row = conn.execute(
@@ -383,12 +410,15 @@ class LangGraphAgent:
 
     @staticmethod
     def _route_after_model(state: AgentState) -> str:
+        """模型已经产出 final/error 就结束，否则进入工具节点。"""
         if state.get("final_answer") or state.get("error"):
             return END
         return "tools"
 
     @classmethod
     def _guard_runtime(cls, state: AgentState, ctx: AgentContext) -> Dict[str, int]:
+        """每个模型/工具节点入口统一执行取消、权限、deadline 与累计预算检查。"""
+        # 取消优先于一切后续工作，避免用户取消后继续产生模型费用。
         if ctx.is_cancelled_fn(ctx.actor.tenant_id, ctx.run_id):
             raise ApiException(409, "CANCELLED", "请求已取消")
         assert_run_sources_readable(ctx.actor, ctx.run_id)
@@ -404,9 +434,11 @@ class LangGraphAgent:
         ctx = runtime.context
         actor = ctx.actor
         usage = cls._guard_runtime(state, ctx)
+        # round 限制 Agent 主循环次数，即使模型一直不返回 final 也会被硬停止。
         if state["round"] >= ctx.policy.max_rounds:
             raise ApiException(429, "BUDGET_EXCEEDED", "Agent 主循环次数已耗尽")
 
+        # 每轮都重新压缩上下文，避免工具结果不断累积导致模型上下文无限增长。
         messages, trim_info = compact_messages(
             list(state["messages"]),
             ctx.policy.max_context_tokens,
@@ -429,6 +461,7 @@ class LangGraphAgent:
                 "usedTokens": usage["totalTokens"],
             },
         )
+        # evidence 即将再次进入模型上下文，发送前重新鉴权，防止中途撤权。
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, state["evidence"])
         assert_run_sources_readable(actor, ctx.run_id)
@@ -449,6 +482,7 @@ class LangGraphAgent:
         tool_calls = reply.get("tool_calls", [])
 
         if not tool_calls:
+            # 没有 tool call 时才把 content 当最终答案，并强制走 Pydantic 结构校验。
             try:
                 parsed = AgentFinalResponse.model_validate_json(reply.get("content", "")).model_dump()
             except ValidationError as exc:
@@ -456,6 +490,7 @@ class LangGraphAgent:
             except Exception as exc:
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "Agent 最终输出不是合法 JSON") from exc
 
+            # 最终 claims 仍需用真实 evidence_map 做引用区间/证据存在性校验。
             validated = validate_claims(parsed, state["evidence_map"])
             validated["evidence"] = state["evidence"]
             validated["warnings"] = state["warnings"]
@@ -488,6 +523,8 @@ class LangGraphAgent:
         calls_count = state["tool_calls_count"]
         approval_decisions: Dict[str, str] = {}
 
+        # 先收集所有需要审批的 tool call，再执行任何有副作用的工具。
+        # 这样 Command(resume=...) 导致节点从头重跑时，不会重复执行一半工具。
         # Native LangGraph HITL. Approval interrupts are collected before any tool
         # side effects, so node re-execution after Command(resume=...) is safe.
         for tc in tool_calls:
@@ -516,12 +553,14 @@ class LangGraphAgent:
         for tc in tool_calls:
             cls._guard_runtime(state, ctx)
             calls_count += 1
+            # 工具总次数是硬预算，和模型 round 分开限制。
             if calls_count > ctx.policy.max_tool_calls:
                 raise ApiException(429, "BUDGET_EXCEEDED", "工具调用次数已耗尽")
 
             name, args = cls._tool_call_parts(tc)
             call_id = str(tc.get("id") or f"call-{calls_count}")
             sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+            # name + 规范化 args 作为重复调用签名，防止模型陷入同一工具死循环。
             repeated_map[sig] = repeated_map.get(sig, 0) + 1
             if repeated_map[sig] >= ctx.policy.repeated_call_limit:
                 raise ApiException(409, "REPEATED_CALLS", "重复工具调用已终止")
@@ -550,6 +589,7 @@ class LangGraphAgent:
                         if not query or not isinstance(top_k, int) or top_k < 1 or top_k > 10:
                             raise ApiException(400, "INVALID_TOOL_ARGUMENTS", "检索工具参数无效")
 
+                        # SELECTED scope 时只允许检索当前 segment 明确选择的 KB。
                         allowed_kbs = cls._resolve_allowed_kbs(actor, ctx.segment_id)
                         retrieval = retry_call(
                             "tool:search_knowledge",
@@ -572,6 +612,7 @@ class LangGraphAgent:
                             if not qa_lease_is_current(conn, actor.tenant_id, ctx.run_id):
                                 raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
                             for hit in retrieval["hits"]:
+                                # 同一 parent/context 多次被搜到时复用已有 evidenceId，避免重复上下文。
                                 key = cls._hit_key(hit)
                                 existing = evidence_by_key.get(key)
                                 if existing:
@@ -582,6 +623,7 @@ class LangGraphAgent:
                                 source_units = hit.get("sourceUnits") or []
                                 unit_id = source_units[0].get("unitId") if source_units else None
                                 raw_text = str(hit["text"])
+                                # 检索正文是不可信数据；先检测/标记间接提示注入，再提供给 Agent。
                                 guarded_text, guard_info = guard_retrieved_content(raw_text)
                                 if guard_info["indirectPromptInjection"]:
                                     warnings_list.append(f"INDIRECT_PROMPT_INJECTION:{eid}")
@@ -609,6 +651,7 @@ class LangGraphAgent:
                                 evidence_by_key[key] = ev_item
                                 tool_ev.append(cls._compact_evidence(ev_item))
 
+                                # 把每个发送给 Agent 的来源登记到 run_source，供撤权复核和审计。
                                 conn.execute(
                                     run_source_table.insert().values(
                                         tenant_id=actor.tenant_id,
@@ -639,6 +682,7 @@ class LangGraphAgent:
                         }
 
                     elif name == "read_section":
+                        # read_section 是“已知文档/章节的定向读取”，仍然必须重新做 ACL/build 校验。
                         doc_id = args.get("documentId") or args.get("document_id")
                         build_id = args.get("buildId") or args.get("build_id")
                         section_id = args.get("sectionId") or args.get("section_id")
@@ -674,6 +718,8 @@ class LangGraphAgent:
                         raise ApiException(400, "UNKNOWN_TOOL", "不支持此工具")
 
                 except ApiException as exc:
+                    # 工具参数错误可以作为 tool result 返回给模型自行修正；
+                    # 权限、预算、取消等错误必须中断整个 Agent。
                     if exc.code in {"INVALID_TOOL_ARGUMENTS", "UNKNOWN_TOOL", "INVALID_INPUT"}:
                         result_payload = {"status": "ERROR", "code": exc.code}
                     else:
@@ -741,6 +787,7 @@ class LangGraphAgent:
 
     @staticmethod
     def _compact_evidence(evidence: Dict[str, Any], max_chars: int = 800) -> Dict[str, Any]:
+        """给 Agent 工具结果返回短摘要；完整正文仍保存在 evidence/run_source 中。"""
         relevant = str(
             evidence.get("matchedText")
             or evidence.get("guardedText")
@@ -762,6 +809,7 @@ class LangGraphAgent:
 
     @classmethod
     def _resolve_allowed_kbs(cls, actor: Actor, segment_id: str) -> List[str]:
+        """解析当前 segment 的 SELECTED KB 范围；非 SELECTED 返回空表示走常规可读范围。"""
         with get_db_connection() as conn:
             seg = conn.execute(
                 select(context_segment_table).where(
@@ -803,6 +851,7 @@ class LangGraphAgent:
         section_id: str,
         ev_index: int,
     ) -> Dict[str, Any]:
+        """读取一个 SourceUnit；先校验 worker lease、评估 scope、ACL 和 build。"""
         with get_db_connection() as conn:
             if not qa_lease_is_current(conn, actor.tenant_id, run_id):
                 raise ApiException(409, "JOB_LEASE_LOST", "问答任务租约已被新的执行者接管")
