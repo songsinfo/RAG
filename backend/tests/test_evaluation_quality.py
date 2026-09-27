@@ -159,9 +159,42 @@ def test_v2_abstain_can_be_correct_without_claims_or_faithfulness():
         "expectationAssessment": {"verdict": "SATISFIED", "reason": "matches gold abstain reason"},
         "reason": "valid abstention",
     })
-    result = parse_full_answer_verdicts(raw, [], [], "ABSTAIN")
+    result = parse_full_answer_verdicts(
+        raw, [], [], "ABSTAIN", {"status": "ABSTAIN", "abstainReason": "资料不足，无法可靠回答"}
+    )
     assert result["correctness"] == "CORRECT"
     assert result["faithfulness"] is None
+
+
+def test_v2_abstain_without_gold_reason_stays_undetermined():
+    raw = json.dumps({
+        "facts": [],
+        "claims": [],
+        "answerRelevance": {"verdict": "ON_TOPIC", "reason": "relevant refusal"},
+        "claimAlignment": {"verdict": "ALIGNED", "reason": "no factual claims"},
+        "expectationAssessment": {"verdict": "SATISFIED", "reason": "judge guessed this was a good refusal"},
+        "reason": "looks fine",
+    })
+    result = parse_full_answer_verdicts(
+        raw, [], [], "ABSTAIN", {"status": "ABSTAIN"}
+    )
+    assert result["correctness"] == "UNDETERMINED"
+
+
+def test_history_context_revalidates_every_run_before_reading(monkeypatch):
+    checked = []
+
+    def deny(actor, run_id):
+        checked.append(run_id)
+        raise ApiException(409, "SOURCE_CHANGED", "revoked history source")
+
+    monkeypatch.setattr("app.qa.context.assert_run_sources_readable", deny)
+    actor = Actor(tenant_id="tenant-demo-1", user_id="user-operator-1", admin=False)
+
+    with pytest.raises(ApiException) as exc:
+        EvaluationRunner._judge_conversation_context(actor, ["history-run-1", "final-run-2"])
+    assert exc.value.code == "SOURCE_CHANGED"
+    assert checked == ["history-run-1"]
 
 
 def test_full_answer_judge_sends_real_answer_history_and_contract(monkeypatch):
