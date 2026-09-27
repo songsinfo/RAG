@@ -5,11 +5,14 @@ import { api, rows, keyOf, terminal, type Row } from './api'
 import JsonView from './JsonView.vue'
 const conversations = ref<Row[]>([]), kbs = ref<Row[]>([]), conversation = ref<Row | null>(null), history = ref<Row[]>([]), selectedKbs = ref<string[]>([]), scopeMode = ref('ALL'), question = ref(''), mode = ref('RAG'), strict = ref(false), current = ref<Row | null>(null), error = ref(''), busy = ref(false), evidence = ref<any>(null), evidenceOpen = ref(false), feedbackRun = ref(''), feedbackOpen = ref(false)
 const feedback = ref({ rating: 'USEFUL', comment: '', issueType: 'OTHER' })
+// 轮询只允许存在一个 timer；组件卸载后用 disposed 防止异步响应继续改状态。
 let timer: ReturnType<typeof setTimeout> | undefined, disposed = false
 async function act(fn: () => Promise<void>) { error.value = ''; busy.value = true; try { await fn() } catch (e) { error.value = String(e) } finally { busy.value = false } }
 async function refreshList() { conversations.value = rows(await api('/conversations')) }
+// 打开会话时顺便恢复当前 segment scope，并检测是否存在尚未结束的 run。
 async function open(id: string) { clearTimeout(timer); current.value = null; conversation.value = await api('/conversations/' + id); history.value = rows(conversation.value?.runs || conversation.value?.history || []); const segment = conversation.value?.currentSegment || conversation.value?.segments?.at(-1); scopeMode.value = segment?.scope?.mode || 'ALL'; selectedKbs.value = segment?.scope?.kbIds || []; const active = history.value.find(row => !terminal(row.status)); if (active) { current.value = active; poll() } }
 async function create() { const result = await api('/conversations', 'POST', { title: question.value.slice(0, 60) || '新会话', scope: { mode: scopeMode.value, kbIds: selectedKbs.value } }); await refreshList(); await open(result.conversationId || result.id) }
+// 修改知识库范围会创建新的 context segment；旧历史仍保留，但后续问题只使用新 scope。
 async function segment() { await act(async () => {
   if (!conversation.value) return
   const previous = conversation.value.currentSegment?.scope || conversation.value.segments?.at(-1)?.scope || { mode: 'ALL', kbIds: [] }
@@ -20,8 +23,13 @@ async function segment() { await act(async () => {
     conversation.value.currentSegment = { ...result, scope }
   } catch (e) { scopeMode.value = previous.mode; selectedKbs.value = previous.kbIds; throw e }
 }) }
+// 提交问题只创建 run，真正的检索/模型执行在后端 DurableJobWorker 中异步完成。
 async function submit() { await act(async () => { if (!question.value.trim()) return; if (!conversation.value) await create(); const cv = conversation.value!; let segmentId = cv.currentSegmentId || cv.segmentId || cv.currentSegment?.id || cv.segments?.at(-1)?.id; if (!segmentId) { const s = await api(`/conversations/${keyOf(cv)}/segments`, 'POST', { scope: { mode: scopeMode.value, kbIds: selectedKbs.value } }); segmentId = s.currentSegmentId || s.segmentId || s.id; cv.currentSegmentId = segmentId } current.value = await api(`/conversations/${keyOf(cv)}/runs`, 'POST', { question: question.value, segmentId, mode: mode.value, strict: strict.value }); question.value = ''; poll() }) }
-async function poll() { if (!current.value || disposed) return; try { const id = current.value.runId || current.value.id; const result = await api('/runs/' + id); if (disposed || !current.value || (current.value.runId || current.value.id) !== id) return; current.value = result; if (terminal(result.status)) { const cv = await api('/conversations/' + keyOf(conversation.value!)); history.value = rows(cv.runs || cv.history || []); current.value = null; return } timer = setTimeout(poll, document.hidden ? 5000 : 1000) } catch (e) { error.value = String(e); /* No retry loop after authorization or transport failures. Refresh can resume. */ } }
+// 页面可见时高频轮询，后台标签页降低频率，减少无意义请求。
+async function poll() { if (!current.value || disposed) return; try { const id = current.value.runId || current.value.id; const result = await api('/runs/' + id); if (disposed || !current.value || (current.value.runId || current.value.id) !== id) return; current.value = result; if (terminal(result.status)) { const cv = await api('/conversations/' + keyOf(conversation.value!)); history.value = rows(cv.runs || cv.history || []); current.value = null; return } timer = setTimeout(poll, document.hidden ? 5000 : 1000) } catch (e) {
+    error.value = String(e)
+    // 授权/网络错误后不自动无限重试；用户显式刷新即可恢复，避免错误风暴。
+  } }
 async function cancel() { await act(async () => { if (!current.value) return; await api('/runs/' + keyOf(current.value) + '/cancel', 'POST'); clearTimeout(timer); await open(keyOf(conversation.value!)) }) }
 async function remove() { try { await ElMessageBox.confirm('清除当前会话和问答正文？活动任务会被取消。', '清除会话', { cancelButtonText: '取消' }) } catch { return } await act(async () => { await api('/conversations/' + keyOf(conversation.value!), 'DELETE'); conversation.value = null; history.value = []; current.value = null; clearTimeout(timer); await refreshList() }) }
 async function source(run: Row, item: Row) { await act(async () => { evidence.value = await api(`/runs/${keyOf(run)}/evidence/${item.evidenceId || item.id}`); evidenceOpen.value = true }) }
