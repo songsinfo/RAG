@@ -1,3 +1,8 @@
+"""Agent / QA 运行时保护。
+
+集中处理整体 deadline、模型调用次数、Token 预算、上下文压缩、重试和熔断。
+这些限制都是“硬停止条件”，不能依赖模型自己判断什么时候该结束。
+"""
 import json
 import os
 import random
@@ -21,6 +26,7 @@ T = TypeVar("T")
 
 @dataclass(frozen=True)
 class AgentRuntimePolicy:
+    """一次 Agent 运行允许消耗的资源上限与重试策略。"""
     overall_timeout_seconds: int = 120
     max_rounds: int = 6
     max_tool_calls: int = 8
@@ -36,6 +42,7 @@ class AgentRuntimePolicy:
 
     @classmethod
     def from_env(cls) -> "AgentRuntimePolicy":
+        """从环境变量读取策略，并把异常/过小值收敛到安全下限。"""
         approval_tools = frozenset(
             item.strip()
             for item in os.getenv("AGENT_APPROVAL_TOOLS", "").split(",")
@@ -58,10 +65,12 @@ class AgentRuntimePolicy:
 
 
 def estimate_tokens(value: Any) -> int:
+    """无精确 tokenizer 时的保守估算，仅用于运行时保护，不用于真实计费。"""
     if value is None:
         return 0
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    # 中文/英文混合场景下用“约 3 字符/token”做保守近似，宁可早一点触发预算。
     # Conservative mixed Chinese/English approximation.
     return max(1, (len(value) + 2) // 3)
 
@@ -132,14 +141,14 @@ def compact_messages(
     messages: List[Dict[str, Any]],
     max_tokens: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Trim context with LangChain's supported message utility.
+    """压缩上下文，但尽量保持一条“语义完整”的最近对话尾部。
 
-    We keep the system instruction and the most recent valid conversation tail.
-    `start_on="human"` prevents a retained ToolMessage from being detached from
-    the conversational turn that produced it.
+    保留 system 指令，并从最近消息向前截取；start_on="human" 防止留下孤立的
+    ToolMessage——如果工具结果还在、触发它的用户/助手轮次却被裁掉，模型会误解上下文。
     """
     converted = [_to_langchain_message(message) for message in messages]
     original_tokens = int(count_tokens_approximately(converted))
+    # 未超预算时原样返回，避免为了“统一格式”无谓重建消息。
     if original_tokens <= max_tokens:
         return list(messages), {
             "trimmed": False,
@@ -148,6 +157,7 @@ def compact_messages(
             "strategy": "langchain.trim_messages",
         }
 
+    # allow_partial=False：宁可整条消息丢掉，也不从消息中间硬截断 JSON/tool payload。
     trimmed = trim_messages(
         converted,
         max_tokens=max_tokens,
@@ -168,6 +178,7 @@ def compact_messages(
 
 
 def get_run_usage(tenant_id: str, run_id: str) -> Dict[str, int]:
+    """从 model_call 汇总一个 run 已经真实消耗的模型调用次数和 Token。"""
     with get_db_connection() as conn:
         row = conn.execute(
             select(
@@ -197,6 +208,7 @@ def assert_runtime_budget(
     deadline_epoch: float,
     policy: AgentRuntimePolicy,
 ) -> Dict[str, int]:
+    # 先检查 wall-clock deadline，再检查累计调用/Token；任一命中都立即停止。
     if time.time() >= deadline_epoch:
         raise ApiException(408, "AGENT_TIMEOUT", "Agent 执行超过整体时间预算")
     usage = get_run_usage(tenant_id, run_id)
@@ -216,6 +228,7 @@ _RETRYABLE_CODES = {
 
 
 def is_retryable_exception(exc: Exception) -> bool:
+    """只重试临时性网络/供应商错误；预算、取消、权限等业务错误绝不重试。"""
     if isinstance(exc, ApiException):
         if exc.code in {"BUDGET_EXCEEDED", "BATCH_BUDGET_EXCEEDED", "CANCELLED", "MODEL_PRICING_NOT_CONFIGURED"}:
             return False
@@ -227,17 +240,20 @@ def is_retryable_exception(exc: Exception) -> bool:
 
 
 class CircuitBreaker:
+    """进程内轻量熔断器，防止依赖故障时持续重试放大流量。"""
     def __init__(self):
         self._lock = threading.Lock()
         self._state: Dict[str, Dict[str, float]] = {}
 
     def before_call(self, key: str, policy: AgentRuntimePolicy) -> None:
+        """真正调用依赖前检查该 key 是否处于熔断窗口。"""
         with self._lock:
             state = self._state.get(key)
             if not state:
                 return
             if state["failures"] < policy.circuit_failure_threshold:
                 return
+            # 熔断窗口到期后允许下一次调用试探恢复。
             if time.time() - state["opened_at"] >= policy.circuit_reset_seconds:
                 self._state.pop(key, None)
                 return
@@ -248,6 +264,7 @@ class CircuitBreaker:
             self._state.pop(key, None)
 
     def failure(self, key: str, policy: AgentRuntimePolicy) -> None:
+        """累计连续失败，达到阈值后打开熔断。"""
         with self._lock:
             state = self._state.setdefault(key, {"failures": 0.0, "opened_at": 0.0})
             state["failures"] += 1
@@ -267,6 +284,7 @@ def retry_call(
 ) -> T:
     policy = policy or AgentRuntimePolicy.from_env()
     circuit_breaker.before_call(key, policy)
+    # call_max_attempts 包含第一次调用，不是“额外重试次数”。
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, policy.call_max_attempts + 1):
@@ -278,11 +296,14 @@ def retry_call(
             return value
         except Exception as exc:
             last_exc = exc
+            # 不可重试错误直接抛出；只有临时错误才进入指数退避。
             if not is_retryable_exception(exc) or attempt >= policy.call_max_attempts:
                 circuit_breaker.failure(key, policy)
                 raise
+            # 指数退避 + 轻微 jitter，避免多个 worker 同时重试形成惊群。
             sleep_seconds = policy.retry_base_delay_seconds * (2 ** (attempt - 1))
             sleep_seconds *= 0.8 + random.random() * 0.4
+            # 如果“睡完再重试”已经会超过整体 deadline，就不再浪费时间等待。
             if deadline_epoch is not None:
                 remaining = deadline_epoch - time.time()
                 if remaining <= sleep_seconds:
@@ -314,6 +335,7 @@ _NON_RETRYABLE_JOB_CODES = {
 
 
 def is_retryable_job_code(code: Optional[str]) -> bool:
+    """Worker 失败后是否允许重新入队；业务确定性失败全部列入禁止重试集合。"""
     if not code:
         return True
     return str(code) not in _NON_RETRYABLE_JOB_CODES
