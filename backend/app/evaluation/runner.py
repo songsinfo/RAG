@@ -734,6 +734,13 @@ class EvaluationRunner:
         """
         if not qa_run_ids:
             return []
+
+        # History is about to be re-sent to an external Judge. Revalidate every
+        # contributing QA run at send time so revoked/changed sources fail closed.
+        from app.qa.context import assert_run_sources_readable
+        for history_run_id in qa_run_ids:
+            assert_run_sources_readable(persona, str(history_run_id))
+
         with get_db_connection() as conn:
             rows = conn.execute(
                 select(
