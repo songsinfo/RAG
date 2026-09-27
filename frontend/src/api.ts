@@ -1,8 +1,11 @@
+// 前端统一 API 封装：集中处理 Cookie 会话、CSRF、幂等键、错误解析与鉴权过期事件。
 export type Row = Record<string, any>
+// CSRF token 缓存在内存中；页面刷新后重新获取，不写 localStorage，减少泄漏面。
 let csrf = ''
 let csrfHeader = 'X-CSRF-Token'
 export class ApiError extends Error { constructor(public status: number, public code: string, message: string) { super(message) } }
 export async function refreshCsrf() {
+  // 写请求前按需获取最新 CSRF 配置，后端可自定义 header 名。
   const response = await fetch('/api/v1/auth/csrf', { credentials: 'include', cache: 'no-store' })
   if (!response.ok) throw new ApiError(response.status, 'CSRF_UNAVAILABLE', '无法获取安全令牌，请检查后端连接')
   const value = await response.json()
@@ -12,6 +15,8 @@ export async function refreshCsrf() {
 }
 export async function api(path: string, method = 'GET', body?: unknown): Promise<any> {
   const headers: Record<string, string> = {}
+  // 所有非只读请求统一附带 CSRF + Idempotency-Key。
+  // 幂等键由每次用户操作生成；真正的“同一次重试”应复用上层传入的业务语义，而不是重复点击。
   if (!['GET', 'HEAD'].includes(method)) {
     if (!csrf) await refreshCsrf()
     headers[csrfHeader] = csrf
@@ -23,6 +28,7 @@ export async function api(path: string, method = 'GET', body?: unknown): Promise
   let data: any
   try { data = text ? JSON.parse(text) : {} } catch { throw new ApiError(response.status, 'INVALID_RESPONSE', '后端返回了无法解析的响应') }
   if (!response.ok) {
+    // 401 通过全局事件通知 App 统一回到登录态，而不是每个页面各自处理。
     if (response.status === 401) window.dispatchEvent(new Event('auth-expired'))
     throw new ApiError(response.status, data.code || 'HTTP_' + response.status, data.message || response.statusText)
   }
