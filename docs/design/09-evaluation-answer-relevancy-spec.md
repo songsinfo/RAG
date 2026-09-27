@@ -28,7 +28,7 @@
 
 现有 expected.status 映射为 ANSWER/PARTIAL/ABSTAIN/CONFLICT。不能因为参考 facts 或 claims 为空就跳过 Relevancy 或有充分规则的拒答题。
 
-保持 persona、租户与来源可读性检查，历史答案和证据也必须在可读范围内；复用 qa_run 引用，不在报告额外复制未经权限核验的原文。题目、正文、历史和证据全部视为不可信数据。
+保持 persona、租户与来源可读性检查，历史答案和证据也必须在可读范围内。每个将被放入 `conversationContext` 的历史 QA run 在发送 Judge 前重新执行 `assert_run_sources_readable()`；任一来源撤权、快照变化或生效构建变化均失败关闭。复用 qa_run 引用，不在报告额外复制未经权限核验的原文。题目、正文、历史和证据全部视为不可信数据。
 
 输入超限不得静默截断后报告完整评估：该结果记 UNDETERMINED，原因 INPUT_TOO_LARGE。正文缺失与空白正文区分：缺失为无法评估；确实输出空白且任务要求回应则为失败。
 
@@ -96,7 +96,7 @@ rubric 升级为 `full-answer-and-relevance-v2`，manifest 增加 inputContractV
 
 新增自动/人工 confusion matrix、原始一致率与比较样本数；对 correctness 明确正类为 CORRECT：FPR=人工非 CORRECT 但自动 CORRECT 数/人工非 CORRECT 且自动有判定数，FNR 反之。任一方 UNDETERMINED 的样本单列并报告比较覆盖率，不混入二值分母。Relevancy 报类别混淆矩阵；缺少人工标签不参与该维度比较。空分母为 null。
 
-人工初标时隐藏自动 verdict/reason，完成后才展示差异，以降低锚定偏差。演示 fixture 标记为 synthetic，机器生成标签不冒充人工 Gold。
+当前实现保证人工复核编辑器不预填自动 verdict/reason，并从空 `labels: {}` 开始，因此只提交人工明确修改的维度，不会误覆盖其他维度。评估列表仍可看到 effective/自动结果，所以尚未实现严格意义上的盲评隐藏；若需要降低锚定偏差，应后续增加独立的 blind-review UI。演示 fixture 标记为 synthetic，机器生成标签不冒充人工 Gold。
 
 API、导出与现有评估页面使用同一聚合结果，显示新维度、未知原因、自动/人工差异、口径和版本。不新建 dashboard。人工验证与真实模型运行是单独验收环节；mock 测试通过不等于 Judge 已校准。
 
