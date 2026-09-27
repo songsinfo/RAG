@@ -1,3 +1,9 @@
+"""检索配置的解析、边界约束与发布态加载。
+
+这里的目标不是“尽量接受任意配置”，而是把 API/数据库中的松散 JSON
+收敛成一个稳定的 RetrievalConfig。后续检索流水线只依赖这个强约束对象，
+避免每个阶段重复判断缺省值、非法范围和不支持的策略组合。
+"""
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -13,6 +19,7 @@ VALID_RETRIEVAL_MODES = {"DENSE", "BM25", "HYBRID"}
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """把整数配置限制在安全范围内，异常输入退回默认值。"""
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -21,6 +28,7 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 def _as_bool(value: Any, default: bool) -> bool:
+    """兼容 bool / 字符串 / 数字形式的开关配置。"""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -32,6 +40,10 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class RetrievalConfig:
+    """运行时使用的强类型检索配置。
+
+    API payload 可以缺字段，但进入 Pipeline 前必须已经补齐默认值并通过组合校验。
+    """
     config_id: str
     mode: str = "HYBRID"
     dense_top_k: int = 30
@@ -59,6 +71,7 @@ class RetrievalConfig:
 
     @classmethod
     def from_payload(cls, config_id: str, payload: Optional[Dict[str, Any]]) -> "RetrievalConfig":
+        """把外部 JSON 配置转换成稳定的运行时对象。"""
         root = payload if isinstance(payload, dict) else {}
         retrieval = root.get("retrieval") if isinstance(root.get("retrieval"), dict) else root
         rerank = root.get("rerank") if isinstance(root.get("rerank"), dict) else {}
@@ -152,6 +165,7 @@ class RetrievalConfig:
 
 
 def _validate_config(config: RetrievalConfig, status_code: int = 400) -> RetrievalConfig:
+    """校验“单字段合法”之外的策略组合约束。"""
     if config.mode not in VALID_RETRIEVAL_MODES:
         raise ApiException(status_code, "INVALID_CONFIG", f"不支持的检索模式: {config.mode}")
     if config.mode == "DENSE" and config.dense_top_k <= 0:
@@ -179,7 +193,9 @@ def _validate_config(config: RetrievalConfig, status_code: int = 400) -> Retriev
 
 
 def load_retrieval_config(tenant_id: str, config_id: Optional[str]) -> RetrievalConfig:
+    """从已发布配置中加载检索策略；没有显式 ID 时读取默认配置。"""
     effective_id = config_id or DEFAULT_RETRIEVAL_CONFIG_ID
+    # 只加载当前租户自己的配置，不能跨租户复用配置 ID。
     with get_db_connection() as conn:
         row = conn.execute(
             select(
@@ -211,6 +227,7 @@ def load_retrieval_config(tenant_id: str, config_id: Optional[str]) -> Retrieval
 
 
 def validate_retrieval_payload(payload: Dict[str, Any]) -> RetrievalConfig:
+    """仅校验一段候选 payload，不访问数据库；评估/配置保存前可复用。"""
     if not isinstance(payload, dict):
         raise ApiException(400, "INVALID_CONFIG", "检索配置必须是 JSON 对象")
     return _validate_config(RetrievalConfig.from_payload("validation", payload))
