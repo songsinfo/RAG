@@ -124,7 +124,7 @@ def parse_verdicts(raw, facts, claims):
     }
 
 
-def parse_full_answer_verdicts(raw, facts, claims, expectation):
+def parse_full_answer_verdicts(raw, facts, claims, expectation, expected=None):
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("Invalid judge payload")
@@ -145,7 +145,14 @@ def parse_full_answer_verdicts(raw, facts, claims, expectation):
         or assessment["verdict"] == "VIOLATED"
         or (expectation == "ANSWER" and "MISSING" in fs)
     )
-    insufficient_gold = expectation in {"ANSWER", "PARTIAL"} and not facts
+    expected = expected if isinstance(expected, dict) else {}
+    abstain_reason = str(expected.get("abstainReason") or "").strip()
+    conflict_basis = bool(facts or expected.get("conflictPoints") or expected.get("evidenceGroups"))
+    insufficient_gold = (
+        (expectation in {"ANSWER", "PARTIAL"} and not facts)
+        or (expectation == "ABSTAIN" and not abstain_reason)
+        or (expectation == "CONFLICT" and not conflict_basis)
+    )
     extraction_gap = expectation != "ABSTAIN" and bool(facts) and not claims
     uncertain = (
         "UNCERTAIN" in fs
@@ -328,4 +335,4 @@ def judge_answer(
             {"role": "user", "content": serialized},
         ],
     )
-    return parse_full_answer_verdicts(raw, facts, claims, expectation)
+    return parse_full_answer_verdicts(raw, facts, claims, expectation, expected)
