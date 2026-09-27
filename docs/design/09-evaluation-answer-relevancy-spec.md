@@ -71,7 +71,7 @@
 |---|---|
 | ANSWER | 回答全部必需事实，事实与引用支持通过，正文/claims 对齐，无明确错误 |
 | PARTIAL | 回答可确认部分并说明信息边界；按题目给定的必需事实和限制判定，不将正确的部分回答一律判失败 |
-| ABSTAIN | 符合 Gold 的不可答原因，说明无法回答且不编造；不能仅凭 NO_EVIDENCE 状态判成功 |
+| ABSTAIN | 符合 Gold 的不可答原因，说明无法回答且不编造；机器判定 CORRECT 前必须有非空 `expected.abstainReason`，不能仅凭 NO_EVIDENCE 状态判成功 |
 | CONFLICT | 按 Gold 指出冲突来源或相互矛盾的主张，不擅自编造唯一结论 |
 
 Gold 缺少足够评分依据时，expectationAssessment 为 UNCERTAIN，综合结果保持 UNDETERMINED。拒答没有事实性断言时 faithfulness=null（不适用），不能填 1；题型规则和充分人工 Gold 仍可支持该题 CORRECT。
