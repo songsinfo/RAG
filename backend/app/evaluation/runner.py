@@ -40,7 +40,14 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
-from app.evaluation.judge import (\n    judge_answer, RUBRIC_VERSION, LEGACY_RUBRIC_VERSION, INPUT_CONTRACT_VERSION,\n    EVALUATION_SCOPE, RELEVANCE_POLICY,\n)
+from app.evaluation.judge import (
+    judge_answer,
+    RUBRIC_VERSION,
+    LEGACY_RUBRIC_VERSION,
+    INPUT_CONTRACT_VERSION,
+    EVALUATION_SCOPE,
+    RELEVANCE_POLICY,
+)
 from app.model_budget import BudgetService
 
 
