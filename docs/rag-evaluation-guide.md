@@ -6,7 +6,7 @@
 
 若要先理解上传、解析、检索、普通 RAG 和 Agent 如何串起来，请从[项目源码导读](source-walkthrough.md)开始，再回到本文学习评估。
 
-**实现核对基线：2026-09-22，`main` 分支。** 本文依据代码与现有测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
+**实现核对基线：2026-09-27，`docs/evaluation-answer-relevancy-spec` 分支。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
 
 ## 目录
 
@@ -254,18 +254,21 @@ LLM 评审应输入问题、必需事实、实际断言和引用证据，并输�
 
 终态不匹配判为 `WRONG`；匹配时只是具备继续评估语义的条件。HUMAN 模式保留 `UNDETERMINED`，等待人工复核。
 
-LLM 模式在状态检查通过后调用 `judge-main`，使用 `fact-and-support-v1` 规则：
+新运行在状态检查通过后调用 `judge-main`，使用 `full-answer-and-relevance-v2`。输入不再只有 claims/evidence，而是同时包含用户实际看到的 `answerText`、最后问题、真实多轮 `conversationContext`、题型 expectation、标准事实、claims 与 evidence。评分范围固定为 `FINAL_TURN_WITH_HISTORY`：历史用于理解指代和约束，只评分最后一轮回答。
+
+v2 一次调用同时返回：
 
 - 每个标准事实：`COVERED / MISSING / CONTRADICTED / UNCERTAIN`。
 - 每个回答断言：`SUPPORTED / UNSUPPORTED / UNCERTAIN`。
-- 出现事实矛盾或不受支持的断言，判为 `WRONG`。
-- 没有标准事实、没有断言，或仍有不确定项，保留 `UNDETERMINED`。
-- 全部事实覆盖且所有断言支持，判为 `CORRECT`。
-- 只覆盖部分事实且其余条件满足，判为 `PARTIAL`；完全未覆盖则为 `WRONG`。
+- `answerRelevance`：`ON_TOPIC / PARTLY_OFF_TOPIC / OFF_TOPIC / UNCERTAIN`。
+- `claimAlignment`：`ALIGNED / MISMATCH / UNCERTAIN`，用于检查正文与 claims 双向一致。
+- `expectationAssessment`：`SATISFIED / VIOLATED / UNCERTAIN`，按 ANSWER / PARTIAL / ABSTAIN / CONFLICT 的 Gold 规则判断。
 
-格式错误、缺项、重复索引或调用异常不能变成通过。拒答题往往没有可评事实或断言，即使终态符合预期，也可能仍需人工复核。
+Relevancy 是 **OBSERVE_ONLY**：它独立展示，不会因为“切题”而抬高 correctness，也不会因为“偏题”直接覆盖已有事实证据。正文与 claims 不一致时，如果没有足够证据证明业务答案本身错误，综合结果保持 `UNDETERMINED` 并进入人工复核；已有明确矛盾、无依据断言或题型违反仍判 `WRONG`。拒答没有事实性 claims 时 `faithfulness=null`，不会伪造满分。
 
-当前语义裁判使用结构化 `claims` 和 `evidence`，并不另做一遍所有展示文本的独立审查。使用裁判结果前，应保证用户可见的事实断言已完整进入 `claims`。
+缺失正文与空白正文分开处理：字段缺失表示无法完整评估，记 `UNDETERMINED / MISSING_ANSWER_TEXT`；确实输出空白且任务要求回应时记失败。输入超过 Judge 上限时记 `UNDETERMINED / INPUT_TOO_LARGE`，不会静默截断后冒充完整评估。
+
+旧运行继续依据其 manifest 中的 `rubricVersion=fact-and-support-v1` 走 v1 兼容路径；新运行写入 `inputContractVersion=full-answer-v2`、`evaluationScope=FINAL_TURN_WITH_HISTORY` 与 `relevancePolicy=OBSERVE_ONLY`。不同 rubric / 输入契约不应作为同条件实验直接比较。
 
 ### 4.4 人工复核怎么保留历史
 
@@ -445,13 +448,16 @@ if ($LASTEXITCODE -ne 0) { throw '评估报告未通过质量门禁' }
 
 ### 8.1 成功率必须同时看分母
 
-当前汇总口径：
+当前汇总同时给出“已判定子集”和“全计划”两种口径：
 
 ```text
-taskSuccessRate = 成功结果数 / 有明确成功或失败判定的结果数
-judgmentCoverage = 有明确成功或失败判定的结果数 / 全部计划结果数
-完成覆盖率（自行计算）= completed / planned
+taskSuccessRate = successful / judged
+plannedTaskSuccessRate = successful / planned
+judgmentCoverage = judged / planned
+completionCoverage = completed / planned
 ```
+
+其中 `executionFailed`、`pending` 是执行轴；`unknown` 是语义判定轴。两类计数不能直接相加解释成同一种失败。
 
 这里“结果数”包括重复运行。例如 20 道题、每道重复 3 次，计划结果为 60，不是 20 个独立问题。
 
@@ -468,7 +474,7 @@ judgmentCoverage = 20%
 
 90% 只描述已判定子集，不能声称整个系统在 100 道题上有 90% 成功率。18% 表示当前已确认的成功占比，也不能把剩下 80 个未知结果全部解释为已证实错误。
 
-设计文档中“成功数 / 全计划数”的任务成功定义，与当前 API 的 `taskSuccessRate` 不同。读取现有报告应以当前代码口径为准，并同时展示覆盖率。
+因此 API 保留兼容字段 `taskSuccessRate`，同时新增 `plannedTaskSuccessRate`。界面会明确标注前者是“已判定样本成功率”，后者才是“成功数 / 全计划数”。
 
 ### 8.2 其他字段的读法
 
@@ -574,7 +580,7 @@ Agent 可以决定检索什么、是否继续搜索、何时停止。多轮检�
 
 当前报告包含 `avgAgentTurns`、`avgAgentToolCalls`、`avgAgentTokens`、`agentTimeoutRate` 等轨迹摘要。它们用于解释代价，不能仅凭轮数较多就判断推理更深入。尤其不要把模型调用数直接等同于用户对话轮数。
 
-当前执行器只使用 `question.text`，没有时取 `turns` 的第一条文本提交一次 QA。能够保存多轮字段不表示已经完整重放多轮会话；需要额外执行与验证才能声称测过追问能力。
+当前 RAG / AGENT 评估会按 `question.turns` 逐轮提交真实 QA，并复用同一 conversation。v2 Judge 从实际持久化的 qa_run 中重建“用户问题 + 历史助手回答”，最后助手回答单独作为 `answerText` 评分，因此不会用测试题文本伪造历史。报告仍只评分最后一轮，不能把它解释成逐轮会话质量分。
 
 ### 11.2 上线后怎样形成闭环
 
@@ -592,7 +598,7 @@ Agent 可以决定检索什么、是否继续搜索、何时停止。多轮检�
 | --- | --- | --- |
 | 题集 | 版本、导入、标注状态、冻结、锚点校验 | 所有候选题均经业务人工审核 |
 | 检索评分 | 文档+版本+引文匹配，Hit/Recall/MRR/nDCG | 全阶段上下文覆盖、完整候选池分级均已完成 |
-| 回答评分 | 状态检查、可选 LLM 事实与支持判定、人工复核 | 裁判已在真实业务金标准上充分校准 |
+| 回答评分 | 完整正文 v2 Judge、事实/支持、Relevancy、claim 对齐、题型判断、人工复核 | 裁判已在真实业务金标准上充分校准 |
 | 费用 | 区分已知和未知费用，排除 fixed 占位价 | 已完成供应商账单对账与绝对硬预算保证 |
 | 快照 | 记录来源与 build，启动前检查变化 | 运行中语料与 QA 检索范围已完全锁定 |
 | 身份 | RAG 按 loginName 查用户并设置非管理员 Actor | 缺失用户必然失败关闭；检索模式也按 persona 执行 |
