@@ -1,3 +1,16 @@
+"""评估执行器。
+
+负责把“冻结题集 + 冻结语料快照 + 已发布检索配置”执行成一组可复现结果：
+- estimate：校验运行条件并估算最坏费用；
+- start：创建 eval_run、durable EVALUATE job 和全部 PENDING 结果；
+- _execute_run：逐题执行 Retrieval / RAG / Agent；
+- Judge：按版本化 rubric 评分完整用户可见答案；
+- aggregate：把执行状态、语义判定、人工复核、成本和检索指标汇总；
+- compare/export：保证不同实验只有在 manifest 可比时才直接对照。
+
+核心原则是“计划分母不能消失”：任务启动时先创建全部结果行，因此未运行、失败、
+取消、未知都能进入最终报告，而不是只统计成功返回的题。
+"""
 import hashlib
 import json
 import logging
@@ -91,10 +104,11 @@ def number(v: Any) -> float:
 
 
 class EvaluationRunner:
-    """Evaluation job execution, metric computation, ablation comparison and baseline diff service."""
+    """评估任务执行、指标计算、人工校准、导出与实验对比服务。"""
 
     @staticmethod
     def estimate(actor: Actor, body: Dict[str, Any]) -> Dict[str, Any]:
+        """只做校验和费用估算，不产生真实模型调用。"""
         EvaluationCatalog.require_admin(actor)
 
         dataset_ver_id = str(body.get("datasetVersionId", "")).strip()
@@ -115,9 +129,11 @@ class EvaluationRunner:
             ).first()
             if not ds:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "题集版本不存在")
+            # 评估只允许使用冻结题集；否则同一 run 的 Gold 可能在执行中被修改。
             if ds.status != "FROZEN":
                 raise ApiException(409, "DATASET_NOT_FROZEN", "先冻结题集")
 
+            # 启动前确认语料快照仍与当前 active build/security epoch 一致。
             EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
 
             cfg = conn.execute(
@@ -149,6 +165,7 @@ class EvaluationRunner:
                 raise ApiException(400, "INVALID_INPUT", "评估模式无效")
 
             cfg_payload = obj(cfg.payload)
+            # RETRIEVAL_ONLY 必须严格保证配置不会触发 embedding/rerank/rewrite 等模型调用。
             if mode == "RETRIEVAL_ONLY":
                 check_no_model(cfg_payload)
 
@@ -165,6 +182,7 @@ class EvaluationRunner:
             if not cases_rows:
                 raise ApiException(409, "EMPTY_SPLIT", "所选分区无题目")
 
+            # 费用估算按“实际要执行的 turn 数”计算，多轮题不能只按题数估算。
             turns = 0
             for c in cases_rows:
                 q = obj(c.question_json)
@@ -191,6 +209,8 @@ class EvaluationRunner:
                     BudgetService.pricing(actor.tenant_id, alias)
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
+                # v2 Judge 会看到完整最终答案和真实历史，因此 Judge 预算比旧 claims-only 更保守。
+                # 这里是启动上限估算，不是供应商账单。
                 # v2 Judge sees the complete final answer plus actual conversation history.
                 # Keep this conservative: answer/retrieval work plus one larger semantic Judge payload.
                 input_tokens = total_turns * 30000 + total_questions * 42000
@@ -217,16 +237,19 @@ class EvaluationRunner:
                 "costStatus": cost_status,
                 "retrievalConfig": cfg_payload,
             }
+            # estimateId 把本次估算参数做内容哈希；start 时可检测估算后参数是否被改过。
             estimate_dict["estimateId"] = hash_payload(estimate_dict).hex()
             return estimate_dict
 
     @staticmethod
     def start(actor: Actor, body: Dict[str, Any], idempotency_key: str) -> Dict[str, Any]:
+        """持久化一轮评估；生产环境不在 HTTP 请求里直接跑完整实验。"""
         EvaluationCatalog.require_admin(actor)
         if not idempotency_key or len(idempotency_key) > 128:
             raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "需要有效Idempotency-Key")
 
         est = EvaluationRunner.estimate(actor, body)
+        # 用户确认费用后再启动；如果题集/配置/参数变化导致 estimateId 改变，强制重新确认。
         if "estimateId" in body and str(body.get("estimateId")) != est["estimateId"]:
             raise ApiException(409, "ESTIMATE_CHANGED", "估算已变化，请重新估算")
 
@@ -240,6 +263,7 @@ class EvaluationRunner:
         if est.get("estimatedCostCny") is None:
             raise ApiException(409, "MODEL_PRICING_NOT_CONFIGURED", "价格未知不能启动付费评估，可先运行RETRIEVAL_ONLY")
 
+        # 先用最坏估算做批次硬门槛，真实每次模型调用还会经过 BudgetService.reserve。
         if number(est["estimatedCostCny"]) > cap:
             raise ApiException(429, "BATCH_BUDGET_EXCEEDED", "按最坏输入输出估算超过批次限额")
 
@@ -248,6 +272,7 @@ class EvaluationRunner:
         run_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
 
+        # manifest 是这轮实验的“不可变解释上下文”，后续报告/比较都以它为准。
         manifest = dict(est)
         manifest["maxCostCny"] = cap
         manifest["maxModelCalls"] = max_model_calls
@@ -340,6 +365,7 @@ class EvaluationRunner:
                     )
             conn.commit()
 
+        # 测试环境同步执行仅为了测试便利；生产由 DurableJobWorker 领取 EVALUATE job。
         if is_test_env():
             EvaluationRunner._execute_run(actor, run_id)
 
@@ -349,7 +375,7 @@ class EvaluationRunner:
 
     @staticmethod
     def _execute_run(actor: Actor, run_id: str):
-        """Asynchronous execution of all cases in an eval run."""
+        """异步逐题执行；每个 case×repeat 都对应预先存在的一行 eval_result。"""
         from app.retrieval.pipeline import RetrievalPipeline
         from app.qa.service import QaService
 
@@ -394,6 +420,7 @@ class EvaluationRunner:
                 eval_snapshot_table.c.tenant_id == actor.tenant_id,
                 eval_snapshot_table.c.id == snapshot_id,
             ))).scalar())
+            # 将冻结快照的 document/build 列表下传给 QA，保证评估不会检索到运行后新发布的内容。
             evaluation_scope = {"snapshotId": snapshot_id, "evalRunId": run_id,
                                 "documents": snapshot_manifest.get("documents", [])}
 
@@ -408,6 +435,7 @@ class EvaluationRunner:
             ).fetchall()
 
         for res in pending_results:
+            # 每题开始前都检查取消；已经完成的结果保留，未开始题仍留在计划分母。
             # Check if cancelled
             with get_db_connection() as conn:
                 curr_run = conn.execute(
@@ -443,6 +471,7 @@ class EvaluationRunner:
 
             start_t = time.perf_counter()
             try:
+                # 每题开始前重新检查快照；长时间评估中间发生文档/权限变化时立即失败关闭。
                 EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
                 persona_actor = EvaluationRunner._persona(actor, c_dict)
             except ApiException as exc:
@@ -450,6 +479,7 @@ class EvaluationRunner:
                     {"taskSuccess": False, "costCny": None}, {"error": exc.code}, error_code=exc.code)
                 continue
 
+            # 纯检索模式不执行 QA 生成，因此 correctness 不冒充为回答质量。
             if mode in {"RETRIEVAL_ONLY", "RETRIEVAL_PIPELINE"}:
                 try:
                     if len(turns) > 1:
@@ -475,6 +505,7 @@ class EvaluationRunner:
                     metric["retrievalConfig"] = retrieval["config"]
                     hit_val = metric.get("hit")
                     exp_status = expected_obj.get("status", "ANSWER")
+                    # 对应拒答题，仅凭“检索是否命中”无法证明拒答正确，所以 taskSuccess 保持未知。
                     if exp_status == "ABSTAIN":
                         metric["taskSuccess"] = None
                     else:
@@ -491,7 +522,7 @@ class EvaluationRunner:
                         actor, result_id, "FAILED", fail_metric, {"error": str(e)}, error_code="RETRIEVAL_FAILED"
                     )
             else:
-                # Full RAG mode via production QaService
+                # RAG/AGENT 评估直接复用生产 QaService，避免评估实现另一套“看起来相似”的 RAG。
                 try:
                     qa_detail, qa_run_ids = EvaluationRunner._run_qa_turns(
                         actor, persona_actor, run_id, result_id, c_dict, manifest, evaluation_scope,
@@ -509,7 +540,7 @@ class EvaluationRunner:
                     metrics["terminalStatus"] = status_str
                     metrics["executedTurns"] = len(qa_run_ids)
 
-                    # Match expectation
+                    # 先检查终态是否符合题型预期；终态匹配只代表“有资格继续语义评分”。
                     exp_status = expected_obj.get("status", "ANSWER")
                     status_matches = (
                         (exp_status == "ABSTAIN" and status_str == "NO_EVIDENCE") or
@@ -519,6 +550,8 @@ class EvaluationRunner:
                     )
                     metrics["statusMatch"] = status_matches
 
+                    # 状态/检索命中无法证明语义正确：
+                    # HUMAN 模式保持 UNDETERMINED；LLM 模式才进入完整答案 Judge。
                     # LLM judge or deterministic evaluation
                     # Retrieval and output status cannot establish semantic correctness.
                     correctness = "UNDETERMINED" if is_terminal_success and status_matches else "WRONG"
@@ -537,11 +570,13 @@ class EvaluationRunner:
                     if correctness == "UNDETERMINED" and manifest.get("judgeMode") == "LLM":
                         try:
                             from app.qa.context import assert_run_sources_readable
+                            # Judge 之前重校验最终 run 来源；历史 run 在 _judge_conversation_context 内逐个再校验。
                             assert_run_sources_readable(persona_actor, qa_run_id)
                             judge_rubric = str(manifest.get("rubricVersion") or LEGACY_RUBRIC_VERSION)
                             judge_contract = str(manifest.get("inputContractVersion") or INPUT_CONTRACT_VERSION)
                             answer_present = "answer" in qa_detail
                             answer_text = qa_detail.get("answer") if answer_present else None
+                            # 只使用真实执行产生的历史问答，不用测试题 turns 伪造助手回答。
                             conversation_context = EvaluationRunner._judge_conversation_context(
                                 persona_actor, qa_run_ids
                             )
@@ -561,9 +596,11 @@ class EvaluationRunner:
                             assert_run_sources_readable(persona_actor, qa_run_id)
                             correctness = judge_obj["correctness"]
                         except Exception as exc:
+                            # Judge 失败属于“无法确定”，绝不能把评估系统故障记成业务答案 WRONG。
                             judge_obj["judgeError"] = type(exc).__name__
                             judge_obj["correctness"] = "UNDETERMINED"
                     metrics["correctness"] = correctness
+                    # 只有 CORRECT=True；PARTIAL/WRONG=False；UNDETERMINED=None，保留三态语义。
                     metrics["taskSuccess"] = correctness == "CORRECT" if correctness != "UNDETERMINED" else None
                     with get_db_connection() as conn:
                         calls = conn.execute(select(model_call_table.c.settled_amount, model_call_table.c.pricing_snapshot).where(and_(
@@ -728,6 +765,7 @@ class EvaluationRunner:
 
     @staticmethod
     def _judge_conversation_context(persona: Actor, qa_run_ids: List[str]) -> List[Dict[str, str]]:
+        """构造 Judge 使用的真实历史；最后助手回答单独作为 answerText，不在历史里重复。"""
         """Build the exact prior user/assistant history plus the final user turn.
 
         The final assistant answer is scored separately as answerText and is therefore not duplicated here.
@@ -735,6 +773,8 @@ class EvaluationRunner:
         if not qa_run_ids:
             return []
 
+        # 历史正文即将再次发送给外部 Judge，因此每个历史 run 都重新做当前权限/快照校验。
+        # 任一来源撤权都直接失败关闭。
         # History is about to be re-sent to an external Judge. Revalidate every
         # contributing QA run at send time so revoked/changed sources fail closed.
         from app.qa.context import assert_run_sources_readable
@@ -762,6 +802,7 @@ class EvaluationRunner:
             question = str(row.question or "").strip()
             if question:
                 messages.append({"role": "user", "content": question})
+            # 最后一轮只放 user question；最后 assistant answer 由 answerText 单独评分，避免重复输入。
             if index < len(qa_run_ids) - 1:
                 result = obj(row.result_json)
                 if "answer" in result:
@@ -807,6 +848,7 @@ class EvaluationRunner:
         ranked_hits: List[Dict[str, Any]],
         evidence_list: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """把 Gold evidenceGroups 与最终 ranked canonical hits 做事实组级匹配。"""
         expected = obj(c_dict.get("expected"))
         gold_groups_raw = maps(expected.get("evidenceGroups"))
 
@@ -816,6 +858,7 @@ class EvaluationRunner:
         anchor_groups: Dict[str, int] = {}
         anchor_grades: Dict[str, int] = {}
 
+        # 一个 Gold fact group 可以有多个可替代来源；命中任意一个都算覆盖该事实组。
         for g_idx, grp in enumerate(gold_groups_raw):
             group_ids: Set[str] = set()
             max_grade = 0
@@ -830,6 +873,7 @@ class EvaluationRunner:
             groups.append(group_ids)
             ideal_grades.append(max_grade)
 
+        # 逐 rank 匹配 anchor，同时记录 relevance grade 供 nDCG 使用。
         # Ranked hits matching against anchors
         ranked: List[Set[str]] = []
         ranked_grades: List[int] = []
@@ -912,7 +956,7 @@ class EvaluationRunner:
 
     @staticmethod
     def aggregate(actor: Actor, run_id: str) -> Dict[str, Any]:
-        """Aggregate execution, semantic, relevance, calibration, retrieval, latency, and cost metrics."""
+        """统一汇总执行、语义、Relevancy、人工校准、检索、延迟和成本指标。"""
         with get_db_connection() as conn:
             rows = conn.execute(
                 select(eval_result_table).where(
@@ -937,7 +981,8 @@ class EvaluationRunner:
                     )).order_by(eval_review_table.c.created_at.asc(), eval_review_table.c.id.asc())
                 ).fetchall()
 
-        # Reviews are append-only and may cover only one dimension. Merge the newest value per dimension.
+        # review 是 append-only，而且一次可能只提交一个维度。
+        # 因此必须“按维度取最新值”，不能拿最新一条 review 整体覆盖旧人工标签。
         latest_reviews: Dict[str, Dict[str, str]] = {}
         reviewed_result_ids: Set[str] = set()
         for review in reviews:
@@ -1008,6 +1053,8 @@ class EvaluationRunner:
                 reviewed_correct += int(human_correctness == "CORRECT")
 
             if semantic_mode:
+                # 执行状态和语义判定是两个正交轴：
+                # FAILED/PENDING 不是语义 WRONG，只能记为未获得语义判定。
                 # Execution and semantic judgment are separate axes. A failed/pending execution
                 # cannot become a semantic WRONG merely because an error path stored taskSuccess=False.
                 if str(r.status) == "COMPLETED" and isinstance(m.get("taskSuccess"), bool):
@@ -1041,6 +1088,7 @@ class EvaluationRunner:
                 final_relevance_counts[final_rel] += 1
                 relevance_assessed += 1
 
+            # 成本未知时只累计已知部分 knownCostCny，同时 unknownCostCases +1；不能把未知补 0。
             cost = m.get("costCny")
             if isinstance(cost, (int, float)):
                 known_cost += cost
@@ -1071,6 +1119,7 @@ class EvaluationRunner:
         p50 = EvaluationMetrics.percentile(durations, 0.5) if durations else None
         p95 = EvaluationMetrics.percentile(durations, 0.95) if durations else None
 
+        # 自动 Judge 与人工标签的校准只在双方都有可比较标签的样本上计算。
         correctness_calibration = EvaluationMetrics.correctness_calibration(correctness_pairs)
         correctness_calibration["humanLabeled"] = human_correctness_labels
         correctness_calibration["comparisonCoverage"] = EvaluationMetrics.ratio(
@@ -1110,7 +1159,8 @@ class EvaluationRunner:
             "pending": pending,
             "notCompleted": total - completed - failed,
             "completionCoverage": EvaluationMetrics.ratio(completed, total),
-            # Backward-compatible denominator: only already-judged results.
+            # 兼容旧字段：taskSuccessRate 仍是 successful/judged；
+            # 新字段 plannedTaskSuccessRate 才是 successful/planned。
             "taskSuccessRate": EvaluationMetrics.ratio(success_count, judged),
             "plannedTaskSuccessRate": (
                 EvaluationMetrics.ratio(success_count, total) if semantic_mode else None
@@ -1296,12 +1346,14 @@ class EvaluationRunner:
 
     @staticmethod
     def review(actor: Actor, result_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """追加人工复核；只保存本次明确提交的维度，不覆盖未修改维度。"""
         EvaluationCatalog.require_admin(actor)
         labels = body.get("labels") if isinstance(body.get("labels"), dict) else {"correctness": body.get("label")}
         allowed_correctness = {"CORRECT", "PARTIAL", "WRONG", "UNDETERMINED"}
         allowed_relevance = {"ON_TOPIC", "PARTLY_OFF_TOPIC", "OFF_TOPIC", "UNCERTAIN"}
         allowed_expectation = {"SATISFIED", "VIOLATED", "UNCERTAIN"}
 
+        # labels={} 是合法的编辑器初始形态，但保存时必须至少有一个明确维度。
         normalized: Dict[str, str] = {}
         if labels.get("correctness") is not None:
             value = str(labels.get("correctness")).strip().upper()
@@ -1334,6 +1386,7 @@ class EvaluationRunner:
             if not res:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "结果不存在")
 
+            # 人工复核不 UPDATE 旧记录，而是追加一条审计记录；aggregate 再按维度取最新值。
             conn.execute(
                 eval_review_table.insert().values(
                     tenant_id=actor.tenant_id,
@@ -1352,6 +1405,7 @@ class EvaluationRunner:
 
     @staticmethod
     def export_run(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """导出运行报告；REDACTED 默认不带逐题正文/证据内容。"""
         EvaluationCatalog.require_admin(actor)
         mode = str(body.get("mode", "REDACTED")).strip().upper()
         if mode not in {"REDACTED", "FULL"}:
@@ -1383,12 +1437,14 @@ class EvaluationRunner:
 
     @staticmethod
     def compare(actor: Actor, run_ids: List[str]) -> Dict[str, Any]:
+        """比较多次实验；只有关键 manifest 字段完全一致才标记 comparable。"""
         EvaluationCatalog.require_admin(actor)
         if len(run_ids) < 2 or len(run_ids) > 4:
             raise ApiException(400, "INVALID_INPUT", "选择2到4次实验")
 
         runs = [EvaluationRunner.get_run(actor, rid) for rid in run_ids]
         first_m = runs[0].get("manifest", {})
+        # 数据集、快照、模式、Judge 规则/输入契约等任何一项不同，都不能声称是同条件对照。
         comparison_fields = (
             "datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats",
             "environment", "judgeMode", "rubricVersion", "inputContractVersion",
