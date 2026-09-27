@@ -1,3 +1,9 @@
+"""Milvus 混合检索与索引访问层。
+
+同一个 canonical CHILD chunk 可以有 ORIGINAL / SUMMARY / QUESTION 多种 representation。
+这些 representation 是“多种检索入口”，不是三篇独立文档，因此最终必须回到 canonical chunk 去重和融合，
+否则一个 chunk 会因为拥有多个 representation 在 RRF 中重复投票。
+"""
 import hashlib
 import os
 import logging
@@ -20,6 +26,9 @@ COLLECTION_NAME = "rag_chunks"
 
 
 class MilvusHybridService:
+    """负责 collection 初始化、representation upsert、删除和 BM25/Dense/Hybrid 查询。"""
+
+    # 仅测试环境允许内存 mock；生产连接失败必须显式报错。
     # In-memory index fallback for local unit tests without requiring a running Milvus container
     _mock_store: Dict[str, Dict[str, Any]] = {}
     _client = None
@@ -41,6 +50,7 @@ class MilvusHybridService:
             try:
                 from pymilvus import MilvusClient
                 client = MilvusClient(uri=milvus_uri, timeout=3.0)
+                # collection 首次启动时创建：dense 用 HNSW+COSINE，sparse 由 Milvus BM25 Function 生成。
                 if not client.has_collection(COLLECTION_NAME):
                     fields = [
                         FieldSchema("id", DataType.VARCHAR, max_length=128, is_primary=True),
@@ -64,6 +74,7 @@ class MilvusHybridService:
                     )
                     schema = CollectionSchema(fields=fields, functions=[bm25_fn], auto_id=False, enable_dynamic_field=True)
                     index_params = client.prepare_index_params()
+                    # HNSW 的 M/efConstruction 是建索引参数；查询时 num_candidates 会映射到 ef。
                     index_params.add_index(
                         field_name="dense_vector",
                         index_type="HNSW",
@@ -112,6 +123,7 @@ class MilvusHybridService:
         batch_size = max(1, min(512, int(os.getenv("MILVUS_UPSERT_BATCH_SIZE", "128"))))
         client = cls.get_client()
 
+        # 每个 child 至少有 ORIGINAL；SUMMARY/QUESTION 是同一 child 的派生表示。
         representations = representations or {}
         items: List[Dict[str, Any]] = []
         for chunk in chunks:
@@ -136,6 +148,7 @@ class MilvusHybridService:
 
         for start in range(0, len(items), batch_size):
             batch = items[start:start + batch_size]
+            # 入库链路可能已经批量生成向量；这里只为缺失 representation 补 embedding，避免重复收费。
             missing_indexes = [i for i, item in enumerate(batch) if not item.get("dense_vector")]
             generated = []
             if missing_indexes:
@@ -271,6 +284,7 @@ class MilvusHybridService:
         job_id: Optional[str] = None,
         num_candidates: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # allowed_build_ids 已由权限层计算；为空时绝不能放宽为“搜索整个租户”。
         if not allowed_build_ids:
             return []
 
@@ -292,11 +306,13 @@ class MilvusHybridService:
         dense_top_k = 0 if dense_top_k is None and mode == "BM25" else (dense_top_k if dense_top_k is not None else 30)
         sparse_top_k = 0 if sparse_top_k is None and mode == "DENSE" else (sparse_top_k if sparse_top_k is not None else 30)
         fusion_top_k = fusion_top_k or 20
+        # Dense HNSW 的搜索宽度至少覆盖 top_k，并设置 1000 上限控制延迟。
         num_candidates = max(
             max(dense_top_k, sparse_top_k, 1),
             min(1000, int(num_candidates or 200)),
         )
 
+        # representation 只影响“如何命中”，下游会 hydrate 回 ORIGINAL 正文。
         representations = [str(value).upper() for value in (representations or ["ORIGINAL"])]
         if not representations or not set(representations).issubset({"ORIGINAL", "SUMMARY", "QUESTION"}):
             raise ApiException(409, "INVALID_RETRIEVAL_CONFIG", "representation 类型无效")
@@ -305,6 +321,7 @@ class MilvusHybridService:
         output_fields = ["kb_id", "document_id", "version_id", "build_id", "index_epoch", "chunk_id", "representation_type", "text_content"]
 
         def normalize_result(res):
+            """把 Milvus 返回结构统一成项目 hit，并在 canonical chunk 级去重。"""
             hits = []
             rows = res[0] if res and isinstance(res, list) and res and isinstance(res[0], list) else (res or [])
             for item in rows:
@@ -322,6 +339,7 @@ class MilvusHybridService:
                     "text": entity.get("text_content"),
                     "score": float(item.get("distance", item.get("score", 0.0)) or 0.0) if isinstance(item, dict) else 0.0,
                 })
+            # 同一 chunk 的 SUMMARY/QUESTION 可能同时命中；只保留该 route 中首次出现的 canonical chunk。
             deduped = []
             seen_chunks = set()
             for hit in hits:
@@ -335,6 +353,7 @@ class MilvusHybridService:
         client = cls.get_client()
         if client:
             try:
+                # 新 build 使用 index_epoch 精确过滤，防止同 buildId 的旧索引代次残留被命中。
                 if allowed_build_epochs:
                     grouped: Dict[int, List[str]] = {}
                     legacy_builds: List[str] = []
@@ -367,6 +386,7 @@ class MilvusHybridService:
                         f'and representation_type in [{rep_expr}]'
                     )
 
+                # DENSE：先为 query 生成 embedding，再做 COSINE HNSW 查询。
                 if mode == "DENSE":
                     query_emb = get_embeddings(
                         [query],
@@ -386,6 +406,7 @@ class MilvusHybridService:
                     )
                     return normalize_result(res)[:fusion_top_k]
 
+                # BM25：直接把原 query 交给 Milvus sparse/BM25 字段。
                 if mode == "BM25":
                     res = client.search(
                         collection_name=COLLECTION_NAME,
@@ -398,6 +419,9 @@ class MilvusHybridService:
                     )
                     return normalize_result(res)[:fusion_top_k]
 
+                # HYBRID 故意不使用 Milvus 内部 hybrid RRF：
+                # ORIGINAL/SUMMARY/QUESTION 若在去重前各算一票，同一个 chunk 会获得不公平的多重投票。
+                # 所以先分别搜索 → canonical chunk 去重 → 再在应用层 RRF。
                 # Fuse at canonical chunk level. Milvus-level hybrid RRF would
                 # treat ORIGINAL/SUMMARY/QUESTION as independent documents and let
                 # one chunk vote multiple times before deduplication.
