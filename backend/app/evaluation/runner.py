@@ -40,7 +40,7 @@ from app.models import (
 from app.evaluation.metrics import EvaluationMetrics
 from app.evaluation.catalog import EvaluationCatalog, obj, maps, hash_payload, case_view
 from app.retrieval.config import validate_retrieval_payload
-from app.evaluation.judge import judge_answer, RUBRIC_VERSION
+from app.evaluation.judge import (\n    judge_answer, RUBRIC_VERSION, LEGACY_RUBRIC_VERSION, INPUT_CONTRACT_VERSION,\n    EVALUATION_SCOPE, RELEVANCE_POLICY,\n)
 from app.model_budget import BudgetService
 
 
@@ -184,8 +184,10 @@ class EvaluationRunner:
                     BudgetService.pricing(actor.tenant_id, alias)
                 total_turns = turns * repeats
                 total_questions = len(cases_rows) * repeats
-                input_tokens = total_turns * 30000 + total_questions * 30000
-                output_tokens = total_turns * 6000 + total_questions * 1800
+                # v2 Judge sees the complete final answer plus actual conversation history.
+                # Keep this conservative: answer/retrieval work plus one larger semantic Judge payload.
+                input_tokens = total_turns * 30000 + total_questions * 42000
+                output_tokens = total_turns * 6000 + total_questions * 2800
                 ceiling = round((input_tokens * 0.00002 + output_tokens * 0.00006), 4)
                 cost_status = "ESTIMATE_NOT_BILL"
 
@@ -198,6 +200,9 @@ class EvaluationRunner:
                 "mode": mode,
                 "judgeMode": judge_mode,
                 "rubricVersion": RUBRIC_VERSION,
+                "inputContractVersion": INPUT_CONTRACT_VERSION,
+                "evaluationScope": EVALUATION_SCOPE,
+                "relevancePolicy": RELEVANCE_POLICY,
                 "strict": bool(body.get("strict", False)),
                 "plannedQuestions": len(cases_rows) * repeats,
                 "plannedTurns": turns * repeats,
@@ -526,7 +531,26 @@ class EvaluationRunner:
                         try:
                             from app.qa.context import assert_run_sources_readable
                             assert_run_sources_readable(persona_actor, qa_run_id)
-                            judge_obj.update(judge_answer(actor.tenant_id, qa_run_id, question_obj, expected_obj, qa_detail))
+                            judge_rubric = str(manifest.get("rubricVersion") or LEGACY_RUBRIC_VERSION)
+                            judge_contract = str(manifest.get("inputContractVersion") or INPUT_CONTRACT_VERSION)
+                            answer_present = "answer" in qa_detail
+                            answer_text = qa_detail.get("answer") if answer_present else None
+                            conversation_context = EvaluationRunner._judge_conversation_context(
+                                persona_actor, qa_run_ids
+                            )
+                            final_question = str(qa_detail.get("question") or question_text)
+                            judge_obj.update(judge_answer(
+                                actor.tenant_id,
+                                qa_run_id,
+                                final_question,
+                                expected_obj,
+                                qa_detail,
+                                answer_text=answer_text,
+                                answer_present=answer_present,
+                                conversation_context=conversation_context,
+                                rubric_version=judge_rubric,
+                                input_contract_version=judge_contract,
+                            ))
                             assert_run_sources_readable(persona_actor, qa_run_id)
                             correctness = judge_obj["correctness"]
                         except Exception as exc:
@@ -694,6 +718,42 @@ class EvaluationRunner:
             if detail.get("visibility") == "HIDDEN" or detail.get("status") in {"FAILED", "CANCELLED"}:
                 raise ApiException(409, "QA_EXECUTION_FAILED", "评测问答未成功完成")
         return detail, run_ids
+
+    @staticmethod
+    def _judge_conversation_context(persona: Actor, qa_run_ids: List[str]) -> List[Dict[str, str]]:
+        """Build the exact prior user/assistant history plus the final user turn.
+
+        The final assistant answer is scored separately as answerText and is therefore not duplicated here.
+        """
+        if not qa_run_ids:
+            return []
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                select(
+                    qa_run_table.c.id,
+                    qa_run_table.c.question,
+                    qa_run_table.c.result_json,
+                ).where(and_(
+                    qa_run_table.c.tenant_id == persona.tenant_id,
+                    qa_run_table.c.owner_id == persona.user_id,
+                    qa_run_table.c.id.in_(qa_run_ids),
+                ))
+            ).fetchall()
+        by_id = {str(r.id): r for r in rows}
+        messages: List[Dict[str, str]] = []
+        for index, rid in enumerate(qa_run_ids):
+            row = by_id.get(str(rid))
+            if not row:
+                continue
+            question = str(row.question or "").strip()
+            if question:
+                messages.append({"role": "user", "content": question})
+            if index < len(qa_run_ids) - 1:
+                result = obj(row.result_json)
+                if "answer" in result:
+                    answer = "" if result.get("answer") is None else str(result.get("answer"))
+                    messages.append({"role": "assistant", "content": answer})
+        return messages
 
     @staticmethod
     def _update_result(
@@ -1058,9 +1118,28 @@ class EvaluationRunner:
     def review(actor: Actor, result_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         EvaluationCatalog.require_admin(actor)
         labels = body.get("labels") if isinstance(body.get("labels"), dict) else {"correctness": body.get("label")}
-        correctness = labels.get("correctness")
-        if correctness not in {"CORRECT", "PARTIAL", "WRONG", "UNDETERMINED"}:
-            raise ApiException(400, "INVALID_INPUT", "人工正确性标签无效")
+        allowed_correctness = {"CORRECT", "PARTIAL", "WRONG", "UNDETERMINED"}
+        allowed_relevance = {"ON_TOPIC", "PARTLY_OFF_TOPIC", "OFF_TOPIC", "UNCERTAIN"}
+        allowed_expectation = {"SATISFIED", "VIOLATED", "UNCERTAIN"}
+
+        normalized: Dict[str, str] = {}
+        if labels.get("correctness") is not None:
+            value = str(labels.get("correctness")).strip().upper()
+            if value not in allowed_correctness:
+                raise ApiException(400, "INVALID_INPUT", "人工正确性标签无效")
+            normalized["correctness"] = value
+        if labels.get("answerRelevance") is not None:
+            value = str(labels.get("answerRelevance")).strip().upper()
+            if value not in allowed_relevance:
+                raise ApiException(400, "INVALID_INPUT", "人工 Answer Relevancy 标签无效")
+            normalized["answerRelevance"] = value
+        if labels.get("expectationAssessment") is not None:
+            value = str(labels.get("expectationAssessment")).strip().upper()
+            if value not in allowed_expectation:
+                raise ApiException(400, "INVALID_INPUT", "人工题型评价标签无效")
+            normalized["expectationAssessment"] = value
+        if not normalized:
+            raise ApiException(400, "INVALID_INPUT", "至少提交一个人工评估维度")
 
         reason = str(body.get("reason", "")).strip()
         now = datetime.now(timezone.utc)
@@ -1081,7 +1160,7 @@ class EvaluationRunner:
                     id=review_id,
                     result_id=result_id,
                     reviewer_id=actor.user_id,
-                    labels_json=labels,
+                    labels_json=normalized,
                     reason_text=reason,
                     created_at=now,
                     updated_at=now,
@@ -1089,7 +1168,7 @@ class EvaluationRunner:
             )
             conn.commit()
 
-        return {"reviewId": review_id}
+        return {"reviewId": review_id, "labels": normalized}
 
     @staticmethod
     def export_run(actor: Actor, run_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1130,7 +1209,11 @@ class EvaluationRunner:
 
         runs = [EvaluationRunner.get_run(actor, rid) for rid in run_ids]
         first_m = runs[0].get("manifest", {})
-        comparison_fields = ("datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats", "environment", "judgeMode", "rubricVersion")
+        comparison_fields = (
+            "datasetVersionId", "snapshotId", "split", "mode", "strict", "repeats",
+            "environment", "judgeMode", "rubricVersion", "inputContractVersion",
+            "evaluationScope", "relevancePolicy",
+        )
         differences = [key for key in comparison_fields if any(
             r.get("manifest", {}).get(key) != first_m.get(key) for r in runs
         )]
