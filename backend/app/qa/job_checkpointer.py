@@ -12,19 +12,22 @@ from app.models import job_table
 
 
 class JobCheckpointSaver(BaseCheckpointSaver):
-    """LangGraph checkpointer backed by the existing durable QA job JSON column.
+    """把 LangGraph checkpoint 存进现有 QA_RUN job.checkpoint JSON。
 
-    This intentionally implements LangGraph's official Checkpointer contract
-    instead of maintaining a parallel custom resume protocol.
+    这里直接实现 LangGraph 官方 Checkpointer 协议，而不是另造一套恢复机制。
+    checkpoint 写入与 DurableJob 使用同一个 lease_epoch fencing：
+    旧 worker 即使在进程恢复后“晚到”，也无法覆盖新 worker 已经推进的图状态。
     """
 
     _ROOT_KEY = "langgraph"
+    # 限制单个 run 的 checkpoint 历史数量，防止长 Agent 运行无限膨胀 job JSON。
     _MAX_HISTORY = 64
 
     @staticmethod
     def _cfg(
         config: RunnableConfig,
     ) -> tuple[str, str, str, Optional[str], Optional[str], Optional[int]]:
+        # thread_id 对应 qa_run_id；job_id + lease_epoch 只在真实 Worker 执行时携带。
         values = config.get("configurable", {})
         thread_id = str(values["thread_id"])
         tenant_id = str(values.get("tenant_id") or "")
@@ -71,6 +74,8 @@ class JobCheckpointSaver(BaseCheckpointSaver):
         ]
         if tenant_id:
             clauses.append(job_table.c.tenant_id == tenant_id)
+        # 有 worker lease 时必须严格匹配 RUNNING + epoch；
+        # HITL WAITING_APPROVAL 等脱离 worker 的读操作则走较宽松状态集合。
         if job_id is not None and lease_epoch is not None:
             clauses.extend([
                 job_table.c.id == job_id,
@@ -108,6 +113,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
 
         job_cp = dict(row.checkpoint or {})
         root = dict(job_cp.get(self._ROOT_KEY) or self._empty_root())
+        # 同一 namespace 可以有多个 checkpoint；无指定 checkpoint_id 时读取最新一个。
         checkpoints = [
             cp
             for cp in root.get("checkpoints", [])
@@ -122,6 +128,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
 
         cp_id = str(match["id"])
         writes_key = f"{checkpoint_ns}:{cp_id}"
+        # pending_writes 是 LangGraph 节点尚未并入 checkpoint 的 channel 写入，恢复时必须一并返回。
         pending = []
         for item in root.get("writes", {}).get(writes_key, []):
             pending.append(
@@ -228,6 +235,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
 
             job_cp = dict(row.checkpoint or {})
             root = dict(job_cp.get(self._ROOT_KEY) or self._empty_root())
+            # put 具备幂等性：相同 ns + checkpoint_id 先移除旧项再追加最新值。
             checkpoints = [
                 cp for cp in root.get("checkpoints", [])
                 if not (cp.get("id") == cp_id and str(cp.get("ns") or "") == checkpoint_ns)
@@ -242,6 +250,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
                     "createdAt": now.isoformat(),
                 }
             )
+            # 只保留最近历史；LangGraph 正常恢复只需要最新链路，不需要无限保存。
             if len(checkpoints) > self._MAX_HISTORY:
                 checkpoints = checkpoints[-self._MAX_HISTORY:]
             root["checkpoints"] = checkpoints
@@ -260,6 +269,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
                 .where(and_(*clauses))
                 .values(checkpoint=job_cp, updated_at=now)
             )
+            # 写入失败通常表示 lease 已换代：旧 worker 必须放弃当前 checkpoint。
             if result.rowcount != 1:
                 conn.rollback()
                 raise RuntimeError(f"QA_RUN lease lost for checkpoint thread {thread_id}")
@@ -296,6 +306,7 @@ class JobCheckpointSaver(BaseCheckpointSaver):
             root = dict(job_cp.get(self._ROOT_KEY) or self._empty_root())
             all_writes = dict(root.get("writes") or {})
             existing = list(all_writes.get(key) or [])
+            # 同一 taskId + write index 重放时覆盖原值，保证节点重执行不会重复追加 pending write。
             by_identity = {
                 (str(item.get("taskId")), int(item.get("idx", 0))): item
                 for item in existing
@@ -324,12 +335,14 @@ class JobCheckpointSaver(BaseCheckpointSaver):
                 .where(and_(*clauses))
                 .values(checkpoint=job_cp, updated_at=now)
             )
+            # pending write 同样受 lease fencing；旧 worker 的写入静默回滚。
             if result.rowcount == 1:
                 conn.commit()
             else:
                 conn.rollback()
 
     def delete_thread(self, thread_id: str) -> None:
+        """只删除 LangGraph 子树，不影响 job 里其他业务 checkpoint 字段。"""
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             rows = conn.execute(
