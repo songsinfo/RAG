@@ -112,7 +112,7 @@ class QaService:
             raise ApiException(400, "INVALID_INPUT", "知识库列表超限")
 
         with get_db_connection() as conn:
-            # 校验用户选择的知识库都真实存在且可访问；segment scope 不能包含不存在或越权的 KB。
+            # 校验所选知识库属于当前租户且处于 LIVE 状态；用户读取权限由后续检索路径校验。
             if scope_mode == "SELECTED" and kb_ids:
                 for k in kb_ids:
                     kb = conn.execute(
@@ -1481,7 +1481,7 @@ class QaService:
             if r.result_json:
                 base.update(r.result_json)
 
-            # 写入新版本前先把旧版本标记为非当前版本，保证读取端只看到一份有效版本。
+            # 读取历史结果时，将证据的 buildId 与文档当前 active_build_id 比较，标记该证据是否来自当前构建。
             if "evidence" in base and isinstance(base["evidence"], list):
                 for ev in base["evidence"]:
                     doc_id = ev.get("documentId")
