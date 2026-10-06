@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
     from app.telemetry import configure_telemetry
     configure_telemetry()
 
-    # Startup: ensure DB connection is reachable and seed database
+    # 启动阶段先确认数据库可连接并执行幂等 seed；尽早暴露基础配置问题，避免首个业务请求才失败。
     try:
         with get_db_connection() as conn:
             conn.execute(text("SELECT 1"))
@@ -89,12 +89,12 @@ app.add_exception_handler(ApiException, api_exception_handler)
 
 @app.middleware("http")
 async def csrf_middleware(request: Request, call_next):
-    # Only protect mutating HTTP methods on API routes
+    # CSRF 只保护 API 中会修改状态的方法；GET/HEAD 保持只读，不要求携带 CSRF token。
     exempt_paths = {"/api/v1/auth/csrf", "/api/v1/health", "/health", "/docs", "/openapi.json"}
     internal_service_call = request.url.path.startswith("/api/v1/internal/")
     if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.url.path.startswith("/api/v1"):
         if request.url.path not in exempt_paths and not internal_service_call:
-            # 1. Check Origin if provided
+            # 第一步校验 Origin（若浏览器提供）：非可信来源直接拒绝，先阻断跨站写请求。
             origin = request.headers.get("origin")
             if origin:
                 parsed = urlparse(origin)
@@ -104,13 +104,13 @@ async def csrf_middleware(request: Request, call_next):
                 if parsed.hostname != req_host or origin_port != req_port or parsed.scheme != request.url.scheme:
                     return JSONResponse(status_code=403, content={"code": "CSRF_INVALID", "message": "请刷新安全凭据后重试"})
 
-            # 2. Extract CSRF token from header and cookie
+            # 第二步同时读取 Header 与 Cookie 中的 CSRF token；双提交值必须同时存在并匹配。
             csrf_header = request.headers.get("x-csrf-token")
             csrf_cookie = request.cookies.get("RAG_CSRF")
             if not csrf_header or not csrf_cookie or csrf_header != csrf_cookie:
                 return JSONResponse(status_code=403, content={"code": "CSRF_INVALID", "message": "请刷新安全凭据后重试"})
 
-            # 3. Determine binding
+            # 第三步确定 token 的会话绑定关系；登录态 token 不能被匿名态或其他会话复用。
             session_token = request.cookies.get("RAG_SESSION")
             binding = session_token if session_token else request.cookies.get("RAG_NONCE", "")
             if not verify_csrf_token(csrf_header, binding, settings.RAG_CSRF_SECRET):
@@ -130,7 +130,7 @@ from app.evaluation.router import router as eval_router
 from app.model_budget_router import router as budget_router
 from app.identity.security import verify_csrf_token
 
-# Include routers
+# 统一注册各业务路由；安全中间件放在应用层统一生效，避免某个 router 漏掉保护。
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(identity_admin_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")

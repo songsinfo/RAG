@@ -327,7 +327,7 @@ def test_planned_success_denominator_separates_execution_failure_from_semantic_u
              {"correctness": "CORRECT", "answerRelevance": {"verdict": "ON_TOPIC", "reason": "ok"}}),
             ("result-v2-unknown", "COMPLETED", {"taskSuccess": None, "costCny": 0.1},
              {"correctness": "UNDETERMINED", "answerRelevance": {"verdict": "UNCERTAIN", "reason": "unknown"}}),
-            # Error paths historically persisted taskSuccess=False. It must not enter the semantic denominator.
+            # 历史错误路径会持久化 taskSuccess=False；该执行失败不能进入语义正确性分母，否则会污染质量指标。
             ("result-v2-failed", "FAILED", {"taskSuccess": False, "costCny": 0.1},
              {"correctness": "WRONG"}),
         ]

@@ -1,5 +1,5 @@
--- Upgrade existing MySQL 8.x databases to permit durable QA_RUN jobs.
--- Discover the previous job.kind CHECK constraint instead of assuming MySQL's generated name.
+-- 升级现有 MySQL 8.x 数据库，使 job.kind 允许持久化 QA_RUN 任务；用于把 QA 执行从进程内任务迁移到 durable worker。
+-- 不假设 MySQL 自动生成的 CHECK 名称，先从元数据中发现旧 job.kind 约束，再安全替换，避免不同环境约束名不一致。
 SET @schema_name = DATABASE();
 SET @old_job_kind_check = (
   SELECT tc.CONSTRAINT_NAME

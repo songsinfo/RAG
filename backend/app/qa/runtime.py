@@ -71,7 +71,7 @@ def estimate_tokens(value: Any) -> int:
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     # 中文/英文混合场景下用“约 3 字符/token”做保守近似，宁可早一点触发预算。
-    # Conservative mixed Chinese/English approximation.
+    # 对中英文混合文本采用偏保守的 token 近似，宁可高估预算也不要因为低估上下文长度导致模型请求超限。
     return max(1, (len(value) + 2) // 3)
 
 

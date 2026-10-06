@@ -112,7 +112,7 @@ class QaService:
             raise ApiException(400, "INVALID_INPUT", "知识库列表超限")
 
         with get_db_connection() as conn:
-            # Validate selected KBs exist
+            # 校验所选知识库属于当前租户且处于 LIVE 状态；用户读取权限由后续检索路径校验。
             if scope_mode == "SELECTED" and kb_ids:
                 for k in kb_ids:
                     kb = conn.execute(
@@ -307,7 +307,7 @@ class QaService:
             if not conv:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "会话不存在")
 
-            # Cancel active runs and erase text
+            # 删除会话前先取消仍在执行的 run，并擦除正文；避免后台 worker 在删除后继续生成新的敏感内容。
             conn.execute(
                 update(qa_run_table)
                 .where(
@@ -458,7 +458,7 @@ class QaService:
         now = datetime.now(timezone.utc)
 
         with get_db_connection() as conn:
-            # 1. Verify conversation
+            # 第 1 步：确认会话存在、归属正确且当前用户仍有权访问，再继续创建本轮 QA run。
             conv = conn.execute(
                 select(conversation_table).where(
                     and_(
@@ -494,8 +494,8 @@ class QaService:
                 raise ApiException(409, "VERSION_CONFLICT", "上下文范围已改变")
 
             # 同一用户提交前加悲观锁，保证 turn_no 分配和“单活动 run”检查不会并发穿透。
-            # Serialize submissions for the same user, matching the Java
-            # pessimistic-lock contract before allocating turn numbers.
+            # 同一用户的提交需要串行化，保持与 Java 版本一致的并发语义；
+            # 在分配 turn number 前先通过悲观锁固定顺序，避免并发请求得到重复/乱序轮次。
             user_row = conn.execute(
                 select(app_user_table.c.id)
                 .where(
@@ -563,8 +563,8 @@ class QaService:
 
             # 普通在线问答固定使用租户当前 active config；
             # 只有内部评估调用才允许 pin 历史已发布 config，保证实验可复现。
-            # Resolve retrieval config_id. Only trusted internal callers
-            # (evaluation) may pin a historical published config.
+            # 解析本轮使用的 retrieval config_id；普通外部请求只能使用当前已发布配置，
+            # 只有受信任的内部调用方（如 evaluation）允许固定历史已发布配置，以保证实验可复现。
             config_id = trusted_config_id
             if not config_id:
                 t_row = conn.execute(
@@ -631,7 +631,7 @@ class QaService:
         if is_test_env():
             QaService.execute_queued_run(actor, run_id)
 
-        # Production execution is claimed by the durable runtime worker.
+        # 生产环境只在这里持久化 QA_RUN job；真正执行由 durable runtime worker 竞争 lease 后完成。
 
         return {
             "runId": run_id,
@@ -816,7 +816,7 @@ class QaService:
                 QaService._finalize_run(actor.tenant_id, run_id, "COMPLETED", "FINISHED", "RULE_MATCHED", result)
                 return
 
-            # Check cancellation
+            # 每个高成本阶段前重新检查取消状态；用户取消后尽快停止检索/模型调用，避免继续花费资源。
             if QaService._is_cancelled(actor.tenant_id, run_id):
                 return
 
@@ -916,8 +916,8 @@ class QaService:
             with get_db_connection() as conn:
                 # 这是第二次 ACL/build 检查：检索已经完成，但 evidence 尚未持久化/送模型。
                 # 解决检索与生成之间发生撤权的 TOCTOU 问题。
-                # A second ACL + active-build check happens immediately before
-                # evidence is persisted and sent to any external model.
+                # 在 evidence 持久化以及任何文本发往外部模型之前再次校验 ACL 和 active build，
+                # 防止“检索完成后权限刚好被撤销”的竞态把已失权内容泄露到数据库或模型供应商。
                 assert_hits_still_readable(conn, actor, hits, allowed_kb_ids or None)
 
                 for idx, h in enumerate(hits, start=1):
@@ -967,7 +967,7 @@ class QaService:
                 conn.commit()
 
             # 4. 生成前做最后一次来源权限检查；撤权优先于已经完成的检索结果。
-            # Final pre-send authorization check. Revocation wins even after retrieval.
+            # 模型发送前做最后一次授权检查：即使检索已完成，只要权限被撤销，就必须以撤销结果为准并立即失败关闭。
             with get_db_connection() as conn:
                 assert_hits_still_readable(conn, actor, evidence, allowed_kb_ids or None)
             QaService._record_event(actor.tenant_id, run_id, "GENERATING")
@@ -993,7 +993,7 @@ class QaService:
                 raise ApiException(502, "INVALID_MODEL_OUTPUT", "回答模型未返回合法 JSON") from exc
 
             # 5. 模型返回 JSON 后，claim 引用必须绑定到真实 evidenceId 和合法字符区间。
-            # Claim Validation
+            # 对模型生成的 claims 做证据绑定校验：无法定位到 evidence 的事实不能被当成已支持结论。
             QaService._record_event(actor.tenant_id, run_id, "VALIDATING")
             validated = validate_claims(parsed_answer, evidence_map)
             validated["evidence"] = evidence
@@ -1454,11 +1454,11 @@ class QaService:
             if not r:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "问答运行不存在")
 
-            # Non-admin can only access own runs
+            # 非管理员只能读取自己的 run；run_id 本身不是授权凭据。
             if not actor.admin and r.owner_id != actor.user_id:
                 raise ApiException(403, "OPERATION_FORBIDDEN", "无权访问此运行")
 
-            # Check ACL visibility of underlying sources in this segment up to this turn
+            # 读取历史前重新检查该 segment 截止当前 turn 引用过的底层 source 是否仍可见；权限撤销后历史答案必须隐藏。
             sources = QaService._all_sources(conn, actor.tenant_id, r.segment_id, r.turn_no)
             for did in sources:
                 if not can_read_document(conn, actor, did):
@@ -1481,7 +1481,7 @@ class QaService:
             if r.result_json:
                 base.update(r.result_json)
 
-            # Mark old versions
+            # 读取历史结果时，将证据的 buildId 与文档当前 active_build_id 比较，标记该证据是否来自当前构建。
             if "evidence" in base and isinstance(base["evidence"], list):
                 for ev in base["evidence"]:
                     doc_id = ev.get("documentId")
@@ -1496,7 +1496,7 @@ class QaService:
                         ).first()
                         ev["isCurrent"] = (d_row is not None and d_row.active_build_id == ev.get("buildId"))
 
-            # Usage summary
+            # 汇总本次模型调用 usage/cost，供预算控制、审计和评估报告使用；不依赖供应商控制台二次推算。
             calls = conn.execute(
                 select(
                     model_call_table.c.purpose,

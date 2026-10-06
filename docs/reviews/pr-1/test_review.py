@@ -66,8 +66,8 @@ def test_revoked_hits_must_not_reach_reranker(monkeypatch, tmp_path):
 def test_expired_lease_restart_is_idempotent(monkeypatch, tmp_path):
     doc = queue_document(monkeypatch, tmp_path)
     with db.engine.begin() as conn:
-        # Match the production uniqueness rule and simulate a process dying
-        # after SourceUnit persistence but before chunk/index completion.
+        # 与生产环境的唯一性约束保持一致，并模拟进程在 SourceUnit 已持久化后崩溃，
+        # 此时 chunk/index 尚未完成，用来验证恢复逻辑能正确处理半成品状态。
         conn.execute(text("CREATE UNIQUE INDEX uq_unit_key ON source_unit(tenant_id, build_id, unit_key)"))
     worker = DurableJobWorker()
     job = worker._claim_one()

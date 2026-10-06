@@ -69,7 +69,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     """
     csrf = login_client(client, "admin", "admin123")
 
-    # 1. Profile check (/me)
+    # 第 1 步：调用 /me 验证登录身份与租户上下文。
     me_resp = client.get("/api/v1/me")
     assert me_resp.status_code == 200
     me_data = me_resp.json()
@@ -77,7 +77,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert me_data["admin"] is True
     assert me_data["tenantCode"] == "demo"
 
-    # 2. Knowledge Base create, list, ACL
+    # 第 2 步：覆盖知识库创建、列表与 ACL 基本链路。
     create_kb_resp = client.post(
         "/api/v1/admin/knowledge-bases",
         json={"name": "Engineering Docs", "readers": [{"type": "USER", "userId": me_data["id"]}]},
@@ -90,7 +90,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert list_kb_resp.status_code == 200
     assert any(k["id"] == kb_id for k in list_kb_resp.json())
 
-    # Get & Update KB ACL
+    # 读取并更新 KB ACL，验证 row_version/security_epoch 协同生效。
     kb_acl_resp = client.get(f"/api/v1/admin/knowledge-bases/{kb_id}/acl")
     assert kb_acl_resp.status_code == 200
     kb_acl = kb_acl_resp.json()
@@ -102,7 +102,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert update_kb_acl_resp.status_code == 200
 
-    # 3. Document Upload with buildConfig
+    # 第 3 步：携带 buildConfig 上传文档，触发版本化 ingestion。
     doc_content = "# System Architecture\n\nFastAPI backend replaces Spring Boot with Milvus hybrid retrieval."
     upload_resp = client.post(
         "/api/v1/admin/documents",
@@ -115,7 +115,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     doc_id = upload_data["documentId"]
     job_id = upload_data["jobId"]
 
-    # Poll Job until finished
+    # 轮询后台 job 到终态，确认 durable worker 真正完成构建。
     for _ in range(30):
         j_resp = client.get(f"/api/v1/admin/jobs/{job_id}")
         assert j_resp.status_code == 200
@@ -123,7 +123,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
             break
         time.sleep(0.1)
 
-    # Inspect document and version preview
+    # 查看文档详情与版本预览，核对解析、chunk 与版本状态。
     doc_resp = client.get(f"/api/v1/documents/{doc_id}")
     assert doc_resp.status_code == 200
     active_build_id = doc_resp.json()["activeBuildId"]
@@ -139,7 +139,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     preview_data = preview_resp.json()
     assert len(preview_data["chunks"]) > 0
 
-    # Sync Milvus mock store with chunk text for reliable mock retrieval
+    # 用真实 chunk 文本同步 Milvus mock，保证后续检索测试稳定且与持久化内容一致。
     chunk_item = preview_data["chunks"][0]
     MilvusHybridService.upsert_chunks(
         tenant_id="tenant-demo-1",
@@ -150,12 +150,12 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
         version_id=str(ver_id),
     )
 
-    # 4. Search endpoint
+    # 第 4 步：调用搜索接口，验证 ACL、排序和证据结构。
     search_resp = client.get(f"/api/v1/search?query=FastAPI&kbIds={kb_id}")
     assert search_resp.status_code == 200
     assert len(search_resp.json()) > 0
 
-    # 5. Conversations, Segments, and RAG Run
+    # 第 5 步：覆盖会话、segment scope 与 RAG run 的完整用户流程。
     conv_resp = client.post(
         "/api/v1/conversations",
         json={"title": "Test Chat", "scope": {"mode": "ALL", "kbIds": []}},
@@ -164,7 +164,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert conv_resp.status_code in (200, 201)
     conv_id = conv_resp.json()["conversationId"]
 
-    # Add segment
+    # 新增 segment，验证 scope 变化会形成新的上下文边界。
     seg_resp = client.post(
         f"/api/v1/conversations/{conv_id}/segments",
         json={"scope": {"mode": "SELECTED", "kbIds": [kb_id]}},
@@ -173,7 +173,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert seg_resp.status_code == 200
     segment_id = seg_resp.json()["currentSegmentId"]
 
-    # Run RAG query (using built-in deterministic simulation of ModelGateway)
+    # 提交 RAG 查询；测试环境使用 ModelGateway 内置确定性模拟，保证端到端断言可重复。
     run_post_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
         json={"question": "系统架构采用了什么框架？", "segmentId": segment_id, "mode": "RAG", "strict": False},
@@ -182,7 +182,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert run_post_resp.status_code == 202
     run_id = run_post_resp.json()["runId"]
 
-    # Poll run status
+    # 轮询 QA run 到终态，确认异步执行与最终落库。
     run_data = None
     for _ in range(60):
         time.sleep(0.1)
@@ -197,12 +197,12 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert len(run_data.get("evidence", [])) > 0
     ev_id = run_data["evidence"][0]["evidenceId"]
 
-    # Fetch evidence details
+    # 读取 evidence 详情，验证答案引用能回溯到原始文档位置。
     ev_resp = client.get(f"/api/v1/runs/{run_id}/evidence/{ev_id}")
     assert ev_resp.status_code == 200
     assert ev_resp.json()["documentId"] == doc_id
 
-    # 6. Feedback submission & Admin review
+    # 第 6 步：提交用户反馈并由管理员复核，覆盖反馈闭环。
     fb_resp = client.put(
         f"/api/v1/runs/{run_id}/feedback",
         json={"rating": "USEFUL", "comment": "非常准确", "issueType": "OTHER"},
@@ -222,7 +222,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert patch_fb.status_code == 200
 
-    # 7. Controlled Trace inspection
+    # 第 7 步：读取受控 trace，验证可观测性数据不会越权暴露敏感正文。
     trace_resp = client.get(f"/api/v1/admin/runs/{run_id}/trace")
     assert trace_resp.status_code == 200
     trace_data = trace_resp.json()
@@ -232,13 +232,13 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert "sk-" not in trace_text
     assert "RAG_SESSION" not in trace_text
 
-    # 8. Operations endpoints: Jobs, Configs, Users, Groups
-    # Jobs list, cancel, retry
+    # 第 8 步：覆盖 Jobs、Configs、Users、Groups 等运营管理接口。
+    # 验证任务列表、取消和重试，重点检查状态机与幂等约束。
     jobs_resp = client.get("/api/v1/admin/jobs")
     assert jobs_resp.status_code == 200
     assert len(jobs_resp.json()) > 0
 
-    # Configs
+    # 验证配置列表与版本化配置读取。
     cfg_create = client.post(
         "/api/v1/admin/configs",
         json={"kind": "RETRIEVAL", "name": "e2e_test_cfg", "payload": {"retrieval": {"mode": "BM25"}}},
@@ -253,12 +253,12 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert cfg_publish.status_code == 200
 
-    # Users
+    # 验证用户管理查询与状态字段。
     users_resp = client.get("/api/v1/admin/users")
     assert users_resp.status_code == 200
     assert any(u["loginName"] == "admin" for u in users_resp.json())
 
-    # Groups and optimistic member update
+    # 验证组管理及成员更新的乐观锁，防止并发覆盖成员列表。
     groups_resp = client.get("/api/v1/admin/groups")
     assert groups_resp.status_code == 200
     assert len(groups_resp.json()) > 0
@@ -274,12 +274,12 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     assert update_members_resp.status_code == 200
     assert update_members_resp.json()["updated"] is True
 
-    # Check that securityEpoch was incremented
+    # 确认权限成员关系变化后 securityEpoch 已提升，使旧授权缓存/异步任务失效。
     new_groups_resp = client.get("/api/v1/admin/groups")
     assert new_groups_resp.json()[0]["securityEpoch"] == current_epoch + 1
 
-    # 9. Document Lifecycle: Trash, List Trash, Restore, Purge
-    # Trash
+    # 第 9 步：覆盖文档 Trash、回收站列表、Restore 和不可逆 Purge 全生命周期。
+    # 执行软删除 Trash，文档应立即退出正常检索范围。
     trash_resp = client.post(
         f"/api/v1/admin/documents/{doc_id}/trash",
         json={"expectedVersion": 1},
@@ -287,12 +287,12 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert trash_resp.status_code == 200
 
-    # List trashed
+    # 查询回收站列表，确认软删除记录仍可管理。
     trashed_list = client.get("/api/v1/admin/documents?status=TRASHED")
     assert trashed_list.status_code == 200
     assert any(d["id"] == doc_id for d in trashed_list.json())
 
-    # Restore
+    # 恢复文档，验证状态与检索可见性重新生效。
     restore_resp = client.post(
         f"/api/v1/admin/documents/{doc_id}/restore",
         json={"expectedVersion": 2},
@@ -300,7 +300,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert restore_resp.status_code == 200
 
-    # Re-trash before purge (documents must be in TRASHED state to be purged)
+    # Purge 前再次 Trash；永久删除只允许从 TRASHED 状态进入，避免误删活动文档。
     trash2_resp = client.post(
         f"/api/v1/admin/documents/{doc_id}/trash",
         json={"expectedVersion": 3},
@@ -308,7 +308,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
     )
     assert trash2_resp.status_code == 200
 
-    # Purge
+    # 执行不可逆 Purge，验证物理文件与派生数据一起清理。
     purge_resp = client.post(
         f"/api/v1/admin/documents/{doc_id}/purge",
         json={"expectedVersion": 4},
@@ -319,7 +319,7 @@ def test_e2e_full_user_and_admin_workflow(client: TestClient):
 
 def test_identity_and_csrf_security_boundaries(client: TestClient):
     """Verify password protection, rate limits, CSRF token binding, and session revocation."""
-    # 1. Invalid credentials
+    # 第 1 步：使用错误凭据登录，必须失败且不能泄露账号是否存在。
     csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
     bad_login = client.post(
         "/api/v1/auth/login",
@@ -329,7 +329,7 @@ def test_identity_and_csrf_security_boundaries(client: TestClient):
     assert bad_login.status_code == 401
     assert bad_login.json()["code"] == "INVALID_CREDENTIALS"
 
-    # 2. Disabled account
+    # 第 2 步：禁用账号即使密码正确也不能建立会话。
     disabled_login = client.post(
         "/api/v1/auth/login",
         json={"tenantCode": "demo", "loginName": "disabled_user", "password": "admin123"},
@@ -337,15 +337,15 @@ def test_identity_and_csrf_security_boundaries(client: TestClient):
     )
     assert disabled_login.status_code == 401
 
-    # 3. Successful login & CSRF protections
+    # 第 3 步：成功登录后验证完整 CSRF 防护。
     csrf_valid = login_client(client, "admin", "admin123")
 
-    # Missing X-CSRF-Token header
+    # 缺失 X-CSRF-Token Header 的写请求必须被拒绝。
     no_csrf = client.post("/api/v1/conversations", json={"title": "test"})
     assert no_csrf.status_code == 403
     assert no_csrf.json()["code"] == "CSRF_INVALID"
 
-    # Forged CSRF header
+    # 伪造的 CSRF Header 与 Cookie 不匹配时必须被拒绝。
     bad_token = client.post(
         "/api/v1/conversations",
         json={"title": "test"},
@@ -353,7 +353,7 @@ def test_identity_and_csrf_security_boundaries(client: TestClient):
     )
     assert bad_token.status_code == 403
 
-    # Foreign Origin header
+    # 来自非可信 Origin 的写请求必须在业务处理前被拒绝。
     foreign_origin = client.post(
         "/api/v1/conversations",
         json={"title": "test"},
@@ -361,12 +361,12 @@ def test_identity_and_csrf_security_boundaries(client: TestClient):
     )
     assert foreign_origin.status_code == 403
 
-    # Logout revokes session immediately
+    # logout 必须立即撤销服务器端 session，而不是只删除浏览器 Cookie。
     logout_resp = client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf_valid})
     assert logout_resp.status_code == 200
     assert logout_resp.json()["authenticated"] is False
 
-    # After logout, accessing protected route returns 401
+    # 退出后继续访问受保护接口必须返回 401，验证旧 session 已不可用。
     post_logout_me = client.get("/api/v1/me")
     assert post_logout_me.status_code == 401
 
@@ -380,7 +380,7 @@ def test_acl_revocation_masks_historical_answers(client: TestClient):
     csrf = login_client(client, "admin", "admin123")
     now = datetime.now(timezone.utc)
 
-    # 1. Create restricted KB and restricted doc
+    # 第 1 步：创建受限 KB 和受限文档，准备权限撤销后的历史脱敏测试。
     doc_id = "doc-revoke-test-1"
     kb_id = "kb-revoke-test-1"
     build_id = "build-revoke-test-1"
@@ -454,7 +454,7 @@ def test_acl_revocation_masks_historical_answers(client: TestClient):
                 updated_at=now,
             )
         )
-        # Grant access via ops group
+        # 通过 ops group 授予访问权限，验证组继承而非直接用户授权。
         conn.execute(
             document_grant_table.insert().values(
                 tenant_id="tenant-demo-1",
@@ -468,7 +468,7 @@ def test_acl_revocation_masks_historical_answers(client: TestClient):
         )
         conn.commit()
 
-    # 2. Create historical conversation and run that cites this document
+    # 第 2 步：创建引用该文档的历史会话/run，构造撤权前可见的真实历史。
     conv_id = "cv-revoke-test"
     seg_id = "seg-revoke-test"
     run_id = "run-revoke-test"
@@ -542,12 +542,12 @@ def test_acl_revocation_masks_historical_answers(client: TestClient):
         )
         conn.commit()
 
-    # Verify user can view the answer prior to revocation
+    # 撤权前先确认用户能看到答案，保证后续隐藏确实由权限变化触发。
     cv_before = client.get(f"/api/v1/conversations/{conv_id}").json()
     assert cv_before["runs"][0]["visibility"] == "VISIBLE"
     assert cv_before["runs"][0]["answer"] == "秘密战略涉及核心业务机密。"
 
-    # 3. Revoke access by removing user from group-ops-1
+    # 第 3 步：把用户移出 group-ops-1，撤销其通过组继承获得的访问权。
     update_members = client.put(
         "/api/v1/admin/groups/group-ops-1/members",
         json={"userIds": [], "expectedSecurityEpoch": 1},
@@ -555,7 +555,7 @@ def test_acl_revocation_masks_historical_answers(client: TestClient):
     )
     assert update_members.status_code == 200
 
-    # 4. Re-read conversation: answer MUST be HIDDEN
+    # 第 4 步：重新读取历史会话，答案必须变为 HIDDEN，不能继续返回缓存正文。
     cv_after = client.get(f"/api/v1/conversations/{conv_id}").json()
     run_after = cv_after["runs"][0]
     assert run_after["visibility"] == "HIDDEN"
@@ -566,7 +566,7 @@ def test_concurrency_and_optimistic_locking(client: TestClient):
     """Verify that version conflict checks protect document lifecycle and group members from state races."""
     csrf = login_client(client, "admin", "admin123")
 
-    # Mismatched expectedSecurityEpoch in group update returns 409
+    # 组更新使用不匹配的 expectedSecurityEpoch 时必须返回 409，验证安全版本乐观锁。
     stale_epoch = client.put(
         "/api/v1/admin/groups/group-ops-1/members",
         json={"userIds": [], "expectedSecurityEpoch": 9999},
@@ -575,7 +575,7 @@ def test_concurrency_and_optimistic_locking(client: TestClient):
     assert stale_epoch.status_code == 409
     assert stale_epoch.json()["code"] == "VERSION_CONFLICT"
 
-    # Mismatched expectedVersion in document lifecycle returns 409
+    # 文档生命周期操作使用错误 expectedVersion 时必须返回 409，防止并发误操作。
     doc_id = "doc-race-test"
     now = datetime.now(timezone.utc)
     with get_db_connection() as conn:
@@ -607,7 +607,7 @@ def test_concurrency_and_optimistic_locking(client: TestClient):
 
 def test_milvus_tenant_and_active_build_isolation():
     """Verify that hybrid search enforces tenant isolation and ignores trashed/draft documents."""
-    # Insert chunks for Tenant A and Tenant B
+    # 分别写入 Tenant A/B 的 chunk，构造多租户隔离测试数据。
     MilvusHybridService.upsert_chunks(
         tenant_id="tenant-demo-1",
         build_id="build-active-demo",
@@ -625,7 +625,7 @@ def test_milvus_tenant_and_active_build_isolation():
         version_id="ver-foreign",
     )
 
-    # Search as tenant-demo-1: must NEVER return chunk-foreign-1
+    # tenant-demo-1 搜索绝不能返回其他租户的 chunk-foreign-1，这是强隔离断言。
     results = MilvusHybridService.search(
         tenant_id="tenant-demo-1",
         allowed_build_ids=["build-active-demo"],
@@ -636,7 +636,7 @@ def test_milvus_tenant_and_active_build_isolation():
     assert "chunk-demo-1" in chunk_ids
     assert "chunk-foreign-1" not in chunk_ids
 
-    # Search with un-allowed build: must return nothing
+    # 使用未授权 build 搜索必须返回空结果，不能仅凭 chunk 存在就放行。
     unallowed = MilvusHybridService.search(
         tenant_id="tenant-demo-1",
         allowed_build_ids=["build-trashed-other"],
@@ -716,7 +716,7 @@ def test_ai_gateway_failure_leads_to_clean_terminal_failure(client: TestClient):
     conv_id = conv_resp.json()["conversationId"]
     segment_id = conv_resp.json()["currentSegmentId"]
 
-    # Patch ModelGateway.chat to simulate gateway failure
+    # 替换 ModelGateway.chat 模拟网关故障，验证错误收敛、重试与脱敏行为。
     with patch.object(ModelGateway, "chat", side_effect=ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "大模型网关故障")):
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
@@ -726,7 +726,7 @@ def test_ai_gateway_failure_leads_to_clean_terminal_failure(client: TestClient):
         assert run_resp.status_code == 202
         run_id = run_resp.json()["runId"]
 
-        # Poll run
+        # 轮询故障 run 到终态，确保断言覆盖后台 worker 写回后的真实状态。
         result = None
         for _ in range(60):
             time.sleep(0.1)
@@ -737,7 +737,7 @@ def test_ai_gateway_failure_leads_to_clean_terminal_failure(client: TestClient):
 
         assert result is not None
         assert result["status"] == "FAILED"
-        # Confirm no provider key leaked in terminal reason or error text
+        # 确认终态 reason/error 文本没有泄露模型供应商 key 或其他密钥信息。
         full_text = json.dumps(result)
         assert "sk-" not in full_text
         assert "Bearer" not in full_text

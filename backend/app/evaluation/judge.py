@@ -112,7 +112,7 @@ def _parse_dimension(payload: Dict[str, Any], name: str, allowed: set[str]) -> D
 
 
 def parse_verdicts(raw, facts, claims):
-    """Parse the legacy v1 rubric. Kept for queued v1 runs and persisted tests."""
+    """解析旧版 v1 rubric；仅为已经排队的历史 v1 运行和持久化测试保留，避免版本升级改变旧实验语义。"""
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("Invalid judge payload")
@@ -308,7 +308,7 @@ def judge_answer(
     rubric_version=RUBRIC_VERSION,
     input_contract_version=INPUT_CONTRACT_VERSION,
 ):
-    """Judge one final answer. v1 is retained only for already-versioned legacy runs."""
+    """评估一条最终用户可见答案；v1 仅服务已明确版本化的历史 run，避免升级后改变旧实验语义。"""
     # 历史运行按 manifest 中记录的 rubric 继续走旧逻辑，避免同一批实验结果被新版规则污染。
     if rubric_version == LEGACY_RUBRIC_VERSION:
         return _judge_legacy(tenant_id, run_id, question, expected, output)

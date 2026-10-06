@@ -35,7 +35,7 @@ class LifecycleActionRequest(BaseModel):
 
 
 
-# Knowledge Base endpoints
+# 知识库管理接口：负责创建、列表、详情以及知识库级权限/配置入口。
 @router.get("/knowledge-bases")
 def list_kbs(actor: Actor = Depends(get_current_actor)):
     return KnowledgeService.list_kbs(actor)
@@ -56,7 +56,7 @@ def update_kb_acl(kb_id: str, payload: UpdateKbAclRequest, actor: Actor = Depend
     return KnowledgeService.update_kb_acl(actor, kb_id, payload.expectedVersion, payload.readers)
 
 
-# Document endpoints
+# 文档接口：负责上传、查询和版本操作；解析、切分和索引由后台 durable job 异步完成。
 @router.get("/documents")
 def list_documents(kbId: Optional[str] = None, actor: Actor = Depends(get_current_actor)):
     return KnowledgeService.list_documents(actor, kb_id=kbId, admin_mode=False)
@@ -263,7 +263,7 @@ def receive_internal_deletion(
         str(body.get("originDocumentId") or ""),
     )
 
-# Job polling endpoints
+# 后台任务轮询接口：前端通过 job 状态观察导入、构建和清理进度，不在 HTTP 请求里长时间阻塞。
 @router.get("/admin/jobs")
 def list_jobs(actor: Actor = Depends(require_admin)):
     return KnowledgeService.list_jobs(actor)
@@ -284,7 +284,7 @@ def cancel_job(job_id: str, actor: Actor = Depends(require_admin)):
     return KnowledgeService.control_job(actor, job_id, cancel=True)
 
 
-# Preview endpoint
+# 文档预览接口：读取已持久化的解析/切分结果用于核对，不会重新触发 Docling。
 @router.get("/documents/{doc_id}/versions/{version_id}/preview")
 def get_preview(doc_id: str, version_id: str, actor: Actor = Depends(get_current_actor)):
     return KnowledgeService.get_preview(actor, doc_id, version_id)
@@ -317,7 +317,7 @@ def accept_build_warnings(
     return KnowledgeService.accept_warnings(actor, build_id, body.get("reason", ""))
 
 
-# Document ACL endpoints
+# 文档级 ACL 接口：在知识库 ACL 之上进一步收敛单文档访问范围，并通过版本字段避免并发覆盖。
 @router.get("/admin/documents/{doc_id}/acl")
 def get_document_acl(doc_id: str, actor: Actor = Depends(require_admin)):
     return KnowledgeService.get_document_acl(actor, doc_id)
@@ -328,7 +328,7 @@ def update_document_acl(doc_id: str, payload: UpdateDocAclRequest, actor: Actor 
     return KnowledgeService.update_document_acl(actor, doc_id, payload.expectedVersion, payload.mode, payload.readers)
 
 
-# Document Lifecycle endpoints (trash, restore, purge)
+# 文档生命周期接口：trash/restore 属于可逆状态变化，purge 是不可逆物理清理，三者必须严格区分。
 @router.post("/admin/documents/{doc_id}/{action}")
 def document_lifecycle(doc_id: str, action: str, payload: LifecycleActionRequest, actor: Actor = Depends(require_admin)):
     return KnowledgeService.document_lifecycle(actor, doc_id, action, payload.expectedVersion)

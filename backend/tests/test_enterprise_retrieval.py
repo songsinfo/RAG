@@ -157,8 +157,8 @@ def test_milvus_index_epoch_isolates_stale_attempt_cleanup():
         index_epoch=2,
     )
 
-    # A stale epoch=1 worker may resume cleanup after epoch=2 already published.
-    # Its delete must be physically scoped to its own generation.
+    # 模拟旧 epoch=1 worker 在 epoch=2 已发布后才恢复执行清理，验证僵尸 worker 场景。
+    # 旧 worker 的删除操作必须物理限定在自己的 generation，绝不能误删新 epoch 的索引数据。
     MilvusHybridService.delete_by_build(
         common["tenant_id"],
         common["build_id"],

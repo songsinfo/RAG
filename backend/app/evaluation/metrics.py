@@ -13,7 +13,7 @@ class EvaluationMetrics:
 
     @staticmethod
     def ratio(numerator: int, denominator: int) -> Optional[float]:
-        """Safely compute proportion. Returns None if denominator is 0."""
+        """安全计算比例；分母为 0 时返回 None，表示“当前不可计算”，而不是误导性的 0 分。"""
         # 分母为 0 时不能返回 0.0，否则会把“没有样本”误解成“表现为 0”。
         return None if denominator == 0 else float(numerator) / denominator
 
@@ -26,10 +26,10 @@ class EvaluationMetrics:
         ideal_grades: Optional[List[int]] = None,
     ) -> Dict[str, Optional[float]]:
         """
-        Compute Hit@K, Recall@K, MRR@K, and optionally NDCG@K against gold fact groups.
+        基于 Gold 事实组计算 Hit@K、Recall@K、MRR@K，并可选计算 NDCG@K。
 
-        Each fact group is a set of equivalent alternative anchor identifiers.
-        A rank position hits a fact group if their sets intersect.
+        每个事实组包含一组等价 anchor 标识；某个排名位置只要与事实组集合存在交集，
+        就视为命中该事实组。同一事实组即使被多个候选覆盖，也只计一次召回。
         """
         if k < 1:
             raise ValueError("k must be positive")
@@ -72,8 +72,10 @@ class EvaluationMetrics:
     @staticmethod
     def ndcg(ranked: List[int], ideal: List[int], k: int = 5) -> Optional[float]:
         """
-        Compute Normalized Discounted Cumulative Gain (NDCG@K) for graded relevance (0..3).
-        Formula: DCG@K / IDCG@K, with exponential gain (2^r - 1) and log2 position discount.
+        计算分级相关性（0..3）的 NDCG@K。
+
+        公式为 DCG@K / IDCG@K；指数增益 (2^r - 1) 强调高相关结果，
+        log2 位置折损体现“越靠前越重要”的排序价值。
         """
         if k < 1:
             raise ValueError("k must be positive")
@@ -89,7 +91,7 @@ class EvaluationMetrics:
 
     @staticmethod
     def dcg(grades: List[int], k: int) -> float:
-        """Compute Discounted Cumulative Gain (DCG@K)."""
+        """计算 DCG@K：累计前 K 个结果的分级相关性，并按排名位置进行对数折损。"""
         total = 0.0
         for i in range(min(k, len(grades))):
             # 指数增益强调高相关文档；log2(i+2) 对越靠后的排名施加更大折损。
@@ -98,7 +100,7 @@ class EvaluationMetrics:
 
     @staticmethod
     def percentile(values: List[Union[int, float]], quantile: float) -> Optional[Union[int, float]]:
-        """Compute percentile with nearest-rank ceiling rule: index = ceil(N * quantile) - 1."""
+        """使用 nearest-rank 向上取整规则计算分位数：index = ceil(N * quantile) - 1；小样本下不会做插值。"""
         if quantile <= 0 or quantile > 1:
             raise ValueError("quantile must be (0,1]")
         if not values:
@@ -113,7 +115,7 @@ class EvaluationMetrics:
         pairs: List[tuple[str, str]],
         labels: List[str],
     ) -> Dict[str, Any]:
-        """Return confusion matrix and raw agreement for comparable labeled pairs."""
+        """返回可比较标签对的混淆矩阵与原始一致率；无法映射到给定 labels 的样本会被跳过。"""
         # 行是人工标签（视为校准基准），列是自动 Judge 标签。
         matrix = {actual: {predicted: 0 for predicted in labels} for actual in labels}
         compared = 0
@@ -132,7 +134,7 @@ class EvaluationMetrics:
 
     @staticmethod
     def correctness_calibration(pairs: List[tuple[str, str]]) -> Dict[str, Any]:
-        """Binary CORRECT calibration. UNDETERMINED pairs are excluded from FPR/FNR denominators."""
+        """对 CORRECT 做二分类校准；UNDETERMINED 没有明确正负语义，因此不进入 FPR/FNR 分母。"""
         # UNDETERMINED 没有明确正负语义，不进入二分类 FPR/FNR 分母。
         judged = [
             (automatic, human)

@@ -75,20 +75,20 @@ function Write-Headers {
 
 Write-Output "=== Starting Import of 18 Mall Knowledge Sources ==="
 
-# Read seed password
+# 读取 seed 环境中的演示密码；脚本只消费运行时配置，不把凭据硬编码进仓库。
 $seedPassword = ''
 foreach ($line in Get-Content -LiteralPath $EnvPath) {
     if ($line -match '^RAG_SEED_PASSWORD=(.*)$') { $seedPassword = $Matches[1].Trim() }
 }
 if (-not $seedPassword) { throw "RAG_SEED_PASSWORD not found in $EnvPath" }
 
-# Login admin and ops
+# 分别登录 admin 与 ops 账号，后续同时验证管理操作和普通组权限路径。
 $admin = New-Session 'admin' $seedPassword
 $ops = New-Session 'ops' $seedPassword
 $adminMe = (Invoke-Api 'GET' '/api/v1/me' $admin.Session).Body
 $opsMe = (Invoke-Api 'GET' '/api/v1/me' $ops.Session).Body
 
-# Create knowledge base for Mall evaluation
+# 为 Mall 评估创建独立知识库，避免导入数据与其他本地测试语料混在一起。
 $kbName = "mall-evaluation-kb"
 $kbRes = Invoke-Api 'POST' '/api/v1/admin/knowledge-bases' $admin.Session (Write-Headers $admin) @{
     name = $kbName
@@ -101,7 +101,7 @@ if ($kbRes.Status -ne 200) { throw "Failed to create knowledge base: $($kbRes.St
 $kbId = [string]$kbRes.Body.id
 Write-Output "Knowledge base created: $kbId ($kbName)"
 
-# Read bindings file to get 18 sources
+# 读取 bindings 文件中定义的 18 个 source，保证导入集合与评估题集使用的语料范围一致。
 $bindings = Get-Content -Raw -LiteralPath $BindingsPath | ConvertFrom-Json -AsHashtable -Depth 30
 $sources = $bindings['sources']
 
@@ -140,7 +140,7 @@ foreach ($relPath in $sources.Keys) {
     $verId = [string]$upload.Body.versionId
     $jobId = [string]$upload.Body.jobId
     
-    # Grant ops read access to document
+    # 给 ops 授予文档只读权限，让评估能够覆盖真实 ACL，而不是全部用管理员权限绕过检查。
     $docAcl = Invoke-Api 'GET' "/api/v1/documents/$docId" $admin.Session
     $rowVersion = [long]$docAcl.Body.rowVersion
     $grantRes = Invoke-Api 'PUT' "/api/v1/admin/documents/$docId/acl" $admin.Session (Write-Headers $admin) @{
@@ -194,7 +194,7 @@ $newJson = $bindings | ConvertTo-Json -Depth 30
 [IO.File]::WriteAllText($BindingsPath, $newJson, [Text.UTF8Encoding]::new($false))
 Write-Output "Bindings updated successfully!"
 
-# Now invoke Bind-EvaluationDataset.ps1
+# 所有 source 导入并授权完成后再调用 Bind-EvaluationDataset.ps1，把题集 Gold 绑定到实际文档版本。
 $bindScript = Join-Path $PSScriptRoot 'Bind-EvaluationDataset.ps1'
 $datasetPath = Join-Path $PSScriptRoot '../datasets/eval_accelerator_300.jsonl'
 Write-Output "`nInvoking Bind-EvaluationDataset.ps1 on $datasetPath..."

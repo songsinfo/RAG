@@ -112,8 +112,8 @@ class RetrievalPipeline:
         )
 
         # BM25 与 Dense 视为独立 route：每个 query variant 都可以形成一条排名列表。
-        # Match the Java route semantics: BM25 variants and dense variants
-        # are independent RRF routes. HyDE contributes only to the dense family.
+        # 与 Java 基线保持相同路由语义：BM25 变体和 dense 变体分别形成独立的 RRF 输入路线，
+        # HyDE 只贡献给 dense 家族，不能让同一个改写结果同时在 sparse/dense 两边重复投票。
         ranked_lists: List[List[Dict[str, Any]]] = []
         route_weights: List[float] = []
         use_sparse = cfg.mode in {"BM25", "HYBRID"}
@@ -187,8 +187,8 @@ class RetrievalPipeline:
 
         # Reranker 是外部模型边界：候选文本离开应用进程前必须重新鉴权。
         # 这是专门防止“检索后撤权”的竞态窗口。
-        # Reranking is an external model boundary. Re-check every candidate
-        # before any candidate text can leave the application process.
+        # rerank 属于外部模型边界；候选文本离开应用进程前必须逐条重新检查授权，
+        # 防止检索后 ACL 被撤销时仍把已失权文本发送给 reranker。
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, hits, kb_ids, document_ids)
 
@@ -222,7 +222,7 @@ class RetrievalPipeline:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
 
         # Parent 扩展可能让文本突然变大，所以必须在扩展后执行最终上下文预算。
-        # Apply the legacy Java context budget after parent expansion.
+        # parent expansion 完成后再应用 Java 基线的 context budget；预算针对最终送入模型的上下文，而不是原始 child。
         budgeted_hits: List[Dict[str, Any]] = []
         used_bytes = 0
         for hit in hits:
@@ -232,8 +232,8 @@ class RetrievalPipeline:
                 if not budgeted_hits:
                     # 最佳 parent 自己就超预算时，尝试退回它的 canonical child。
                     # 这样既避免上下文为空，也不粗暴截断原文导致引用位置失真。
-                    # Keep at least the best hit, but fall back to its canonical
-                    # child text if an expanded parent alone exceeds the budget.
+                    # 即使 parent expansion 后首条就超预算，也至少保留最佳命中；
+                    # 如果展开后的 parent 单条过大，则退回 canonical child 文本，避免因为预算裁剪导致结果完全为空。
                     child_id = str(hit.get("chunkId") or "")
                     fallback = cls._hydrate_original_chunks(
                         actor.tenant_id,
@@ -711,10 +711,10 @@ class RetrievalPipeline:
                         source["contextMapped"] = True
                         cursor = source["contextEnd"]
                     else:
-                        # Keep provenance even when the source unit was normalized,
-                        # summarized or the parent context was truncated. In that
-                        # case the exact parent offsets are unavailable, but the
-                        # unit/location chain must not disappear.
+                        # 即使 source unit 经归一化、摘要化或 parent context 被截断，也必须保留 provenance，
+                        # 因为回答引用仍需要能追溯到原始文档；此时可以缺失精确 parent offset，
+                        # 但 source unit、文档位置和 build 链路必须继续存在，
+                        # 不能为了展示处理后的文本而丢掉证据来源链。
                         source["contextMapped"] = False
                     source_units.append(source)
 

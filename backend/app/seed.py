@@ -23,17 +23,17 @@ logger = logging.getLogger(__name__)
 class DemoSeed:
     @staticmethod
     def run():
-        """Ensures tables exist and demo seed data (tenant, admin user, ops group, default config) is present."""
+        """确保数据表存在，并幂等补齐本地演示所需的租户、管理员、运维组和默认配置；重复执行不会覆盖已有业务数据。"""
         now = datetime.now(timezone.utc)
 
-        # 1. Ensure metadata schema tables are created
+        # 第 1 步：确保元数据表已创建；seed 本身保持幂等，重复启动不会重复建表或破坏现有数据。
         try:
             metadata.create_all(bind=engine)
         except Exception as e:
             logger.warning("metadata.create_all check: %s", e)
 
         with get_db_connection() as conn:
-            # 2. Seed Tenant: tenant-demo-1
+            # 第 2 步：写入演示租户 tenant-demo-1；仅在不存在时创建，已有租户配置不被覆盖。
             tenant = conn.execute(
                 select(tenant_table).where(tenant_table.c.code == "demo")
             ).first()
@@ -56,7 +56,7 @@ class DemoSeed:
             else:
                 tenant_id = str(tenant.id)
 
-            # 3. Seed Admin User
+            # 第 3 步：创建演示管理员用户，供本地联调和端到端测试使用。
             admin_user = conn.execute(
                 select(app_user_table).where(
                     app_user_table.c.tenant_id == tenant_id,
@@ -86,7 +86,7 @@ class DemoSeed:
             else:
                 user_id = str(admin_user.id)
 
-            # 4. Seed Ops Group
+            # 第 4 步：创建默认运维组，用于验证组成员与 ACL 继承逻辑。
             ops_group = conn.execute(
                 select(user_group_table).where(
                     user_group_table.c.tenant_id == tenant_id,
@@ -111,7 +111,7 @@ class DemoSeed:
             else:
                 group_id = str(ops_group.id)
 
-            # 5. Seed Group Membership
+            # 第 5 步：建立演示用户与运维组的成员关系，保证权限链路有可测试数据。
             gm = conn.execute(
                 select(group_member_table).where(
                     group_member_table.c.tenant_id == tenant_id,
@@ -132,7 +132,7 @@ class DemoSeed:
                 )
                 conn.commit()
 
-            # 6. Seed versioned enterprise retrieval strategy.
+            # 第 6 步：写入版本化企业检索策略；配置版本必须固定，历史运行才能按原参数复现。
             enterprise_cfg_id = "cfg-enterprise-retrieval-v2"
             enterprise_cfg = conn.execute(
                 select(config_revision_table).where(
@@ -191,8 +191,8 @@ class DemoSeed:
                 )
                 conn.commit()
 
-            # Keep v1 for backwards-compatible historical runs.
-            # 6b. Seed Default Retrieval Strategy Config
+            # 保留 v1 配置供历史 run 回放和对比，不能因为默认策略升级就修改已完成实验的解释上下文。
+            # 第 6b 步：设置默认检索策略配置，新请求使用当前版本，历史请求仍引用自己的已发布版本。
             default_cfg = conn.execute(
                 select(config_revision_table).where(
                     config_revision_table.c.tenant_id == tenant_id,
@@ -227,7 +227,7 @@ class DemoSeed:
                 )
                 conn.commit()
 
-            # 7. Seed model gateway aliases referenced by model_call records.
+            # 第 7 步：写入 model_call 记录会引用的模型网关别名，确保 usage/成本审计能映射到稳定模型标识。
             model_configs = {
                 "cfg-model-chat-main": "chat-main",
                 "cfg-model-embedding-main": "embedding-main",

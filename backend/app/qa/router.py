@@ -100,7 +100,7 @@ def stream_run_events(
     run_id: str,
     actor: Actor = Depends(get_current_actor),
 ):
-    # Authorization is checked before streaming begins.
+    # 流式响应开始前先完成授权检查；一旦开始输出 SSE/stream，就不能再依赖后续 HTTP 状态码阻止越权内容。
     QaService.get_run(actor, run_id)
 
     def event_stream():

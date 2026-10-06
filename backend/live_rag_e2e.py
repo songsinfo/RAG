@@ -14,7 +14,7 @@ SEED_PASSWORD = os.getenv("RAG_SEED_PASSWORD", "")
 
 client = httpx.Client(base_url=BASE_URL, timeout=60.0)
 
-# Step 1: CSRF & Login
+# 第 1 步：获取 CSRF 并登录，建立后续端到端请求使用的真实会话。
 csrf_init = client.get("/api/v1/auth/csrf").json()["csrfToken"]
 login_resp = client.post(
     "/api/v1/auth/login",
@@ -27,7 +27,7 @@ assert login_resp.status_code == 200, f"Login failed: {login_resp.text}"
 csrf_token = client.get("/api/v1/auth/csrf").json()["csrfToken"]
 headers = {"X-CSRF-Token": csrf_token}
 
-# Step 2: Create Knowledge Base via /api/v1/admin/knowledge-bases
+# 第 2 步：通过 /api/v1/admin/knowledge-bases 创建知识库，验证管理端真实 API 契约。
 kb_name = f"高并发架构规范库-{int(time.time())}"
 kb_resp = client.post(
     "/api/v1/admin/knowledge-bases",
@@ -40,7 +40,7 @@ kb_data = kb_resp.json()
 kb_id = kb_data["id"]
 print(f"Created Knowledge Base: ID={kb_id}, Name={kb_name}")
 
-# Step 3: Upload Document via /api/v1/admin/documents
+# 第 3 步：通过 /api/v1/admin/documents 上传文档，触发真实 ingestion/build 流程。
 doc_content = """# 高并发架构与容灾规范
 
 ## 核心分流与限流策略
@@ -76,7 +76,7 @@ doc_id = up_data["documentId"]
 build_id = up_data.get("buildId")
 print(f"Uploaded Document: ID={doc_id}, BuildID={build_id}")
 
-# Step 4: Poll for Build Completion
+# 第 4 步：轮询 build 到完成状态；只有索引发布后才继续问答，避免把构建竞态误当成检索失败。
 print("Waiting for indexing and building to complete...")
 active_build = None
 for i in range(40):
@@ -91,7 +91,7 @@ for i in range(40):
 else:
     raise RuntimeError("Timed out waiting for document indexing")
 
-# Step 5: Create Conversation
+# 第 5 步：创建会话，为后续多轮问题提供 segment 与历史上下文。
 conv_resp = client.post(
     "/api/v1/conversations",
     json={"title": "架构规范问答测试", "scope": {"mode": "SELECTED", "kbIds": [kb_id]}},
@@ -101,7 +101,7 @@ assert conv_resp.status_code == 201
 conv_id = conv_resp.json()["conversationId"]
 print(f"\nCreated Conversation: ID={conv_id}")
 
-# Step 6: Submit First Question
+# 第 6 步：提交第一轮问题，验证从检索到模型生成的完整 RAG 路径。
 question1 = "生产环境 MySQL 采用什么复制模式？RPO 和 RTO 指标各是多少？"
 print(f"\n=======================================================")
 print(f"  [QUESTION 1]: {question1}")
@@ -116,7 +116,7 @@ print("Submit Run 1 status:", run_resp1.status_code, run_resp1.json())
 assert run_resp1.status_code == 202
 run_id1 = run_resp1.json()["runId"]
 
-# Poll Run 1
+# 轮询第一轮 run 到终态，确保最终 answer/evidence 已经持久化。
 run1_data = None
 for i in range(40):
     time.sleep(1)
@@ -147,7 +147,7 @@ print(f"\n>>> Extracted Claims & Citations ({len(run1_data.get('claims', []))} c
 for cl in run1_data.get("claims", []):
     print(f"  - Claim: {cl.get('text')} | Evidence: {cl.get('evidence')}")
 
-# Step 7: Submit Second Question (Milvus retrieval params)
+# 第 7 步：提交第二轮问题，并验证 Milvus 检索参数在真实多轮上下文中正确生效。
 question2 = "知识库系统采用什么向量引擎进行检索？混合检索的融合参数 k 统一设定为多少？"
 print(f"\n=======================================================")
 print(f"  [QUESTION 2]: {question2}")

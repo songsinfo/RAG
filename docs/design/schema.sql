@@ -1,7 +1,7 @@
--- Design DDL v1.0, MySQL 8.4. Not executed or an applied migration.
--- No database creation/drop, secrets, seed accounts, or company content.
--- UTC DATETIME(6); application must set connection time zone to +00:00.
--- Polymorphic job.target_id and audit object ids are checked by services.
+-- 设计版 DDL v1.0，目标 MySQL 8.4；该文件用于描述目标结构，不代表已经执行，也不是可直接回放的迁移记录。
+-- 文件中不包含建库/删库命令、密钥、seed 账号密码或公司业务内容，避免设计文档携带环境敏感信息。
+-- 所有时间字段使用 UTC DATETIME(6)；应用连接必须设置 +00:00 时区，避免跨环境写入本地时区造成排序/过期判断偏差。
+-- job.target_id 与 audit 对象 ID 属于多态引用，无法用单一外键表达，因此由服务层按 kind/object_type 强制校验。
 
 CREATE TABLE tenant (
   id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -759,7 +759,7 @@ CREATE TABLE deletion_record (
   CONSTRAINT fk_96 FOREIGN KEY (tenant_id,requested_by) REFERENCES app_user (tenant_id,id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
--- Deferred circular reference: an active build must belong to this document.
+-- 这是延迟校验的循环引用：document.active_build_id 指向的 build 必须属于该 document；发布流程在事务中保证这一不变量。
 ALTER TABLE document ADD CONSTRAINT fk_document_active_build
   FOREIGN KEY (tenant_id,id,active_build_id)
   REFERENCES index_build (tenant_id,document_id,id);

@@ -35,8 +35,8 @@ def _build_chat_model(
         max_tokens=max_tokens,
         temperature=0.0,
         timeout=timeout_seconds,
-        # LiteLLM is used as an OpenAI-compatible Chat Completions gateway.
-        # Keep this explicit so model-name heuristics cannot silently switch API shape.
+        # LiteLLM 作为 OpenAI-compatible Chat Completions 网关使用；具体供应商差异统一在网关层吸收。
+        # 这里显式固定 API 形态，避免仅凭模型名启发式判断而静默切换协议，导致请求结构不兼容。
         use_responses_api=False,
     )
 

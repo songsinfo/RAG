@@ -23,7 +23,7 @@ def test_normalizer_terms():
     text = "Error in backend/app/main.py: INVALID_MODEL_RESPONSE with active_build_id and expectedVersion"
     norm = normalize_terms(text)
 
-    # Check that paths, snake_case, camelCase and error codes are normalized
+    # 验证路径、snake_case、camelCase 与错误码都会生成可检索的归一化 token。
     assert "main" in norm.lower()
     assert "active" in norm.lower()
     assert "build" in norm.lower()
@@ -38,7 +38,7 @@ def test_rrf_fusion():
 
     fused = rrf_fuse([list1, list2], weights=[1.0, 1.0], rrf_k=60)
     assert len(fused) == 4
-    # docB is rank 2 in list1 (1/62) and rank 1 in list2 (1/61), should rank highest
+    # docB 在两个列表中排名分别为 2 和 1，RRF 累计分最高，因此融合后应排第一。
     assert fused[0]["id"] == "docB"
     assert fused[0]["score"] > fused[1]["score"]
 
@@ -76,7 +76,7 @@ def test_hybrid_search_acl_and_rebuild(client):
         conn.execute(knowledge_base_table.insert().values(tenant_id=tenant_id, id=kb1_id, name="KB 1", status="LIVE", row_version=1, created_at=now, updated_at=now))
         conn.execute(knowledge_base_table.insert().values(tenant_id=tenant_id, id=kb2_id, name="KB 2", status="LIVE", row_version=1, created_at=now, updated_at=now))
 
-        # Grant viewer access ONLY to KB 1
+        # viewer 只授予 KB1 权限，用于验证检索不会跨 ACL 泄露 KB2 数据。
         conn.execute(
             kb_grant_table.insert().values(
                 tenant_id=tenant_id,
@@ -89,7 +89,7 @@ def test_hybrid_search_acl_and_rebuild(client):
                 updated_at=now,
             )
         )
-        # Grant admin access to KB 1 and KB 2
+        # admin 同时授予 KB1/KB2 权限，作为完整可见性的对照组。
         conn.execute(
             kb_grant_table.insert().values(
                 tenant_id=tenant_id,
@@ -115,7 +115,7 @@ def test_hybrid_search_acl_and_rebuild(client):
             )
         )
 
-        # Doc 1 in KB 1 (accessible to viewer)
+        # 文档 1 位于 KB1，对 viewer 可见。
         doc1_id = "doc-1"
         build1_id = "build-1"
         conn.execute(
@@ -165,7 +165,7 @@ def test_hybrid_search_acl_and_rebuild(client):
             )
         )
 
-        # Doc 2 in KB 2 (secret, NOT accessible to viewer)
+        # 文档 2 位于 KB2，属于 viewer 不可见的敏感数据。
         doc2_id = "doc-2"
         build2_id = "build-2"
         conn.execute(
@@ -215,10 +215,10 @@ def test_hybrid_search_acl_and_rebuild(client):
             )
         )
 
-    # Rebuild index from MySQL
+    # 根据 MySQL active build 重建测试索引，确保检索数据与持久化状态一致。
     MilvusHybridService.rebuild_from_mysql(tenant_id)
 
-    # 1. Login as viewer
+    # 第 1 步：以 viewer 登录，验证最小权限检索。
     csrf_resp = client.get("/api/v1/auth/csrf")
     csrf_token = csrf_resp.json()["csrfToken"]
     login_resp = client.post(
@@ -228,7 +228,7 @@ def test_hybrid_search_acl_and_rebuild(client):
     )
     assert login_resp.status_code == 200
 
-    # Viewer search: should see chunk-1 from KB 1, NOT chunk-2 from KB 2
+    # viewer 搜索只能看到 KB1 的 chunk-1，绝不能返回 KB2 的 chunk-2。
     search_resp = client.get("/api/v1/search?query=milvus")
     assert search_resp.status_code == 200
     evidence = search_resp.json()["evidence"]
@@ -236,7 +236,7 @@ def test_hybrid_search_acl_and_rebuild(client):
     assert "chunk-1" in chunk_ids
     assert "chunk-2" not in chunk_ids
 
-    # 2. Login as admin
+    # 第 2 步：切换为 admin 登录，验证管理员可见范围。
     csrf_resp = client.get("/api/v1/auth/csrf")
     csrf_token = csrf_resp.json()["csrfToken"]
     login_admin = client.post(
@@ -246,14 +246,14 @@ def test_hybrid_search_acl_and_rebuild(client):
     )
     assert login_admin.status_code == 200
 
-    # Admin search: should see both chunk-1 and chunk-2
+    # admin 搜索应同时看到 chunk-1 与 chunk-2，作为 ACL 过滤正确性的正向对照。
     admin_search = client.get("/api/v1/search?query=milvus")
     assert admin_search.status_code == 200
     admin_chunk_ids = [e["chunkId"] for e in admin_search.json()["evidence"]]
     assert "chunk-1" in admin_chunk_ids
     assert "chunk-2" in admin_chunk_ids
 
-    # 3. Test delete by build
+    # 第 3 步：按 build 删除索引数据，验证清理范围不会影响其他 build。
     MilvusHybridService.delete_by_build(tenant_id, build1_id)
     post_del_search = client.get("/api/v1/search?query=milvus")
     post_del_chunk_ids = [e["chunkId"] for e in post_del_search.json()["evidence"]]

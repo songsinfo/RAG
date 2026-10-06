@@ -14,7 +14,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         auth_header = self.headers.get("Authorization", "")
         
         if self.path == "/rerank":
-            # Map /rerank to DashScope rerank endpoint
+            # 将统一的 /rerank 路径映射到 DashScope rerank 实际端点，让上层 ModelGateway 不感知供应商 URL 差异。
             target_url = f"{TARGET_HOST}/api/v1/services/rerank/text-rerank/text-rerank"
             req = urllib.request.Request(
                 target_url,
@@ -29,7 +29,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     resp_body = resp.read()
                     data = json.loads(resp_body.decode("utf-8"))
-                    # Unwrap output.results to top-level results for ModelGateway
+                    # 把 DashScope 的 output.results 解包成顶层 results，转换为 ModelGateway 统一消费的响应结构。
                     results = data.get("output", {}).get("results", data.get("results", []))
                     usage = data.get("usage", {})
                     adapted = {
@@ -57,7 +57,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(err_msg)
         else:
-            # Forward other endpoints (/chat/completions, /embeddings, etc.) to compatible-mode/v1
+            # 其他端点（/chat/completions、/embeddings 等）统一转发到 compatible-mode/v1，保持 OpenAI-compatible 调用方式。
             clean_path = self.path
             if not clean_path.startswith("/compatible-mode/v1"):
                 clean_path = "/compatible-mode/v1" + clean_path

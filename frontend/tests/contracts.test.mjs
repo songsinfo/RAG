@@ -10,14 +10,14 @@ const compiled = ts.transpileModule(source, {
 const client = await import('data:text/javascript;base64,' + Buffer.from(compiled).toString('base64'))
 
 test('frontend helper utilities: rows, keyOf, terminal', () => {
-  // rows helper unpacks arrays, items, content, results
+  // rows helper 统一解包数组、items、content、results 等常见响应结构，避免页面层重复兼容。
   assert.deepEqual(client.rows([1, 2, 3]), [1, 2, 3])
   assert.deepEqual(client.rows({ items: ['a', 'b'] }), ['a', 'b'])
   assert.deepEqual(client.rows({ content: ['c'] }), ['c'])
   assert.deepEqual(client.rows({ results: ['d'] }), ['d'])
   assert.deepEqual(client.rows(null), [])
 
-  // keyOf finds canonical ID fields across entities
+  // keyOf 从不同实体中提取统一主键字段，兼容 id/runId/conversationId 等后端响应差异。
   assert.equal(client.keyOf({ id: 'id-1' }), 'id-1')
   assert.equal(client.keyOf({ documentId: 'doc-1' }), 'doc-1')
   assert.equal(client.keyOf({ runId: 'run-1' }), 'run-1')
@@ -30,7 +30,7 @@ test('frontend helper utilities: rows, keyOf, terminal', () => {
   assert.equal(client.keyOf({ caseId: 'case-1' }), 'case-1')
   assert.equal(client.keyOf({ resultId: 'res-1' }), 'res-1')
 
-  // terminal helper recognizes terminal business statuses
+  // terminal helper 识别业务终态；只有终态才停止前端轮询，避免任务仍在运行时提前结束。
   assert.equal(client.terminal('QUEUED'), false)
   assert.equal(client.terminal('RUNNING'), false)
   assert.equal(client.terminal('PENDING'), false)
@@ -108,7 +108,7 @@ test('every frontend REST route correctly prefixes /api/v1 and formats headers',
     return Response.json({ status: 'OK', url, method: options?.method || 'GET' })
   }
 
-  // Pre-seed CSRF
+  // 预先写入 CSRF 状态，聚焦测试 API 封装本身而不是重复覆盖 token 获取流程。
   await client.refreshCsrf()
 
   for (const item of routesToTest) {
