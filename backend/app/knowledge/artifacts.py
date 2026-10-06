@@ -99,8 +99,8 @@ def delete_artifact(storage_key: str):
         try:
             _s3_client().delete_object(Bucket=_bucket(), Key=storage_key)
         except Exception as exc:
-            # A purge is only complete when the private object is actually gone.
-            # Propagate storage failures so the durable job stays FAILED/retryable.
+            # purge 只有在私有对象存储中的实体文件真正删除后才算完成，不能只删除数据库记录。
+            # 存储层删除失败必须继续向上抛出，让 durable job 保持 FAILED/可重试，避免留下无法追踪的敏感文件。
             raise ApiException(503, "ARTIFACT_DELETE_FAILED", f"对象存储删除失败: {exc}") from exc
         return
 
@@ -113,8 +113,8 @@ def delete_artifact(storage_key: str):
             raise ApiException(503, "ARTIFACT_DELETE_FAILED", f"本地构件删除失败: {exc}") from exc
         return
 
-    # Backward compatibility: old content-addressed keys were stored at
-    # tenant/sha[:2]/sha/filename while the persisted key was tenant/sha/filename.
+    # 兼容旧版内容寻址路径：历史对象实际可能存放在 tenant/sha[:2]/sha/filename，
+    # 但数据库里曾只记录 tenant/sha/filename；清理时同时兼容旧路径，避免升级后产生孤儿对象。
     parts = storage_key.split("/")
     if len(parts) == 3:
         tenant_id, sha_hex, filename = parts

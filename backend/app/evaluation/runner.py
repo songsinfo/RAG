@@ -65,7 +65,7 @@ from app.model_budget import BudgetService
 
 
 def check_no_model(config: Dict[str, Any]):
-    """Verify RETRIEVAL_ONLY against the same effective config used at runtime."""
+    """用与运行时完全相同的 effective config 校验 RETRIEVAL_ONLY，确保该模式不会偷偷触发 embedding、rerank 或其他模型调用。"""
     try:
         effective = validate_retrieval_payload(config)
     except ApiException as exc:
@@ -93,7 +93,7 @@ def check_no_model(config: Dict[str, Any]):
 
 
 def number(v: Any) -> float:
-    """Parse and validate numeric parameter."""
+    """解析并校验数值参数；统一处理字符串/数字输入，并在非法值进入预算与比较逻辑前失败。"""
     try:
         n = float(v)
         if not math.isfinite(n):
@@ -211,8 +211,8 @@ class EvaluationRunner:
                 total_questions = len(cases_rows) * repeats
                 # v2 Judge 会看到完整最终答案和真实历史，因此 Judge 预算比旧 claims-only 更保守。
                 # 这里是启动上限估算，不是供应商账单。
-                # v2 Judge sees the complete final answer plus actual conversation history.
-                # Keep this conservative: answer/retrieval work plus one larger semantic Judge payload.
+                # v2 Judge 会看到完整最终答案和真实会话历史，因此预算必须覆盖比旧版 claims-only 更大的语义评估输入。
+                # 这里故意采用保守上限：把回答/检索开销与一次更大的 Judge payload 一并计入，避免低估费用后再超限。
                 input_tokens = total_turns * 30000 + total_questions * 42000
                 output_tokens = total_turns * 6000 + total_questions * 2800
                 ceiling = round((input_tokens * 0.00002 + output_tokens * 0.00006), 4)
@@ -369,8 +369,8 @@ class EvaluationRunner:
         if is_test_env():
             EvaluationRunner._execute_run(actor, run_id)
 
-        # Non-test environments leave the durable EVALUATE job queued for
-        # app.runtime.worker, so process restarts do not lose long evaluations.
+        # 非测试环境只创建并保留 durable EVALUATE job，
+        # 由 app.runtime.worker 后台领取；即使进程重启，长时间评估也能从数据库任务继续。
         return {"runId": run_id, "jobId": job_id, "status": "QUEUED"}
 
     @staticmethod
@@ -436,7 +436,7 @@ class EvaluationRunner:
 
         for res in pending_results:
             # 每题开始前都检查取消；已经完成的结果保留，未开始题仍留在计划分母。
-            # Check if cancelled
+            # 每个 case 执行前检查 run 是否已取消，避免取消后继续产生模型调用和评估费用。
             with get_db_connection() as conn:
                 curr_run = conn.execute(
                     select(eval_run_table.c.status).where(
@@ -552,8 +552,8 @@ class EvaluationRunner:
 
                     # 状态/检索命中无法证明语义正确：
                     # HUMAN 模式保持 UNDETERMINED；LLM 模式才进入完整答案 Judge。
-                    # LLM judge or deterministic evaluation
-                    # Retrieval and output status cannot establish semantic correctness.
+                    # 根据 judgeMode 选择 LLM Judge 或确定性规则；两种路径都输出统一语义判定结构。
+                    # “检索成功/请求成功”只代表执行链路完成，不能据此推断答案语义正确；正确性必须由独立评估得出。
                     correctness = "UNDETERMINED" if is_terminal_success and status_matches else "WRONG"
                     judge_obj = {
                         "correctness": correctness,
@@ -680,7 +680,7 @@ class EvaluationRunner:
                         actor, result_id, "FAILED", fail_metric, {"error": str(e)}, error_code=type(e).__name__
                     )
 
-        # Finish run
+        # 所有计划结果都进入终态后再结束 run，并统一计算聚合指标；不能只统计成功样本。
         with get_db_connection() as conn:
             curr_run = conn.execute(
                 select(eval_run_table.c.status).where(
@@ -765,18 +765,18 @@ class EvaluationRunner:
 
     @staticmethod
     def _judge_conversation_context(persona: Actor, qa_run_ids: List[str]) -> List[Dict[str, str]]:
-        """构造 Judge 使用的真实历史；最后助手回答单独作为 answerText，不在历史里重复。"""
-        """Build the exact prior user/assistant history plus the final user turn.
+        """构造 Judge 使用的真实历史。
 
-        The final assistant answer is scored separately as answerText and is therefore not duplicated here.
+        只包含此前完整的 user/assistant 历史以及最后一轮 user 问题；
+        最终 assistant 回答会单独作为 answerText 评分，因此这里不能重复拼进去。
         """
         if not qa_run_ids:
             return []
 
         # 历史正文即将再次发送给外部 Judge，因此每个历史 run 都重新做当前权限/快照校验。
         # 任一来源撤权都直接失败关闭。
-        # History is about to be re-sent to an external Judge. Revalidate every
-        # contributing QA run at send time so revoked/changed sources fail closed.
+        # 会话历史即将再次发送给外部 Judge，因此在发送时重新验证每一个贡献过内容的 QA run，
+        # 只要底层 source 已撤权或发生安全变化，就采用 fail-closed，禁止把历史敏感内容再次外发。
         from app.qa.context import assert_run_sources_readable
         for history_run_id in qa_run_ids:
             assert_run_sources_readable(persona, str(history_run_id))
@@ -874,7 +874,7 @@ class EvaluationRunner:
             ideal_grades.append(max_grade)
 
         # 逐 rank 匹配 anchor，同时记录 relevance grade 供 nDCG 使用。
-        # Ranked hits matching against anchors
+        # 将有序检索结果与 Gold anchors 对齐，计算 hit/recall/MRR 等指标；排序位置必须保留，不能先去掉失败项。
         ranked: List[Set[str]] = []
         ranked_grades: List[int] = []
         seen_groups: Set[int] = set()
@@ -1055,15 +1055,15 @@ class EvaluationRunner:
             if semantic_mode:
                 # 执行状态和语义判定是两个正交轴：
                 # FAILED/PENDING 不是语义 WRONG，只能记为未获得语义判定。
-                # Execution and semantic judgment are separate axes. A failed/pending execution
-                # cannot become a semantic WRONG merely because an error path stored taskSuccess=False.
+                # 执行状态与语义判定是两个独立维度；FAILED/PENDING 只说明任务没有完成，
+                # 不能因为错误路径把 taskSuccess=False 就自动记成语义 WRONG，否则会把系统故障混入答案质量。
                 if str(r.status) == "COMPLETED" and isinstance(m.get("taskSuccess"), bool):
                     judged += 1
                     success_count += int(m["taskSuccess"] is True)
                 else:
                     semantic_unknown += 1
             else:
-                # Preserve existing retrieval-mode success semantics without presenting them as QA judgment.
+                # 保留 retrieval-only 的既有执行成功语义，但明确不要把它包装成 QA 正确性结论。
                 if isinstance(m.get("taskSuccess"), bool):
                     judged += 1
                     success_count += int(m["taskSuccess"] is True)
@@ -1260,7 +1260,7 @@ class EvaluationRunner:
                     "judge": obj(e.judge_json),
                     "errorCode": str(e.error_code) if e.error_code else None,
                 }
-                # Reviews
+                # 合并人工 review：人工最新标签优先覆盖对应维度，未人工修改的维度仍保留自动 Judge 结果。
                 rev_rows = conn.execute(
                     select(eval_review_table).where(
                         and_(
@@ -1466,16 +1466,18 @@ class EvaluationRunner:
     @staticmethod
     def compare_with_baseline(actor: Actor, run_id: str, baseline_report_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Compare a Python/Milvus evaluation run with the frozen Java/ES baseline report.
-        Reads artifacts/baseline-report.json and computes deltas per caseKey and overall metrics.
+        将 Python/Milvus 评估 run 与冻结的 Java/ES 基线报告比较。
+
+        从 artifacts/baseline-report.json 读取不可变基线，按 caseKey 对齐逐题结果，
+        同时计算整体指标差值，避免因为样本顺序不同造成错误比较。
         """
         EvaluationCatalog.require_admin(actor)
         if not baseline_report_path:
-            # Default to repo root artifacts/baseline-report.json
+            # 默认从仓库根目录读取冻结的 baseline-report.json，便于 CI 与本地使用同一基线。
             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
             baseline_report_path = os.path.join(repo_root, "artifacts", "baseline-report.json")
             if not os.path.exists(baseline_report_path):
-                # Fallback to local worktree artifacts
+                # 若以其他工作目录运行，则回退到当前 worktree 的 artifacts 路径，避免路径差异导致比较功能不可用。
                 worktree_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
                 baseline_report_path = os.path.join(worktree_root, "..", "artifacts", "baseline-report.json")
 
@@ -1528,7 +1530,7 @@ class EvaluationRunner:
                 },
             })
 
-        # Metric deltas
+        # 对齐同名指标后计算 delta；保持基线值、当前值和差值同时可见，避免只看单一涨跌数字。
         c_recall = current_metrics.get("recallAt5") or 0.0
         b_recall = baseline_metrics.get("recallAt5") or 0.0
         c_p50 = current_metrics.get("observedP50Ms") or 0.0

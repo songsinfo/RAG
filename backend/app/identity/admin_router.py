@@ -102,7 +102,7 @@ def update_group_members(
         if not grp:
             raise ApiException(404, "RESOURCE_NOT_FOUND", "用户组不存在")
 
-        # Optimistic lock check on tenant security_epoch
+        # 使用 tenant.security_epoch 做乐观锁校验：权限更新必须基于最新安全版本，避免并发修改互相覆盖或旧权限被重新写回。
         res = conn.execute(
             update(tenant_table)
             .where(

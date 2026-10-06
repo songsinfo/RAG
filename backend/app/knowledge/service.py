@@ -499,7 +499,7 @@ class KnowledgeService:
 
     @staticmethod
     def recover_unfinished_jobs():
-        """Requeue only expired leased jobs; queued jobs survive process restarts."""
+        """仅重新入队租约已过期的任务；原本处于 QUEUED 的任务天然保存在数据库中，进程重启不会丢失。"""
         try:
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
@@ -648,7 +648,7 @@ class KnowledgeService:
                 .values(row_version=new_version, updated_at=now)
             )
 
-            # Re-create grants
+            # 重新创建知识库授权关系：先基于当前请求重建 grants，再统一提升 security_epoch，避免权限变更与安全版本不同步。
             conn.execute(
                 kb_grant_table.delete().where(
                     and_(
@@ -670,14 +670,14 @@ class KnowledgeService:
                         updated_at=now,
                     )
                 )
-            # Bump security_epoch
+            # 权限集合发生变化后提升 security_epoch；后续异步任务和历史会话会用该版本判断授权是否已经过期。
             conn.execute(
                 update(tenant_table)
                 .where(tenant_table.c.id == actor.tenant_id)
                 .values(security_epoch=tenant_table.c.security_epoch + 1)
             )
 
-            # Audit event
+            # 写入审计事件，保留本次权限变更的操作者、对象和结果，便于追踪安全相关修改。
             conn.execute(
                 audit_event_table.insert().values(
                     tenant_id=actor.tenant_id,
@@ -794,7 +794,7 @@ class KnowledgeService:
                 )
             )
 
-            # Re-create document grants
+            # 重新创建文档级 grants；文档 ACL 是知识库 ACL 之上的进一步收敛，不能仅复用 KB 授权结果。
             conn.execute(
                 document_grant_table.delete().where(
                     and_(
@@ -820,14 +820,14 @@ class KnowledgeService:
                     )
                 )
 
-            # Bump security_epoch
+            # 权限集合发生变化后提升 security_epoch；后续异步任务和历史会话会用该版本判断授权是否已经过期。
             conn.execute(
                 update(tenant_table)
                 .where(tenant_table.c.id == actor.tenant_id)
                 .values(security_epoch=tenant_table.c.security_epoch + 1)
             )
 
-            # Audit event
+            # 写入审计事件，保留本次权限变更的操作者、对象和结果，便于追踪安全相关修改。
             conn.execute(
                 audit_event_table.insert().values(
                     tenant_id=actor.tenant_id,
@@ -908,7 +908,7 @@ class KnowledgeService:
             if not doc:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
-            # ACL check for non-admin
+            # 非管理员必须经过 ACL 校验；管理员走独立特权路径，普通用户绝不能因为知道资源 ID 就绕过授权。
             if not actor.admin and not can_read_document(conn, actor, str(doc.id)):
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "文档不存在")
 
@@ -968,7 +968,7 @@ class KnowledgeService:
                     "status": str(existing_job.status),
                 }
 
-            # 2. Check KB
+            # 第 2 步：确认目标知识库存在且当前用户可写；导入任务在落库前先固定权限边界。
             kb = conn.execute(
                 select(knowledge_base_table.c.id).where(
                     and_(
@@ -1076,7 +1076,7 @@ class KnowledgeService:
                 )
             )
 
-            # 6. Create Config Revision & Index Build
+            # 第 6 步：冻结本次构建使用的配置 revision，并创建独立 index build；后续重试始终复用同一份不可变配置。
             cfg_id = str(uuid.uuid4())
             cfg_hash = hashlib.sha256(json.dumps(build_config, sort_keys=True).encode("utf-8")).digest()
             conn.execute(
@@ -1116,7 +1116,7 @@ class KnowledgeService:
                 )
             )
 
-            # 7. Create Job
+            # 第 7 步：创建 durable job，把耗时解析/切分/索引从 HTTP 请求移到可恢复的后台执行链路。
             job_id = str(uuid.uuid4())
             checkpoint = {
                 "documentId": doc_id,
@@ -1146,8 +1146,8 @@ class KnowledgeService:
             )
             conn.commit()
 
-        # Tests execute synchronously. Non-test environments leave the durable
-        # job queued for the DB-backed worker (embedded or standalone).
+        # 测试环境为了确定性会同步执行；非测试环境只负责把 durable job 入队，
+        # 后续由基于数据库租约的 worker（内嵌或独立进程）领取，进程重启也不会丢任务。
         from app.config import is_test_env
         if is_test_env():
             KnowledgeService._execute_ingestion_job(
@@ -1220,8 +1220,8 @@ class KnowledgeService:
 
         # 这里能安全重建，是因为所有这些表都是由 immutable source artifact 派生出来的；
         # active/READY build 属于已发布事实，禁止使用这条恢复路径清理。
-        # Safe restart point: unpublished build data is derived from the immutable
-        # source artifact, so remove partial rows and deterministically rebuild it.
+        # 这里是安全的重启点：未发布 build 的中间数据都可以从不可变 source artifact 重新推导，
+        # 因此恢复时先删除半成品行，再确定性重建，避免一次崩溃留下重复 chunk/source_unit。
         conn.execute(delete(representation_table).where(and_(
             representation_table.c.tenant_id == tenant_id,
             representation_table.c.build_id == build_id,
@@ -1255,8 +1255,8 @@ class KnowledgeService:
         try:
             # Docling 是昂贵外部调用，调用前先检查 lease，避免旧 worker 浪费资源。
             # build_config 从 build 绑定的 config revision 读取，重试时参数保持不变。
-            # Reject stale workers before the potentially expensive Docling call
-            # and load the immutable build configuration used for chunking.
+            # 在昂贵的 Docling 调用之前先拒绝已经失去 lease 的旧 worker，避免无意义消耗解析资源，
+            # 同时读取本次 build 已冻结的配置，确保重试不会因为线上配置变化而改变切分结果。
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
                     return
@@ -1350,8 +1350,8 @@ class KnowledgeService:
                     return
 
                 # 崩溃恢复采用“删除未发布派生数据后从原 Artifact 重建”，保证结果确定且幂等。
-                # Recovery is idempotent: partial rows from a crashed attempt are
-                # removed only for an unpublished build, then rebuilt from artifact.
+                # 恢复流程必须幂等：只清理“尚未发布 build”的崩溃半成品，
+                # 再从 artifact 重新生成；已发布 build 不允许被恢复逻辑破坏。
                 KnowledgeService._reset_unpublished_build(conn, tenant_id, doc_id, build_id)
                 conn.commit()
 
@@ -1617,7 +1617,7 @@ class KnowledgeService:
                     job_id=job_id,
                 )
 
-            # Fenced publish: only the current lease owner can make the build active.
+            # 发布采用 fencing：只有当前 lease owner 才能把 build 切成 active，旧 worker 即使晚到也无法覆盖新结果。
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
                 if not KnowledgeService._lease_is_current(conn, tenant_id, job_id, lease_epoch):
@@ -1673,8 +1673,8 @@ class KnowledgeService:
                 conn.commit()
 
         except ApiException as exc:
-            # A lease loss must never let an old worker overwrite the new owner's
-            # state. Other errors are recorded only if this worker still owns it.
+            # 一旦 lease 丢失，旧 worker 绝不能再写入新 owner 已接管的状态；
+            # 其他错误也只有在当前 worker 仍持有 lease 时才能记录，避免“僵尸写回”。
             if exc.code == "JOB_LEASE_LOST":
                 return
             with get_db_connection() as conn:
@@ -2054,7 +2054,7 @@ class KnowledgeService:
                 if not doc.active_build_id:
                     raise ApiException(409, "RESTORE_NOT_READY", "文档没有已发布构建")
 
-                # Verify artifacts
+                # 恢复前校验原始 artifact 仍然存在且可读；源文件已经丢失时不能假装可以重建索引。
                 artifacts = conn.execute(
                     select(artifact_table.c.storage_key).where(
                         and_(
@@ -2067,7 +2067,7 @@ class KnowledgeService:
                 for art in artifacts:
                     read_artifact(str(art.storage_key))
 
-                # Restore in Milvus if needed
+                # 如向量索引已缺失，则按 MySQL 中的 canonical 数据恢复 Milvus；该步骤应保持可重复执行。
                 build_id = str(doc.active_build_id)
                 child_chunks = conn.execute(
                     select(
@@ -2366,8 +2366,8 @@ class KnowledgeService:
                 )
                 # PURGE 是隐私硬边界：递增 QA job lease_epoch，立即废掉仍在运行的旧 worker；
                 # 同时删除 LangGraph checkpoint/resume，防止已清理正文从 checkpoint 中复活。
-                # Purge is a privacy boundary: invalidate the QA execution lease
-                # and atomically destroy LangGraph history/pending writes/resume data.
+                # purge 是隐私边界：先让相关 QA 执行 lease 失效，阻止仍在运行的 worker 继续写回被删除的数据，
+                # 并原子清理 LangGraph history、pending writes 与 resume 数据，确保无法从 checkpoint 恢复已删除内容。
                 conn.execute(
                     update(job_table)
                     .where(and_(
@@ -2427,7 +2427,7 @@ class KnowledgeService:
                     .values(comment_text=None, resolution_text=None, updated_at=now)
                 )
 
-            # Scrub evaluation data derived from the purged source.
+            # 清理所有由该文档派生的评估数据，避免 Gold/快照/结果继续保留已被用户要求永久删除的内容。
             gold_rows = conn.execute(
                 select(eval_gold_table.c.case_id).where(
                     and_(
@@ -2540,7 +2540,7 @@ class KnowledgeService:
                     .values(status="PURGED", manifest_json={}, manifest_hash=empty_hash, updated_at=now)
                 )
 
-            # Evaluation results can also point at QA runs that referenced the source.
+            # 评估结果还可能间接指向引用过该文档的 QA run，因此 purge 不能只清理 ingestion 表。
             affected_run_ids = [str(ar.id) for ar in affected_runs]
             if affected_run_ids:
                 eval_result_rows = conn.execute(
@@ -2574,7 +2574,7 @@ class KnowledgeService:
                         .values(status="PURGED", metrics_json=None, judge_json=None, updated_at=now)
                     )
 
-            # Scrub source_units
+            # 清理 source_units：这些是解析后的正文载体，属于必须删除的派生内容。
             conn.execute(
                 update(source_unit_table)
                 .where(
@@ -2586,7 +2586,7 @@ class KnowledgeService:
                 .values(text_content=None, location={}, updated_at=now)
             )
 
-            # Scrub chunks, spans and representations
+            # 清理 chunks、span 映射和多种 representation，避免检索索引或摘要残留原文信息。
             doc_builds_stmt = select(index_build_table.c.id).where(
                 and_(
                     index_build_table.c.tenant_id == tenant_id,
@@ -2643,7 +2643,7 @@ class KnowledgeService:
                     .values(quality_warnings=None, review_reason=None, updated_at=now)
                 )
 
-            # Scrub artifacts & document_versions
+            # 最后清理 artifact 元数据与 document_versions；在此之前先确保依赖这些版本的数据都已处理。
             conn.execute(
                 update(artifact_table)
                 .where(
@@ -2665,7 +2665,7 @@ class KnowledgeService:
                 .values(original_name=None, updated_at=now)
             )
 
-            # Finalize document & deletion record
+            # 最终更新 document 删除状态并写入 deletion record，使后续审计能够确认 purge 已完整结束。
             conn.execute(
                 update(document_table)
                 .where(

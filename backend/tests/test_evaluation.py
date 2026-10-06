@@ -33,7 +33,7 @@ from app.models import (
 
 
 # ==============================================================================
-# 1. Algorithmic Metric Tests (Java Parity)
+# 第 1 组：算法指标测试，并与 Java 基线公式保持一致。
 # ==============================================================================
 
 def test_one_of_three_facts_is_a_hit_but_only_third_recall():
@@ -109,8 +109,8 @@ def test_retrieval_only_permits_bm25_without_model_transforms_or_reranking():
         check_no_model({"retrieval": {"mode": "DENSE"}})
     assert exc1.value.code == "MODEL_REQUIRED"
 
-    # Missing mode is normalized exactly like RetrievalConfig.from_payload:
-    # HYBRID, which uses query embeddings and therefore is not zero-model.
+    # mode 缺失时必须与 RetrievalConfig.from_payload 使用相同默认逻辑：
+    # 默认归一化为 HYBRID；该模式会调用 query embedding，因此不能被误判为 zero-model。
     with pytest.raises(ApiException) as exc_default:
         check_no_model({"retrieval": {"topK": 5}})
     assert exc_default.value.code == "MODEL_REQUIRED"
@@ -149,7 +149,7 @@ def test_object_and_map_parsers_validate_structure():
 
 
 # ==============================================================================
-# 2. Lifecycle, Split Leakage & Anchor Validation Tests
+# 第 2 组：题集生命周期、split 泄漏与 Gold anchor 校验测试。
 # ==============================================================================
 
 @pytest.fixture
@@ -160,7 +160,7 @@ def eval_env():
     now = datetime.now(timezone.utc)
 
     with get_db_connection() as conn:
-        # Clean up existing test data
+        # 先清理同名测试数据，保证重复运行时结果不受旧记录影响。
         conn.execute(delete(eval_review_table).where(eval_review_table.c.tenant_id == t_id))
         conn.execute(delete(eval_result_table).where(eval_result_table.c.tenant_id == t_id))
         conn.execute(delete(eval_run_table).where(eval_run_table.c.tenant_id == t_id))
@@ -181,7 +181,7 @@ def eval_env():
         conn.execute(delete(app_user_table).where(app_user_table.c.tenant_id == t_id))
         conn.execute(delete(tenant_table).where(tenant_table.c.id == t_id))
 
-        # Insert tenant
+        # 写入测试租户，作为后续用户、知识库和评估数据的隔离边界。
         conn.execute(
             tenant_table.insert().values(
                 id=t_id,
@@ -192,7 +192,7 @@ def eval_env():
                 created_at=now,
             )
         )
-        # Insert admin user
+        # 写入管理员用户，用于执行评估配置与题集管理操作。
         conn.execute(
             app_user_table.insert().values(
                 tenant_id=t_id,
@@ -205,7 +205,7 @@ def eval_env():
                 updated_at=now,
             )
         )
-        # Insert operator user
+        # 写入普通 operator 用户，验证非管理员权限路径。
         conn.execute(
             app_user_table.insert().values(
                 tenant_id=t_id,
@@ -218,7 +218,7 @@ def eval_env():
                 updated_at=now,
             )
         )
-        # Insert knowledge base
+        # 写入测试知识库，作为 Gold 文档与检索快照的父资源。
         kb_id = "eval-kb-01"
         conn.execute(
             knowledge_base_table.insert().values(
@@ -242,7 +242,7 @@ def eval_env():
                 updated_at=now,
             )
         )
-        # Insert document & build
+        # 写入文档和对应 build，构造可被快照/anchor 引用的真实语料版本。
         doc_id = "doc-eval-01"
         ver_id = "ver-eval-01"
         build_id = "build-eval-01"
@@ -291,7 +291,7 @@ def eval_env():
                 updated_at=now,
             )
         )
-        # Insert source_unit with quote
+        # 写入包含目标 quote 的 source_unit，用于验证 Gold 文本能够重新定位。
         conn.execute(
             source_unit_table.insert().values(
                 tenant_id=t_id,
@@ -308,7 +308,7 @@ def eval_env():
                 updated_at=now,
             )
         )
-        # Insert chunk with quote
+        # 写入包含同一 quote 的 chunk，覆盖 chunk 级命中与 provenance 校验。
         chunk_id = "chunk-eval-01"
         chunk_text = "知识库系统采用结构化分块策略保留Markdown标题层级，提供端到端严谨召回保证。"
         conn.execute(
@@ -353,14 +353,14 @@ def test_dataset_lifecycle_and_freeze_validation(eval_env):
     ver_id = eval_env["ver_id"]
     quote = eval_env["quote"]
 
-    # 1. Create dataset
+    # 第 1 步：创建评估题集及初始版本。
     ds = EvaluationCatalog.create_dataset(admin, {"name": "Smoke Dataset"})
     assert ds["name"] == "Smoke Dataset"
     assert ds["revision"] == 1
     assert ds["status"] == "DRAFT"
     ds_id = ds["id"]
 
-    # 2. Import cases
+    # 第 2 步：批量导入 case，建立问题、预期与 Gold 结构。
     cases_payload = [
         {
             "caseKey": "case-01",
@@ -391,12 +391,12 @@ def test_dataset_lifecycle_and_freeze_validation(eval_env):
     res = EvaluationCatalog.save_cases(admin, ds_id, cases_payload)
     assert res["count"] == 1
 
-    # 3. Attempt freeze with DRAFT annotationStatus -> should fail with ANNOTATION_REQUIRED
+    # 第 3 步：annotationStatus 仍为 DRAFT 时尝试 freeze，必须返回 ANNOTATION_REQUIRED。
     with pytest.raises(ApiException) as exc:
         EvaluationCatalog.freeze(admin, ds_id)
     assert exc.value.code == "ANNOTATION_REQUIRED"
 
-    # 4. Attempt import with split leakage -> should fail with SPLIT_LEAKAGE
+    # 第 4 步：导入存在 split 泄漏的 case，必须返回 SPLIT_LEAKAGE。
     leak_case = {
         "caseKey": "case-02-leak",
         "groupKey": "grp-01",  # Same groupKey as case-01
@@ -422,21 +422,21 @@ def test_dataset_lifecycle_and_freeze_validation(eval_env):
         },
         "annotationStatus": "AUTO_REVIEWED",
     }
-    # Update case-01 to AUTO_REVIEWED first
+    # 先把 case-01 更新为 AUTO_REVIEWED，排除 annotation 状态对后续 split 校验的干扰。
     EvaluationCatalog.update_case(admin, EvaluationCatalog.cases(admin, ds_id)[0]["id"], {"annotationStatus": "AUTO_REVIEWED"})
-    # Save leak case
+    # 保存专门构造的泄漏 case，用于 freeze 阶段检测跨 split 重复。
     EvaluationCatalog.save_cases(admin, ds_id, [leak_case])
 
-    # Now freeze should detect SPLIT_LEAKAGE
+    # 此时 freeze 应准确检测 SPLIT_LEAKAGE，而不是被其他前置校验抢先失败。
     with pytest.raises(ApiException) as exc_leak:
         EvaluationCatalog.freeze(admin, ds_id)
     assert exc_leak.value.code == "SPLIT_LEAKAGE"
 
-    # Remove the leaking case
+    # 删除泄漏 case，继续验证后续 anchor 和冻结流程。
     leak_case_id = [c["id"] for c in EvaluationCatalog.cases(admin, ds_id) if c["caseKey"] == "case-02-leak"][0]
     EvaluationCatalog.delete_case(admin, leak_case_id)
 
-    # 5. Freeze with invalid quote -> should fail with ANCHOR_UNRESOLVED
+    # 第 5 步：使用无法在语料中定位的 quote 冻结，必须返回 ANCHOR_UNRESOLVED。
     invalid_quote_case = {
         "caseKey": "case-03-bad-quote",
         "groupKey": "grp-03",
@@ -467,21 +467,21 @@ def test_dataset_lifecycle_and_freeze_validation(eval_env):
         EvaluationCatalog.freeze(admin, ds_id)
     assert exc_anchor.value.code == "ANCHOR_UNRESOLVED"
 
-    # Remove invalid quote case
+    # 删除非法 quote case，恢复到可正常冻结的数据集。
     bad_id = [c["id"] for c in EvaluationCatalog.cases(admin, ds_id) if c["caseKey"] == "case-03-bad-quote"][0]
     EvaluationCatalog.delete_case(admin, bad_id)
 
-    # 6. Successful freeze
+    # 第 6 步：所有校验通过后成功冻结题集版本。
     frozen_ds = EvaluationCatalog.freeze(admin, ds_id)
     assert frozen_ds["status"] == "FROZEN"
     assert frozen_ds["frozenAt"] is not None
 
-    # 7. Modify frozen dataset -> should fail with DATASET_FROZEN
+    # 第 7 步：尝试修改已冻结题集，必须返回 DATASET_FROZEN，保证实验输入不可变。
     with pytest.raises(ApiException) as exc_mod:
         EvaluationCatalog.save_cases(admin, ds_id, cases_payload)
     assert exc_mod.value.code == "DATASET_FROZEN"
 
-    # 8. Copy version -> creates new DRAFT dataset
+    # 第 8 步：复制冻结版本时创建新的 DRAFT 版本，后续修改必须发生在新版本上。
     copied = EvaluationCatalog.copy_version(admin, ds_id)
     assert copied["revision"] == 2
     assert copied["status"] == "DRAFT"
@@ -491,7 +491,7 @@ def test_dataset_lifecycle_and_freeze_validation(eval_env):
 
 
 # ==============================================================================
-# 3. Snapshot, Config & Runner Integration Tests
+# 第 3 组：语料快照、检索配置与 EvaluationRunner 集成测试。
 # ==============================================================================
 
 def test_snapshot_config_and_evaluation_run(eval_env):
@@ -505,7 +505,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     ver_id = eval_env["ver_id"]
     quote = eval_env["quote"]
 
-    # Generate test auth session & CSRF
+    # 生成测试登录会话和 CSRF token，后续管理接口全部走真实鉴权链路。
     session_token = "test-eval-session-token"
     with get_db_connection() as conn:
         from app.models import auth_session_table
@@ -530,7 +530,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     headers = {"x-csrf-token": csrf}
     cookies = {"RAG_SESSION": session_token, "RAG_CSRF": csrf}
 
-    # 1. Create and publish RETRIEVAL config via /api/v1/admin/configs
+    # 第 1 步：通过管理接口创建并发布 RETRIEVAL 配置，验证评估引用的是已发布不可变配置。
     cfg_resp = client.post(
         "/api/v1/admin/configs",
         json={
@@ -556,12 +556,12 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert pub_resp.status_code == 200
     assert pub_resp.json()["status"] == "PUBLISHED"
 
-    # List configs
+    # 读取配置列表，确认刚发布的版本可被后续 run 选择。
     list_cfg = client.get("/api/v1/admin/configs", cookies=cookies)
     assert list_cfg.status_code == 200
     assert any(c["id"] == cfg_id for c in list_cfg.json())
 
-    # 2. Create snapshot
+    # 第 2 步：创建语料快照，冻结当前 active build 与安全版本。
     snap_resp = client.post(
         "/api/v1/admin/eval/snapshots",
         json={
@@ -575,7 +575,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert snap_resp.status_code == 201
     snap_id = snap_resp.json()["id"]
 
-    # 3. Create and freeze dataset
+    # 第 3 步：创建并冻结题集，保证 run 启动后 Gold 不再变化。
     ds = EvaluationCatalog.create_dataset(admin, {"name": "Eval Test Suite"})
     ds_id = ds["id"]
     EvaluationCatalog.save_cases(
@@ -624,7 +624,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     )
     EvaluationCatalog.freeze(admin, ds_id)
 
-    # 4. Estimate evaluation cost
+    # 第 4 步：先估算评估费用，验证预算门槛与模型调用上限。
     est_resp = client.post(
         "/api/v1/admin/eval/estimates",
         json={
@@ -644,7 +644,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert est["costStatus"] == "NO_MODEL_CALLS"
     assert est["estimateId"] is not None
 
-    # 5. Start evaluation run
+    # 第 5 步：使用 estimateId 启动真实评估 run。
     start_resp = client.post(
         "/api/v1/admin/eval/runs",
         json={
@@ -663,7 +663,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert start_resp.status_code == 201
     run_id = start_resp.json()["runId"]
 
-    # Poll run until completed
+    # 持续轮询直到评估进入终态，避免仅验证任务创建。
     import time
     for _ in range(60):
         run_detail = client.get(f"/api/v1/admin/eval/runs/{run_id}", cookies=cookies).json()
@@ -677,7 +677,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert metrics["completed"] == 2
     assert metrics["failed"] == 0
 
-    # 6. Check per-case results
+    # 第 6 步：逐题检查结果状态、检索指标与语义判定。
     results_resp = client.get(f"/api/v1/admin/eval/runs/{run_id}/results", cookies=cookies)
     assert results_resp.status_code == 200
     cases_res = results_resp.json()
@@ -686,7 +686,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert "smoke-qa-01" in res_keys
     assert "smoke-qa-02" in res_keys
 
-    # 7. Add human review to result
+    # 第 7 步：为结果添加人工 review，验证人工标签覆盖/补充自动 Judge 的机制。
     res_id = cases_res[0]["id"]
     rev_resp = client.post(
         f"/api/v1/admin/eval/results/{res_id}/reviews",
@@ -696,13 +696,13 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     )
     assert rev_resp.status_code == 201
 
-    # Verify review attached in results
+    # 重新读取结果，确认人工 review 已正确附着并进入 effective judgment。
     recheck_res = client.get(f"/api/v1/admin/eval/runs/{run_id}/results", cookies=cookies).json()
     r0 = [r for r in recheck_res if r["id"] == res_id][0]
     assert len(r0["reviews"]) == 1
     assert r0["reviews"][0]["labels"]["correctness"] == "CORRECT"
 
-    # 8. Test export
+    # 第 8 步：测试结果导出，确保离线分析可复现当前 run。
     exp_resp = client.post(
         f"/api/v1/admin/eval/runs/{run_id}/exports",
         json={"mode": "REDACTED"},
@@ -713,8 +713,8 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert exp_resp.json()["mode"] == "REDACTED"
     assert len(exp_resp.json()["cases"]) == 2
 
-    # 9. Test comparisons
-    # Start second run with same params
+    # 第 9 步：测试两个 manifest 可比的 run 之间的指标比较。
+    # 使用相同参数启动第二轮 run，构造合法的同条件对照组。
     start_resp2 = client.post(
         "/api/v1/admin/eval/runs",
         json={
@@ -743,7 +743,7 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     assert comp["comparable"] is True
     assert len(comp["runs"]) == 2
 
-    # 10. Test baseline diff comparison against artifacts/baseline-report.json
+    # 第 10 步：与 artifacts/baseline-report.json 中冻结的 Java/ES 基线做差异比较。
     diff_resp = client.get(f"/api/v1/admin/eval/runs/{run_id}/baseline-diff", cookies=cookies)
     assert diff_resp.status_code == 200
     diff = diff_resp.json()
@@ -810,7 +810,7 @@ def test_single_case_failure_retention(eval_env):
     ver_id = eval_env["ver_id"]
     quote = eval_env["quote"]
 
-    # 1. Create dataset and snapshot
+    # 第 1 步：创建冻结题集与语料快照，构造失败场景的稳定输入。
     ds = EvaluationCatalog.create_dataset(admin, {"name": "Failure Retention Test Suite"})
     ds_id = ds["id"]
     EvaluationCatalog.save_cases(
@@ -873,7 +873,7 @@ def test_single_case_failure_retention(eval_env):
     snap = EvaluationCatalog.create_snapshot(admin, {"name": "Fail Test Snap", "documentIds": [doc_id], "approvedSyntheticOrRedacted": True})
     snap_id = snap["id"]
 
-    # Mock RETRIEVAL config
+    # 注入 RETRIEVAL mock 配置，聚焦验证 runner 状态处理而不是外部检索服务。
     with get_db_connection() as conn:
         cfg_id = "cfg-fail-retention-test"
         now = datetime.now(timezone.utc)
@@ -905,7 +905,7 @@ def test_single_case_failure_retention(eval_env):
         "mode": "RETRIEVAL_ONLY",
     })
 
-    # Mock Milvus search failure specifically for 'failing-case'
+    # 仅对 failing-case 模拟 Milvus 搜索失败，验证单题失败不会让其他结果从计划分母消失。
     from unittest.mock import patch
     from app.retrieval.milvus_service import MilvusHybridService
 
@@ -936,7 +936,7 @@ def test_single_case_failure_retention(eval_env):
                 break
             time.sleep(0.3)
 
-    # Check results
+    # 检查所有预创建结果行都进入预期终态，包括成功与失败 case。
     res_list = EvaluationRunner.results(admin, run_id)
     assert len(res_list) == 2
 
@@ -946,13 +946,13 @@ def test_single_case_failure_retention(eval_env):
     assert good_res["status"] == "COMPLETED"
     assert good_res["errorCode"] is None
 
-    # CRITICAL: bad_res MUST be retained as FAILED, with errorCode
+    # 关键断言：bad_res 必须保留为 FAILED 且带 errorCode，不能因为失败而被聚合逻辑过滤掉。
     assert bad_res["status"] == "FAILED"
     assert bad_res["errorCode"] == "RETRIEVAL_FAILED"
     assert "error" in bad_res["judge"]
     assert "SIMULATED_INDEX_TIMEOUT" in bad_res["judge"]["error"]
 
-    # Check run aggregate
+    # 检查 run 聚合统计，确认 FAILED/PENDING 等执行状态都被计入计划分母。
     run_detail = EvaluationRunner.get_run(admin, run_id)
     m = run_detail["metrics"]
     assert m["planned"] == 2

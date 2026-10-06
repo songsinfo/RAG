@@ -48,17 +48,17 @@ def test_docling_hybrid_chunks_are_not_resplit_and_keep_provenance():
     children = [c for c in chunks if c["kind"] == "CHILD"]
     parents = [c for c in chunks if c["kind"] == "PARENT"]
 
-    # HybridChunker owns child boundaries; the adapter must preserve them 1:1.
+    # child 边界由 HybridChunker 决定；适配层必须 1:1 保留，不能再次切分导致 provenance 偏移。
     assert [c["text_content"] for c in children] == [item["text"] for item in items]
     assert [c["token_count"] for c in children] == [120, 130, 100]
 
-    # Parent/SourceUnit grouping is contextual aggregation, split by heading path.
+    # Parent/SourceUnit 只是上下文聚合层，并按 heading path 分组；它不能改变原始 child 的语义边界。
     assert len(parents) == 2
     assert len(units) == 2
     assert units[0]["text_content"] == "第一段\n\n第二段"
     assert units[1]["location"]["pageNumbers"] == [2]
 
-    # Child spans point back into the grouped section SourceUnit.
+    # 每个 child span 都必须能回指到分组后的 SourceUnit，保证最终引用可追溯。
     assert len(spans) == 3
     assert spans[0]["unit_id"] == spans[1]["unit_id"]
     assert spans[0]["start_cp"] == 0

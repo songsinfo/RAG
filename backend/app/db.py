@@ -17,9 +17,9 @@ engine = create_engine(
 
 @contextmanager
 def get_db_connection() -> Generator[Connection, None, None]:
-    # Test fixtures use SQLite StaticPool, which shares one DB-API connection
-    # across LangGraph checkpoint worker threads and application code. Serialize
-    # that test-only connection while leaving MySQL fully concurrent.
+    # 测试夹具使用 SQLite StaticPool，因此 LangGraph checkpoint 线程与应用代码会共享同一个 DB-API 连接。
+    # SQLite 的同一连接不适合并发访问，所以这里只对测试环境中的共享连接做串行化保护；
+    # 生产 MySQL 仍保持正常并发，避免为了兼容测试而降低真实环境吞吐。
     lock = _sqlite_connection_lock if engine.dialect.name == "sqlite" else None
     if lock is None:
         with engine.connect() as connection:

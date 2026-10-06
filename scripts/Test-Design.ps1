@@ -1,4 +1,4 @@
-# Documentation-only structural checks. This does not execute MySQL or Elasticsearch.
+# 这里只做文档/结构静态检查，不会真正连接或执行 MySQL、Elasticsearch；用于快速发现设计文件缺失和契约漂移。
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'

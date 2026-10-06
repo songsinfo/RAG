@@ -1,1 +1,1 @@
-"""Evaluation package for offline automated evaluation and baseline comparison."""
+"""离线自动评估与基线对比模块。"""

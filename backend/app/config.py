@@ -59,8 +59,8 @@ class Settings(BaseSettings):
         if self.DB_URL and self.DB_URL.startswith("mysql+pymysql://"):
             return self.DB_URL
         if self.DB_URL and self.DB_URL.startswith("jdbc:mysql://"):
-            # Convert jdbc:mysql://localhost:3307/rag_demo?... to mysql+pymysql://...
-            # e.g. jdbc:mysql://localhost:3307/rag_demo?connectionTimeZone=UTC...
+            # 将 Java/JDBC 风格的 MySQL URL 转换成 SQLAlchemy + PyMySQL 可识别的 URL；查询参数继续保留。
+            # 例如 jdbc:mysql://localhost:3307/rag_demo?connectionTimeZone=UTC... 会转换为 mysql+pymysql://...。
             import re
             m = re.match(r"jdbc:mysql://([^:/]+):(\d+)/([^?]+)", self.DB_URL)
             if m:
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    # Check for .runtime/<ENVIRONMENT>.env first
+    # 优先读取 .runtime/<ENVIRONMENT>.env，让不同运行环境覆盖默认配置，同时避免把本地运行参数写进仓库根目录。
     rag_root = Path(__file__).resolve().parent.parent.parent
     env_name = os.getenv("RAG_ENVIRONMENT", "demo")
     runtime_env = rag_root / f".runtime/{env_name}.env"

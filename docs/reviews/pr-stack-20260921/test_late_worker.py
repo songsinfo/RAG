@@ -25,8 +25,8 @@ def test_delayed_old_worker_must_not_reset_replacement(monkeypatch, tmp_path):
         conn.execute(update(job_table).where(job_table.c.id == old_job["id"]).values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
     replacement = worker._claim_one()
     assert replacement["lease_epoch"] == old_job["lease_epoch"] + 1
-    # Replacement has already started and persisted source/event state while
-    # the original process was suspended before entering execute_queued_run.
+    # replacement worker 已经启动并持久化了 source/event 状态，
+    # 原进程则在进入 execute_queued_run 前被挂起；该场景用于验证晚到旧 worker 不会覆盖新 owner 状态。
     with review.db.engine.begin() as conn:
         build_id = conn.execute(select(index_build_table.c.id)).scalar_one()
         conn.execute(update(qa_run_table).where(qa_run_table.c.id == run_id).values(status="RUNNING", mode="RAG"))

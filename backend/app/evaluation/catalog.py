@@ -24,13 +24,13 @@ from app.models import (
 
 
 def hash_payload(v: Any) -> bytes:
-    """Compute SHA-256 digest of deterministic JSON representation."""
+    """对确定性 JSON 表示计算 SHA-256 摘要；字段排序稳定后，相同输入可得到稳定哈希。"""
     serialized = json.dumps(v, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).digest()
 
 
 def obj(v: Any) -> Dict[str, Any]:
-    """Safely convert value to dict."""
+    """把输入安全收敛为 dict；空值或异常类型统一返回空字典，减少下游重复类型判断。"""
     if v is None:
         return {}
     if isinstance(v, dict):
@@ -43,7 +43,7 @@ def obj(v: Any) -> Dict[str, Any]:
 
 
 def maps(v: Any) -> List[Dict[str, Any]]:
-    """Safely convert value to list of dicts."""
+    """把输入安全收敛为字典列表，并过滤非字典元素，保证下游遍历结构稳定。"""
     if v is None:
         return []
     if not isinstance(v, list):
@@ -52,7 +52,7 @@ def maps(v: Any) -> List[Dict[str, Any]]:
 
 
 def dataset_view(r: Any) -> Dict[str, Any]:
-    """Format dataset version view for client responses."""
+    """把题集版本数据库记录转换为客户端响应结构，统一字段命名并隐藏内部存储细节。"""
     frozen_at = r.frozen_at.isoformat() if getattr(r, "frozen_at", None) else None
     return {
         "id": str(r.id),
@@ -64,7 +64,7 @@ def dataset_view(r: Any) -> Dict[str, Any]:
 
 
 def case_view(r: Any) -> Dict[str, Any]:
-    """Format case view for client responses."""
+    """把评估 case、预期答案类型与 Gold 信息整理为客户端可消费的响应结构。"""
     return {
         "id": str(r.id),
         "caseKey": str(r.case_key),
@@ -79,7 +79,7 @@ def case_view(r: Any) -> Dict[str, Any]:
 
 
 class EvaluationCatalog:
-    """Evaluation dataset versions, cases, gold facts, and corpus snapshot management."""
+    """评估题集版本、case、Gold 事实与语料快照的统一管理服务；负责冻结、复制、校验和可复现性约束。"""
 
     @staticmethod
     def require_admin(actor: Actor):
@@ -210,7 +210,7 @@ class EvaluationCatalog:
             res = []
             for r in rows:
                 c_dict = case_view(r)
-                # Verify document readability for gold evidence
+                # 校验 Gold evidence 所引用的文档在当前租户/快照下确实可读；不可见文档不能进入 Gold，避免评估集泄漏越权内容。
                 expected = c_dict.get("expected", {})
                 for grp in expected.get("evidenceGroups", []):
                     for alt in grp.get("alternatives", []):
@@ -267,7 +267,7 @@ class EvaluationCatalog:
                 if annotation not in {"DRAFT", "AUTO_REVIEWED", "HUMAN_REVIEWED"}:
                     raise ApiException(400, "INVALID_INPUT", "标注状态无效")
 
-                # Verify anchors and document existence
+                # 冻结前同时校验锚点和文档存在性，把坏引用提前拦截，避免运行阶段才发现 Gold 无法解析。
                 for grp in maps(expected.get("evidenceGroups")):
                     for alt in maps(grp.get("alternatives")):
                         doc_id = str(alt.get("documentId", "")).strip()
@@ -278,7 +278,7 @@ class EvaluationCatalog:
                         if not can_read_document(conn, actor, doc_id):
                             raise ApiException(403, "ACCESS_DENIED", f"文档不可见: {doc_id}")
 
-                # Find or assign case_id
+                # 优先复用调用方提供的 case_id；缺失时生成新 ID，确保后续 Gold anchors 与该 case 稳定关联。
                 existing_case = conn.execute(
                     select(eval_case_table.c.id).where(
                         and_(
@@ -310,7 +310,7 @@ class EvaluationCatalog:
                 else:
                     case_id = str(uuid.uuid4())
 
-                # Insert case
+                # 先写入 case 主记录，再写 Gold anchors；这样外键关系和后续校验都有明确父记录。
                 conn.execute(
                     eval_case_table.insert().values(
                         tenant_id=actor.tenant_id,
@@ -329,7 +329,7 @@ class EvaluationCatalog:
                     )
                 )
 
-                # Insert gold anchors
+                # 写入 Gold anchors，并保留文档、版本和位置等定位信息，供检索命中与答案归因评估使用。
                 for grp in maps(expected.get("evidenceGroups")):
                     fact_name = str(grp.get("fact", "")).strip()
                     for alt_no, alt in enumerate(maps(grp.get("alternatives"))):
@@ -499,7 +499,7 @@ class EvaluationCatalog:
         if not can_read_document(conn, actor, doc_id):
             raise ApiException(403, "ACCESS_DENIED", f"文档不可见: {doc_id}")
 
-        # Search quote in source_unit for builds of this doc and version
+        # 在指定文档版本对应的 build/source_unit 中重新定位 Gold 引用文本；只有可复现定位的 quote 才算有效锚点。
         stmt = (
             select(source_unit_table.c.text_content)
             .select_from(

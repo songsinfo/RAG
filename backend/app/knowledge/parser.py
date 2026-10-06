@@ -89,7 +89,7 @@ def _docling_hybrid_chunks(
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     data = {
         # 转换阶段参数：尽量保留文档结构，遇到转换错误直接失败。
-        # Conversion options. Docling applies the relevant options per input format.
+        # Docling 转换参数集中在这里维护；不同输入格式只会应用与自身相关的选项，避免调用层重复判断文件类型。
         "convert_do_ocr": "true",
         "convert_do_table_structure": "true",
         "convert_table_mode": "accurate",
@@ -98,7 +98,7 @@ def _docling_hybrid_chunks(
         "convert_do_picture_classification": _bool_form(vision),
         "convert_do_picture_description": _bool_form(vision),
         # 切块阶段参数：child chunk 的 token 边界由 Docling HybridChunker 负责。
-        # HybridChunker options.
+        # HybridChunker 的切分参数单独配置；解析负责结构化文档，chunker 再据此生成最终可检索块。
         "chunking_use_markdown_tables": "true",
         "chunking_include_raw_text": "true",
         "chunking_max_tokens": str(max_tokens),

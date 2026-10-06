@@ -9,10 +9,10 @@ from typing import Dict, List
 import bcrypt
 from fastapi import Response
 
-# Pre-computed dummy hash to mitigate timing attacks when user does not exist
+# 预先计算一个 dummy 密码哈希：即使用户不存在也执行同等级别的校验，降低通过响应耗时枚举账号的风险。
 DUMMY_HASH = bcrypt.hashpw(b"no-such-user-timing-shield", bcrypt.gensalt(rounds=12)).decode("utf-8")
 
-# Rate limiting sliding window: (ip, tenant, login) -> list of timestamps
+# 登录限流采用滑动窗口，键为 (IP, tenant, login)，值记录近期失败时间；同时约束来源、租户和账号维度。
 _login_attempts: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_lock = Lock()
 
@@ -25,12 +25,12 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def generate_token() -> str:
-    """Generate 32-byte secure random URL-safe base64 string without padding."""
+    """生成 32 字节密码学安全随机 token，并编码为无填充 URL-safe Base64，适合放入 Cookie/Header。"""
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
 
 
 def hash_token(token: str) -> bytes:
-    """Calculate 32-byte binary SHA-256 hash of the session token."""
+    """计算会话 token 的 32 字节 SHA-256 二进制摘要；数据库只保存摘要，不持久化可直接使用的明文 token。"""
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
@@ -64,12 +64,12 @@ def verify_csrf_token(token: str, binding: str, secret: str) -> bool:
 
 
 def check_rate_limit(ip: str, tenant: str, login: str) -> bool:
-    """Returns True if within limit (<= 5 attempts per 60s), False if rate-limited."""
+    """检查 60 秒滑动窗口登录限流：最多允许 5 次尝试；返回 False 表示当前请求应被限流拒绝。"""
     key = f"{ip}:{tenant}:{login}"
     now = time.time()
     with _rate_limit_lock:
         timestamps = _login_attempts[key]
-        # Keep only attempts within the last 60 seconds
+        # 每次判断前只保留最近 60 秒的尝试记录；更早的数据退出窗口，避免列表无限增长。
         _login_attempts[key] = [t for t in timestamps if now - t <= 60.0]
         if len(_login_attempts[key]) >= 5:
             return False

@@ -29,7 +29,7 @@ class MilvusHybridService:
     """负责 collection 初始化、representation upsert、删除和 BM25/Dense/Hybrid 查询。"""
 
     # 仅测试环境允许内存 mock；生产连接失败必须显式报错。
-    # In-memory index fallback for local unit tests without requiring a running Milvus container
+    # 本地单测使用内存索引兜底，不要求启动 Milvus 容器；生产路径仍走真实 Milvus，避免测试依赖外部服务。
     _mock_store: Dict[str, Dict[str, Any]] = {}
     _client = None
     _client_checked = False
@@ -422,9 +422,9 @@ class MilvusHybridService:
                 # HYBRID 故意不使用 Milvus 内部 hybrid RRF：
                 # ORIGINAL/SUMMARY/QUESTION 若在去重前各算一票，同一个 chunk 会获得不公平的多重投票。
                 # 所以先分别搜索 → canonical chunk 去重 → 再在应用层 RRF。
-                # Fuse at canonical chunk level. Milvus-level hybrid RRF would
-                # treat ORIGINAL/SUMMARY/QUESTION as independent documents and let
-                # one chunk vote multiple times before deduplication.
+                # RRF 必须在 canonical chunk 层融合；如果直接在 Milvus representation 层做 hybrid RRF，
+                # ORIGINAL/SUMMARY/QUESTION 会被当成独立文档，导致同一个 chunk 通过多个 representation 重复投票，
+                # 去重发生得太晚就会人为放大该 chunk 的排名，因此先归并 representation 再融合。
                 candidate_multiplier = max(1, len(representations))
                 query_emb = get_embeddings(
                     [query],
@@ -562,7 +562,7 @@ class MilvusHybridService:
 
     @classmethod
     def rebuild_from_mysql(cls, tenant_id: str):
-        """Idempotently rebuilds Milvus index from active builds in MySQL."""
+        """根据 MySQL 中当前 active build 幂等重建 Milvus 索引；重复执行不会产生重复向量，适用于灾难恢复和本地重建。"""
         with get_db_connection() as conn:
             stmt = (
                 select(

@@ -179,7 +179,7 @@ class ModelGateway:
         # 每次实际/模拟调用都生成独立 call_id，用于预算预留、结算和 model_call 审计。
         call_id = str(uuid.uuid4())
 
-        # Attempt to call LiteLLM Gateway via langchain_openai if configured
+        # 若配置了真实网关，则通过 langchain_openai 调用 LiteLLM 的 OpenAI-compatible 接口；供应商差异在网关层吸收。
         if gateway_url:
             try:
                 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -275,7 +275,7 @@ class ModelGateway:
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
         # 仅测试环境使用确定性模拟，目的是让单元测试不依赖真实模型/网络/费用。
-        # Fallback for offline unit test environments
+        # 离线单测环境无法访问真实模型时退回确定性模拟，保证测试不依赖网络和供应商额度。
         cls._record_call(
             tenant_id=tenant_id,
             call_id=call_id,
@@ -288,9 +288,9 @@ class ModelGateway:
             job_id=job_id,
         )
 
-        # Deterministic simulation based on prompt
+        # 根据 prompt 做确定性模拟；同样输入必须得到同样输出，避免单测因随机模型行为不稳定。
         if purpose == "ANSWER":
-            # Extract evidence if present
+            # 若 prompt 中包含 evidence，则提取其中可验证内容生成模拟答案，让后续 claim/evidence 校验仍能覆盖真实路径。
             user_msg = messages[-1].get("content", "")
             try:
                 data = json.loads(user_msg)
@@ -484,7 +484,7 @@ class ModelGateway:
             cls._record_call(tenant_id, call_id, run_id, purpose, "FAILED", 0, 0, model_alias, job_id=job_id)
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址 LITELLM_BASE_URL")
 
-        # Default deterministic mock: first round search, second round answer
+        # Agent 默认 mock：第一轮固定发起搜索工具调用，第二轮基于工具结果生成答案，覆盖最小完整 Agent loop。
         cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias, job_id=job_id)
         has_tool_response = any(m.get("role") == "tool" for m in messages)
         if not has_tool_response:
@@ -595,7 +595,7 @@ class ModelGateway:
             )
             raise ApiException(503, "RERANK_UNAVAILABLE", "未配置可用的 Reranker 网关")
 
-        # Deterministic local reranker for tests: lexical overlap, then original order.
+        # 测试 reranker 使用确定性本地规则：先按词项重叠度排序，再用原始顺序打破平局，保证断言稳定。
         terms = [t.lower() for t in query.split() if t.strip()]
         scored = []
         for idx, document in enumerate(documents):

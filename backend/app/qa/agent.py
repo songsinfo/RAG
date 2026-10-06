@@ -209,7 +209,7 @@ class LangGraphAgent:
             )
         # 有状态且还有 next，说明上次 worker 在节点之间退出，可直接从 checkpoint 接着跑。
         elif snapshot.values and snapshot.next:
-            # Native LangGraph checkpoint resume after a transient worker/process failure.
+            # 临时 worker/进程故障后优先使用 LangGraph 原生 checkpoint resume，继续未完成图，而不是从头重复工具副作用。
             graph_input = None
             record_event_fn(
                 actor.tenant_id,
@@ -219,8 +219,8 @@ class LangGraphAgent:
             )
         # 图已完成但业务 worker 重放时，优先复用 checkpoint 里的最终答案，避免重复调用模型。
         elif snapshot.values and not snapshot.next:
-            # A completed graph should normally have finalized the QA run already.
-            # Reuse the persisted final state if the worker is replayed after commit.
+            # 图已完成时通常 QA run 也已经落终态；如果 worker 被重复投递，不应再次执行整张图。
+            # 若提交后发生重复执行，直接复用持久化 final state，实现 at-least-once 调度下的幂等收敛。
             final_answer = snapshot.values.get("final_answer")
             if final_answer:
                 return final_answer
@@ -287,9 +287,9 @@ class LangGraphAgent:
                 graph_input,
                 context=context,
                 config=graph_config,
-                # Persist before advancing to the next node. This is also the
-                # correct durability choice for HITL and avoids concurrent
-                # checkpoint writes racing application DB writes.
+                # 在进入下一个节点前先持久化 checkpoint；这样崩溃恢复时不会重复已经完成的节点，
+                # 对 HITL 同样更安全，并能避免 checkpoint 写入与业务数据库写入并发竞态，
+                # 使“图状态”和“业务状态”的推进顺序保持可解释。
                 # sync 保证“推进到下一节点”之前 checkpoint 已持久化；
                 # 对 HITL 和 worker 崩溃恢复都比异步落盘更安全。
                 durability="sync",
@@ -525,8 +525,8 @@ class LangGraphAgent:
 
         # 先收集所有需要审批的 tool call，再执行任何有副作用的工具。
         # 这样 Command(resume=...) 导致节点从头重跑时，不会重复执行一半工具。
-        # Native LangGraph HITL. Approval interrupts are collected before any tool
-        # side effects, so node re-execution after Command(resume=...) is safe.
+        # 使用 LangGraph 原生 HITL：所有需要审批的 interrupt 都在真正执行工具副作用之前收集，
+        # 因此 Command(resume=...) 后节点即使重新进入，也不会重复执行审批前已经产生的外部副作用。
         for tc in tool_calls:
             name, args = cls._tool_call_parts(tc)
             call_id = str(tc.get("id") or "")

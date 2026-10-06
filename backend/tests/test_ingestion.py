@@ -14,7 +14,7 @@ def get_auth_context(client, login_name="admin", password="admin123"):
     )
     assert login_resp.status_code == 200
 
-    # Get fresh CSRF token bound to session
+    # 获取绑定到当前会话的新 CSRF token，避免复用登录前的匿名 token。
     fresh_csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
     return fresh_csrf
 
@@ -22,7 +22,7 @@ def get_auth_context(client, login_name="admin", password="admin123"):
 def test_kb_creation_and_concurrency(client):
     csrf = get_auth_context(client, "admin", "admin123")
 
-    # 1. Create KB
+    # 第 1 步：创建知识库，作为文档导入与 ACL 测试的父资源。
     create_resp = client.post(
         "/api/v1/admin/knowledge-bases",
         json={"name": "test-kb-1", "readers": []},
@@ -33,12 +33,12 @@ def test_kb_creation_and_concurrency(client):
     kb_id = kb_data["id"]
     assert kb_data["rowVersion"] == 1
 
-    # 2. Get KB ACL
+    # 第 2 步：读取知识库 ACL 和当前版本号，为后续乐观锁更新做准备。
     acl_resp = client.get(f"/api/v1/admin/knowledge-bases/{kb_id}/acl")
     assert acl_resp.status_code == 200
     assert acl_resp.json()["rowVersion"] == 1
 
-    # 3. Update KB ACL with wrong expectedVersion -> 409
+    # 第 3 步：使用错误 expectedVersion 更新 ACL，预期返回 409，验证并发覆盖保护。
     bad_update = client.put(
         f"/api/v1/admin/knowledge-bases/{kb_id}/acl",
         json={"expectedVersion": 999, "readers": []},
@@ -47,7 +47,7 @@ def test_kb_creation_and_concurrency(client):
     assert bad_update.status_code == 409
     assert bad_update.json()["code"] == "CONCURRENT_CONFLICT"
 
-    # 4. Update KB ACL with correct expectedVersion -> 200
+    # 第 4 步：使用正确 expectedVersion 更新 ACL，预期成功。
     good_update = client.put(
         f"/api/v1/admin/knowledge-bases/{kb_id}/acl",
         json={"expectedVersion": 1, "readers": [{"type": "USER", "userId": "user-admin-1"}]},
@@ -60,7 +60,7 @@ def test_kb_creation_and_concurrency(client):
 def test_document_upload_and_preview(client):
     csrf = get_auth_context(client, "admin", "admin123")
 
-    # 1. Create KB
+    # 第 1 步：创建知识库，作为文档导入与 ACL 测试的父资源。
     kb_resp = client.post(
         "/api/v1/admin/knowledge-bases",
         json={"name": "kb-doc-test", "readers": []},
@@ -68,7 +68,7 @@ def test_document_upload_and_preview(client):
     )
     kb_id = kb_resp.json()["id"]
 
-    # 2. Upload markdown document
+    # 第 2 步：上传 Markdown 文档，触发完整 ingestion/build 流程。
     doc_content = (
         "# 规格说明\n\n"
         "知识库系统采用结构化切块策略。\n\n"
@@ -91,7 +91,7 @@ def test_document_upload_and_preview(client):
     job_id = upload_data["jobId"]
     assert upload_data["status"] == "QUEUED"
 
-    # 3. Poll job status until COMPLETED
+    # 第 3 步：持续轮询后台 job 到 COMPLETED，确认异步构建真正完成。
     job = None
     for _ in range(60):
         time.sleep(0.1)
@@ -105,23 +105,23 @@ def test_document_upload_and_preview(client):
     assert job["status"] == "COMPLETED"
     assert job["stage"] == "INDEXING"
 
-    # 4. Preview document version
+    # 第 4 步：预览该文档版本，核对解析、SourceUnit 与 chunk 持久化结果。
     preview_resp = client.get(f"/api/v1/documents/{doc_id}/versions/{version_id}/preview")
     assert preview_resp.status_code == 200
     preview = preview_resp.json()
     assert len(preview["units"]) > 0
     assert len(preview["chunks"]) > 0
 
-    # Source units now come directly from Docling HybridChunker provenance.
+    # SourceUnit 直接来自 Docling HybridChunker provenance；测试要验证适配层没有重新制造不一致的边界。
     kinds = {u["kind"] for u in preview["units"]}
     assert kinds == {"TEXT"}
 
-    # Verify parent and child chunks exist
+    # 同时验证 parent 与 child chunk 存在，保证 parent-child 检索策略的数据基础完整。
     chunk_kinds = {c["kind"] for c in preview["chunks"]}
     assert "PARENT" in chunk_kinds
     assert "CHILD" in chunk_kinds
 
-    # 5. Upload new version
+    # 第 5 步：上传新版本，验证版本递增与 active build 切换逻辑。
     ver2_content = "# 规格说明 V2\n\n更新了文档内容。\n".encode("utf-8")
     ver2_resp = client.post(
         f"/api/v1/admin/documents/{doc_id}/versions",

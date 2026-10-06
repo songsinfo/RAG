@@ -44,7 +44,7 @@ def test_agent_single_tool_search_and_answer(client):
     now = datetime.now(timezone.utc)
     tenant_id = "tenant-demo-1"
 
-    # Setup a live KB, Doc, Chunk
+    # 准备一套真实可检索的 KB、文档和 chunk，后续 Agent 测试基于完整数据链路运行。
     kb_id = "kb-agent-1"
     doc_id = "doc-agent-1"
     build_id = "build-agent-1"
@@ -112,7 +112,7 @@ def test_agent_single_tool_search_and_answer(client):
 
     MilvusHybridService.rebuild_from_mysql(tenant_id)
 
-    # 1. Create conversation
+    # 第 1 步：创建会话，得到后续 Agent run 使用的上下文容器。
     conv_resp = client.post(
         "/api/v1/conversations",
         json={"title": "Agent Test Conv", "scope": {"mode": "ALL"}},
@@ -121,7 +121,7 @@ def test_agent_single_tool_search_and_answer(client):
     conv_id = conv_resp.json()["conversationId"]
     segment_id = conv_resp.json()["currentSegmentId"]
 
-    # 2. Submit AGENT run
+    # 第 2 步：提交 AGENT 模式 run，验证异步 Agent 执行路径。
     run_resp = client.post(
         f"/api/v1/conversations/{conv_id}/runs",
         json={"question": "StateGraph 如何工作？", "segmentId": segment_id, "mode": "AGENT"},
@@ -130,7 +130,7 @@ def test_agent_single_tool_search_and_answer(client):
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
 
-    # 3. Poll until completion
+    # 第 3 步：轮询直到终态，避免只验证任务创建而漏掉实际执行结果。
     run_data = None
     for _ in range(60):
         time.sleep(0.1)
@@ -219,9 +219,9 @@ def test_agent_read_section_tool(client):
             )
         )
 
-    # Inject mock handler to test read_section tool
+    # 注入 mock handler 专门触发 read_section 工具，验证工具路由与返回值处理。
     def mock_agent(messages):
-        # If tool response received, finish with claim
+        # 收到工具结果后立即生成 claim，验证工具输出能够进入最终答案/证据链。
         if any(m.get("role") == "tool" for m in messages):
             return {
                 "role": "assistant",
@@ -239,7 +239,7 @@ def test_agent_read_section_tool(client):
                 }, ensure_ascii=False),
                 "tool_calls": [],
             }
-        # First round: call read_section
+        # 第一轮固定调用 read_section，模拟 Agent 先查证据再作答的标准流程。
         return {
             "role": "assistant",
             "content": "",
@@ -292,7 +292,7 @@ def test_agent_read_section_tool(client):
 def test_agent_repeated_calls_termination(client):
     csrf = get_auth_context(client, "admin", "admin123")
 
-    # Mock handler that always calls the exact same tool
+    # mock 每轮都调用同一个工具，用于验证重复工具调用/循环保护逻辑。
     def mock_repeated(messages):
         return {
             "role": "assistant",
@@ -345,7 +345,7 @@ def test_agent_repeated_calls_termination(client):
 def test_agent_unknown_tool_handled(client):
     csrf = get_auth_context(client, "admin", "admin123")
 
-    # Round 1: call unknown tool. Round 2: finish
+    # 第一轮故意请求未知工具，第二轮再结束，验证未知工具错误不会破坏 Agent 状态机。
     def mock_unknown(messages):
         if any(m.get("role") == "tool" for m in messages):
             return {

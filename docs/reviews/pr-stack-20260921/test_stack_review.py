@@ -55,15 +55,15 @@ def test_restore_rebuild_preserves_published_epoch(monkeypatch, tmp_path):
     worker._run_ingest(worker._claim_one())
     assert RetrievalPipeline.retrieve(ACTOR, "Milvus")["hits"]
     lifecycle(doc["documentId"], "trash")
-    # Lost/rebuilt external index is the reason restore performs an upsert.
+    # restore 使用 upsert 是为了兼容外部索引已丢失/重建的情况：恢复时不能假设向量记录一定还存在。
     MilvusHybridService.delete_by_document(ACTOR.tenant_id, doc["documentId"])
     lifecycle(doc["documentId"], "restore")
     assert RetrievalPipeline.retrieve(ACTOR, "Milvus")["hits"], "RESTORED document has epoch-0 vectors but published fence is 1"
 
 
 def test_qa_submit_satisfies_production_job_kind_constraint(monkeypatch):
-    # SQLite test metadata omits the CHECK in deploy/compose.yml's MySQL schema.
-    # Mirror that exact allowlist with a trigger, without requiring MySQL.
+    # SQLite 测试元数据不会自动带上 deploy/compose.yml 中 MySQL 的 CHECK 约束，
+    # 因此用 trigger 精确模拟同一 allowlist，在不依赖 MySQL 的情况下保持测试约束一致。
     schema = (ROOT / "docs/design/schema.sql").read_text(encoding="utf-8")
     import re
     allowed = re.search(r"CHECK \(kind IN \(([^)]+)\)\)", schema[schema.index("CREATE TABLE job ("):]).group(1)
@@ -86,7 +86,7 @@ def test_qa_worker_cannot_finalize_after_lease_takeover(monkeypatch):
         assert replacement["lease_epoch"] == 2
         with db.engine.begin() as conn:
             conn.execute(update(qa_run_table).where(qa_run_table.c.id == run_id).values(status="RUNNING"))
-        # Original epoch-1 execution returns while replacement owns the run.
+        # 原 epoch-1 执行晚到返回时，replacement 已经拥有 run；旧执行结果必须被 fencing 条件拒绝。
         QaService._finalize_run(ACTOR.tenant_id, run_id, "COMPLETED", "FINISHED", "COMPLETED", {"answer": "stale epoch-1 result"})
 
     monkeypatch.setattr(QaService, "_execute_run", old_execution_returns)

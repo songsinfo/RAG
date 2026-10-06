@@ -63,11 +63,11 @@ def test_login_rejected_for_wrong_tenant(client):
 
 
 def test_full_login_me_logout_lifecycle(client):
-    # 1. Obtain CSRF
+    # 第 1 步：获取 CSRF token，后续所有写请求都基于该安全上下文。
     csrf_resp = client.get("/api/v1/auth/csrf")
     csrf_token = csrf_resp.json()["csrfToken"]
 
-    # 2. Login successfully
+    # 第 2 步：使用有效凭据登录并建立会话 Cookie。
     login_resp = client.post(
         "/api/v1/auth/login",
         json={"tenantCode": "demo", "loginName": "admin", "password": "admin123"},
@@ -77,7 +77,7 @@ def test_full_login_me_logout_lifecycle(client):
     assert login_resp.json()["authenticated"] is True
     assert "RAG_SESSION" in client.cookies
 
-    # 3. Access /api/v1/me
+    # 第 3 步：访问 /api/v1/me，确认会话身份已生效。
     me_resp = client.get("/api/v1/me")
     assert me_resp.status_code == 200
     me_data = me_resp.json()
@@ -89,11 +89,11 @@ def test_full_login_me_logout_lifecycle(client):
     assert len(me_data["groups"]) == 1
     assert me_data["groups"][0]["name"] == "Ops Group"
 
-    # 4. Refresh CSRF bound to authenticated session
+    # 第 4 步：刷新绑定到当前已登录会话的 CSRF token，验证匿名/登录 token 不可混用。
     auth_csrf_resp = client.get("/api/v1/auth/csrf")
     auth_csrf_token = auth_csrf_resp.json()["csrfToken"]
 
-    # 5. Logout
+    # 第 5 步：退出登录并立即撤销服务器端会话。
     logout_resp = client.post(
         "/api/v1/auth/logout",
         headers={"X-CSRF-Token": auth_csrf_token},
@@ -101,7 +101,7 @@ def test_full_login_me_logout_lifecycle(client):
     assert logout_resp.status_code == 200
     assert logout_resp.json()["authenticated"] is False
 
-    # 6. Verify session revocation
+    # 第 6 步：再次访问受保护接口，确认已撤销会话不能继续使用。
     after_logout = client.get("/api/v1/me")
     assert after_logout.status_code == 401
     assert after_logout.json()["code"] == "AUTH_REQUIRED"
@@ -111,7 +111,7 @@ def test_rate_limiting(client):
     csrf_resp = client.get("/api/v1/auth/csrf")
     csrf_token = csrf_resp.json()["csrfToken"]
 
-    # Attempt 5 times
+    # 连续尝试 5 次，仍应处在允许窗口内。
     for _ in range(5):
         resp = client.post(
             "/api/v1/auth/login",
@@ -120,7 +120,7 @@ def test_rate_limiting(client):
         )
         assert resp.status_code == 401
 
-    # 6th attempt must be rate-limited
+    # 第 6 次尝试必须触发限流，验证 60 秒滑动窗口边界。
     rate_limited_resp = client.post(
         "/api/v1/auth/login",
         json={"tenantCode": "demo", "loginName": "rate_limit_test", "password": "wrong"},
@@ -131,7 +131,7 @@ def test_rate_limiting(client):
 
 
 def test_expired_session_rejected(client):
-    # Insert manually expired session
+    # 手工插入已过期会话，验证过期时间由服务端强制执行，而不是仅依赖 Cookie。
     expired_token = generate_token()
     token_h = hash_token(expired_token)
     past_time = datetime.now(timezone.utc) - timedelta(hours=1)

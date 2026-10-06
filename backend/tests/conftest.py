@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 import bcrypt
 
-# Ensure test environment
+# 明确切换到测试环境，避免夹具误用开发/生产配置。
 os.environ["RAG_ENVIRONMENT"] = "test"
 os.environ["RAG_CSRF_SECRET"] = "test-secret-key-12345"
 os.environ["LITELLM_BASE_URL"] = ""
@@ -24,7 +24,7 @@ from app.main import app
 
 @pytest.fixture(autouse=True)
 def setup_test_db(monkeypatch):
-    # In-memory SQLite for fast, reproducible tests
+    # 使用内存 SQLite 提供快速、可重复的测试数据库；每个测试会在受控夹具中重建状态。
     from app.identity.security import _login_attempts
     _login_attempts.clear()
 
@@ -119,12 +119,12 @@ def setup_test_db(monkeypatch):
             )
         )
 
-    # Patch app.db.engine
+    # 将 app.db.engine 替换为测试引擎，确保被测代码和夹具操作的是同一个数据库。
     orig_engine = app_db.engine
     app_db.engine = test_engine
 
-    # Ingestion tests stay hermetic while production always calls Docling.
-    # Dedicated parser tests below exercise the real HTTP contract separately.
+    # ingestion 测试保持 hermetic，不依赖真实 Docling 服务；生产环境仍始终调用真实 Docling。
+    # 真实 HTTP 解析契约由下面的专门 parser 测试单独覆盖，避免单元测试与外部服务耦合。
     from app.knowledge.chunker import adapt_docling_hybrid_chunks
     import app.knowledge.service as knowledge_service
 
