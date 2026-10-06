@@ -30,7 +30,7 @@ def hash_payload(v: Any) -> bytes:
 
 
 def obj(v: Any) -> Dict[str, Any]:
-    """把输入安全收敛为 dict；空值或异常类型统一返回空字典，减少下游重复类型判断。"""
+    """将 None/空字符串转为空字典，保留 dict；字符串/字节按 JSON 解析，其他输入通过 dict(v) 转换，转换失败时异常继续抛出。"""
     if v is None:
         return {}
     if isinstance(v, dict):
@@ -43,7 +43,7 @@ def obj(v: Any) -> Dict[str, Any]:
 
 
 def maps(v: Any) -> List[Dict[str, Any]]:
-    """把输入安全收敛为字典列表，并过滤非字典元素，保证下游遍历结构稳定。"""
+    """None 返回空列表；其他输入必须是 list，并逐项调用 obj 转换，不额外过滤元素，转换失败时异常继续抛出。"""
     if v is None:
         return []
     if not isinstance(v, list):
@@ -278,7 +278,7 @@ class EvaluationCatalog:
                         if not can_read_document(conn, actor, doc_id):
                             raise ApiException(403, "ACCESS_DENIED", f"文档不可见: {doc_id}")
 
-                # 优先复用调用方提供的 case_id；缺失时生成新 ID，确保后续 Gold anchors 与该 case 稳定关联。
+                # 按当前租户、题集版本和 caseKey 查找已有 case 并复用其 ID；不存在时生成新 ID，供 Gold anchors 关联。
                 existing_case = conn.execute(
                     select(eval_case_table.c.id).where(
                         and_(
