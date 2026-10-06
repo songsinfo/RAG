@@ -59,8 +59,8 @@ class Settings(BaseSettings):
         if self.DB_URL and self.DB_URL.startswith("mysql+pymysql://"):
             return self.DB_URL
         if self.DB_URL and self.DB_URL.startswith("jdbc:mysql://"):
-            # 将 Java/JDBC 风格的 MySQL URL 转换成 SQLAlchemy + PyMySQL 可识别的 URL；查询参数继续保留。
-            # 例如 jdbc:mysql://localhost:3307/rag_demo?connectionTimeZone=UTC... 会转换为 mysql+pymysql://...。
+            # 将 Java/JDBC 风格的 MySQL URL 转为 SQLAlchemy + PyMySQL URL；仅提取主机、端口和库名，原查询参数不保留，固定添加 charset=utf8mb4。
+            # 例如 jdbc:mysql://localhost:3307/rag_demo?connectionTimeZone=UTC... 转换后不会保留 connectionTimeZone，只会附加 charset=utf8mb4。
             import re
             m = re.match(r"jdbc:mysql://([^:/]+):(\d+)/([^?]+)", self.DB_URL)
             if m:
