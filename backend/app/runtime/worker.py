@@ -13,6 +13,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,7 @@ from app.errors import ApiException
 from app.knowledge.artifacts import read_artifact
 from app.models import app_user_table, deletion_record_table, job_table, qa_run_table
 from app.qa.runtime import is_retryable_job_code
+from app.logging_config import configure_logging, log_context
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,16 @@ class DurableJobWorker:
         job = self._claim_one()
         if not job:
             return False
+        with log_context(tenant_id=str(job["tenant_id"]), job_id=str(job["id"]),
+                         run_id=str(job["target_id"]) if job["kind"] == "QA_RUN" else None,
+                         worker_id=self.worker_id, kind=job["kind"], lease_epoch=job["lease_epoch"],
+                         attempt=int(job.get("attempt") or 0) + 1):
+            self._execute_claimed(job)
+        return True
+
+    def _execute_claimed(self, job):
+        started = time.perf_counter()
+        logger.info("job_started")
         heartbeat_stop = threading.Event()
         # 业务执行可能持续数十秒/数分钟，因此独立 heartbeat 线程持续续租。
         heartbeat = threading.Thread(
@@ -95,7 +107,20 @@ class DurableJobWorker:
             heartbeat.join(timeout=2)
         # 业务执行统一先落 FAILED，再由这里根据错误类型决定是否重新 QUEUED。
         self._requeue_failed_if_retryable(job)
-        return True
+        try:
+            with get_db_connection() as conn:
+                row = conn.execute(select(job_table.c.status, job_table.c.stage, job_table.c.error_code)
+                    .where(and_(job_table.c.tenant_id == job["tenant_id"], job_table.c.id == job["id"],
+                                job_table.c.lease_epoch == job["lease_epoch"]))).first()
+            logger.log(logging.WARNING if row and row.error_code else logging.INFO,
+                       "job_finished" if row else "job_lease_lost", extra={"fields": {
+                           "status": str(row.status) if row else "LEASE_LOST",
+                           "stage": str(row.stage) if row else None,
+                           "error_code": row.error_code if row else None,
+                           "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                       }})
+        except Exception:
+            logger.exception("job_status_log_failed")
 
     def _claim_one(self) -> Optional[Dict[str, Any]]:
         """用 FOR UPDATE SKIP LOCKED 原子竞争一个可执行/租约过期任务。"""
@@ -152,7 +177,10 @@ class DurableJobWorker:
                 )
                 conn.commit()
                 if result.rowcount == 0:
-                    logger.warning("Lease lost for job %s; heartbeat stopped", job["id"])
+                    logger.warning("job_lease_lost", extra={"fields": {
+                        "tenant_id": str(job["tenant_id"]), "job_id": str(job["id"]),
+                        "worker_id": self.worker_id, "lease_epoch": job["lease_epoch"],
+                    }})
                     return
 
     def _run_ingest(self, job: Dict[str, Any]):
@@ -295,6 +323,10 @@ class DurableJobWorker:
                 )
             conn.commit()
 
+            logger.warning("job_retry_scheduled", extra={"fields": {
+                "error_code": row.error_code, "retry_delay_seconds": delay_seconds,
+            }})
+
     def _fail(self, job: Dict[str, Any], code: str):
         """将当前 lease 对应的任务标记失败；旧 lease 无法修改新 worker 的任务。"""
         now = datetime.now(timezone.utc)
@@ -323,7 +355,7 @@ class DurableJobWorker:
 
 
 def main():
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    configure_logging()
     DurableJobWorker().run_forever()
 
 

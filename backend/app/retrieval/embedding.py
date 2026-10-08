@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 import logging
+import time
 import uuid
 from typing import Iterable, List
 
@@ -74,6 +75,12 @@ def get_embeddings(
             call_id = str(uuid.uuid4())
             sent = False
             recorded = False
+            call_started = time.perf_counter()
+            log_fields = {"call_id": call_id, "purpose": "EMBEDDING", "model_alias": "embedding-main",
+                          "tenant_id": tenant_id or os.getenv("RAG_DEFAULT_TENANT_ID", "tenant-demo-1"),
+                          **({"run_id": run_id} if run_id else {}), **({"job_id": job_id} if job_id else {}),
+                          "batch_count": len(batch)}
+            logger.info("model_call_started", extra={"fields": log_fields})
             input_tokens = max(1, sum(max(1, len(value) // 4) for value in batch))
             # 在真正发送请求前按估算 Token 预留预算，避免并发调用一起穿透余额。
             BudgetService.reserve(
@@ -178,8 +185,19 @@ def get_embeddings(
             )
             recorded = True
 
+            logger.info("model_call_finished", extra={"fields": {
+                **log_fields, "status": "SUCCESS" if has_usage else "UNKNOWN",
+                "input_tokens": reported_tokens if has_usage else input_tokens, "output_tokens": 0,
+                "usage_reported": has_usage, "duration_ms": round((time.perf_counter() - call_started) * 1000, 2),
+            }})
+
         return vectors
-    except ApiException:
+    except ApiException as exc:
+        if "log_fields" in locals():
+            logger.exception("model_call_failed", extra={"fields": {
+                **log_fields, "error_code": exc.code,
+                "duration_ms": round((time.perf_counter() - call_started) * 1000, 2),
+            }})
         if "call_id" in locals() and "recorded" in locals() and not recorded:
             try:
                 from app.qa.model_gateway import ModelGateway
@@ -198,7 +216,10 @@ def get_embeddings(
                 logger.exception("Failed to reconcile embedding budget after validation error")
         raise
     except Exception as exc:
-        logger.error("大模型嵌入网关连接失败: %s", exc)
+        logger.exception("model_call_failed", extra={"fields": {
+            **(log_fields if "log_fields" in locals() else {}), "error_code": type(exc).__name__,
+            **({"duration_ms": round((time.perf_counter() - call_started) * 1000, 2)} if "call_started" in locals() else {}),
+        }})
         if not is_test_env():
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"大模型嵌入网关连接失败: {exc}") from exc
         return [generate_deterministic_embedding(t, dim) for t in texts]

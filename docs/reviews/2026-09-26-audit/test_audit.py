@@ -338,10 +338,16 @@ def test_gateway_fallback_has_separate_reservation_and_actual_alias(monkeypatch)
     run_id = queued_qa(monkeypatch)
     sent = []
     class Primary:
+        def bind(self, **kwargs):
+            assert kwargs == {"response_format": {"type": "json_object"}}
+            return self
         def invoke(self, messages):
             sent.append("chat-main")
             raise RuntimeError("synthetic provider failure")
     class Fallback:
+        def bind(self, **kwargs):
+            assert kwargs == {"response_format": {"type": "json_object"}}
+            return self
         def invoke(self, messages):
             sent.append("judge-main")
             return SimpleNamespace(content="answer", usage_metadata={"input_tokens": 5, "output_tokens": 2})

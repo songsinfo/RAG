@@ -25,6 +25,7 @@ from sqlalchemy import select, and_, or_, exists, update, delete
 from app.config import is_test_env
 from app.db import get_db_connection
 from app.errors import ApiException
+from app.logging_config import log_stage
 from app.identity.deps import Actor, assert_hits_still_readable, can_read_document
 from app.models import (
     tenant_table,
@@ -627,6 +628,9 @@ class QaService:
             )
             conn.commit()
 
+        logger.info("run_submitted", extra={"fields": {
+            "tenant_id": actor.tenant_id, "run_id": run_id, "job_id": qa_job_id, "status": "QUEUED",
+        }})
         # 测试环境同步执行只是为了单测方便；不能据此理解为生产请求在线程内跑完。
         if is_test_env():
             QaService.execute_queued_run(actor, run_id)
@@ -762,8 +766,9 @@ class QaService:
                     )
                 )
                 conn.commit()
+            log_stage(logger, "run_stage", stage, tenant_id=tenant_id, run_id=run_id)
         except Exception:
-            pass
+            logger.exception("run_event_write_failed", extra={"fields": {"run_id": run_id, "stage": stage}})
 
     @staticmethod
     def _execute_run(
@@ -1009,13 +1014,13 @@ class QaService:
             QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", validated)
 
         except ApiException as e:
-            logger.error("Run %s failed with ApiException: %s (code=%s)", run_id, e.message, e.code)
+            logger.exception("run_failed", extra={"fields": {"run_id": run_id, "error_code": e.code}})
             if e.code == "APPROVAL_REQUIRED":
                 QaService._mark_waiting_approval(actor.tenant_id, run_id)
                 return
             QaService._fail_run(actor.tenant_id, run_id, e.code)
-        except Exception as e:
-            logger.exception("Run %s failed with unexpected exception: %s", run_id, e)
+        except Exception:
+            logger.exception("run_failed", extra={"fields": {"run_id": run_id, "error_code": "INTERNAL_ERROR"}})
             QaService._fail_run(actor.tenant_id, run_id, "INTERNAL_ERROR")
 
     @staticmethod
@@ -1219,6 +1224,8 @@ class QaService:
                 )
             )
             conn.commit()
+            log_stage(logger, "run_finished", stage, tenant_id=tenant_id, run_id=run_id,
+                      status=status, terminal_reason=terminal_reason)
             return True
 
     @staticmethod

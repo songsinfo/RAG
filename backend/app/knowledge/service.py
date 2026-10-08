@@ -13,6 +13,7 @@ upload_document → 保存原始 Artifact → 创建 immutable Version/Build →
 """
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import uuid
@@ -23,6 +24,7 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import select, and_, or_, exists, update, delete
 from app.db import get_db_connection
 from app.errors import ApiException
+from app.logging_config import log_stage
 from app.identity.deps import Actor, can_read_document
 from app.knowledge.artifacts import save_artifact, read_artifact, delete_artifact
 from app.knowledge.parser import parse_and_chunk_document
@@ -60,6 +62,9 @@ from app.models import (
     eval_result_table,
     eval_review_table,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeService:
@@ -1230,6 +1235,12 @@ class KnowledgeService:
             chunk_span_table.c.tenant_id == tenant_id,
             chunk_span_table.c.build_id == build_id,
         )))
+        # MySQL 立即检查自引用外键，必须先删 CHILD，再删 PARENT。
+        conn.execute(delete(chunk_table).where(and_(
+            chunk_table.c.tenant_id == tenant_id,
+            chunk_table.c.build_id == build_id,
+            chunk_table.c.parent_id.is_not(None),
+        )))
         conn.execute(delete(chunk_table).where(and_(
             chunk_table.c.tenant_id == tenant_id,
             chunk_table.c.build_id == build_id,
@@ -1252,6 +1263,7 @@ class KnowledgeService:
     ):
         """完整执行一次入库状态机：解析 → 持久化 → 表征/向量 → 索引 → 发布。"""
         now = datetime.now(timezone.utc)
+        log_fields = {"tenant_id": tenant_id, "job_id": job_id, "document_id": doc_id, "build_id": build_id}
         try:
             # Docling 是昂贵外部调用，调用前先检查 lease，避免旧 worker 浪费资源。
             # build_config 从 build 绑定的 config revision 读取，重试时参数保持不变。
@@ -1285,6 +1297,7 @@ class KnowledgeService:
                 conn.commit()
 
             # 所有格式统一走 Docling + HybridChunker；这里不再按文件类型走多套 parser/chunker。
+            log_stage(logger, "ingest_stage", "PARSING", **log_fields)
             raw_units, chunks, spans = parse_and_chunk_document(
                 file_bytes,
                 filename,
@@ -1343,6 +1356,7 @@ class KnowledgeService:
                         )
                     )
                     conn.commit()
+                    log_stage(logger, "ingest_stage", "NEEDS_REVIEW", **log_fields)
                     return
 
             with get_db_connection() as conn:
@@ -1395,6 +1409,7 @@ class KnowledgeService:
                     .values(stage="CHUNKING", updated_at=now)
                 )
                 conn.commit()
+            log_stage(logger, "ingest_stage", "CHUNKING", **log_fields, unit_count=len(raw_units))
 
             now = datetime.now(timezone.utc)
             with get_db_connection() as conn:
@@ -1442,6 +1457,7 @@ class KnowledgeService:
                     .values(stage="INDEXING", updated_at=now)
                 )
                 conn.commit()
+            log_stage(logger, "ingest_stage", "INDEXING", **log_fields, chunk_count=len(chunks))
 
             # 只有 CHILD 参与检索表示；PARENT 仅用于命中后的上下文扩展。
             child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
@@ -1672,11 +1688,14 @@ class KnowledgeService:
                     return
                 conn.commit()
 
+            log_stage(logger, "ingest_finished", "PUBLISHED", **log_fields, status="COMPLETED")
+
         except ApiException as exc:
             # 一旦 lease 丢失，旧 worker 绝不能再写入新 owner 已接管的状态；
             # 其他错误也只有在当前 worker 仍持有 lease 时才能记录，避免“僵尸写回”。
             if exc.code == "JOB_LEASE_LOST":
                 return
+            logger.exception("ingest_failed", extra={"fields": {**log_fields, "error_code": exc.code}})
             with get_db_connection() as conn:
                 conn.execute(
                     update(job_table)
@@ -1685,6 +1704,7 @@ class KnowledgeService:
                 )
                 conn.commit()
         except Exception:
+            logger.exception("ingest_failed", extra={"fields": {**log_fields, "error_code": "INGEST_FAILED"}})
             with get_db_connection() as conn:
                 conn.execute(
                     update(job_table)

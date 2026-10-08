@@ -56,7 +56,8 @@ def save_artifact(tenant_id: str, filename: str, data: bytes,
     sha = hashlib.sha256(data)
     sha_digest = sha.digest()
     sha_hex = sha.hexdigest()
-    safe_name = Path(filename).name.replace(" ", "_")
+    # storage_key 是 ASCII 列；原始文件名由 document_version 单独保留。
+    safe_name = hashlib.sha256(Path(filename).name.encode("utf-8")).hexdigest()
     storage_key = f"{tenant_id}/{document_id}/{artifact_id}/{safe_name}" if document_id and artifact_id else f"{tenant_id}/{sha_hex}/{safe_name}"
     if _mode() == "s3":
         client, bucket = _s3_client(), _bucket()
