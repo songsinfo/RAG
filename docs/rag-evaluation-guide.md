@@ -6,7 +6,7 @@
 
 若要先理解上传、解析、检索、普通 RAG 和 Agent 如何串起来，请从[项目源码导读](source-walkthrough.md)开始，再回到本文学习评估。
 
-**实现核对基线：2026-09-27，`docs/evaluation-answer-relevancy-spec` 分支。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
+**实现核对基线：2026-10-08，`main` 分支，代码提交 `bc3d643`。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
 
 ## 目录
 
@@ -330,8 +330,8 @@ router.py
   → EvaluationRunner.start：写 eval_run、EVALUATE job、全部 PENDING 结果
   → DurableJobWorker 执行 EVALUATE
   → EvaluationRunner._execute_run
-      ├─ RETRIEVAL_* → RetrievalPipeline.retrieve
-      └─ RAG / AGENT → QaService.create_conversation / submit_run / get_run
+      ├─ RETRIEVAL_* → _persona() → RetrievalPipeline.retrieve（快照文档范围）
+      └─ RAG / AGENT → _persona() → _run_qa_turns（同一会话逐轮 QA，传入 evaluation_scope）
   → _compute_retrieval_metrics + 状态检查 + 可选 judge_answer
   → _update_result：持久化单题结果
   → aggregate：应用最新人工复核并汇总
@@ -348,7 +348,7 @@ router.py
 
 运行 manifest 包含题集版本、快照 ID、检索配置及载荷、分区、重复次数、模式、严格模式、裁判模式、规则版本、预算和环境等。
 
-这些记录有助于复现，但不意味着模型供应商版本、全部提示词、运行时依赖和执行范围已经完全锁定。完整实验仍应记录代码提交、部署版本和真实模型配置。
+检索模式把快照文档 ID 作为 `document_ids`；RAG/AGENT 将 `evaluation_scope` 持久化到 QA 运行，检索及章节读取通过 `run_document_scope()` 限定快照文档与 Build。执行期间反复检查权限 epoch、文档状态和生效 Build，变化时失败关闭。这是范围限制与变化检测，不是把语料和权限物理锁住；模型供应商版本、全部提示词和运行时依赖也未因此固化。完整实验仍应记录代码提交、部署版本和真实模型配置。
 
 ## 7. 从零完成一轮评估
 
@@ -600,18 +600,19 @@ Agent 可以决定检索什么、是否继续搜索、何时停止。多轮检�
 | 检索评分 | 文档+版本+引文匹配，Hit/Recall/MRR/nDCG | 全阶段上下文覆盖、完整候选池分级均已完成 |
 | 回答评分 | 完整正文 v2 Judge、事实/支持、Relevancy、claim 对齐、题型判断、人工复核 | 裁判已在真实业务金标准上充分校准 |
 | 费用 | 区分已知和未知费用，排除 fixed 占位价 | 已完成供应商账单对账与绝对硬预算保证 |
-| 快照 | 记录来源与 build，启动前检查变化 | 运行中语料与 QA 检索范围已完全锁定 |
-| 身份 | RAG 按 loginName 查用户并设置非管理员 Actor | 缺失用户必然失败关闭；检索模式也按 persona 执行 |
-| 多轮 | 题集可存 turns，估算考虑 turns 数 | 执行器已逐轮重放会话 |
+| 快照 | 检索/QA 限定快照文档与 Build，执行中检查权限及版本变化 | 语料与权限被物理锁住，或模型与依赖版本已完全固化 |
+| 身份 | 检索、RAG、AGENT 统一使用有效 persona 的非管理员 Actor；缺失或停用返回 PERSONA_UNAVAILABLE | 所有题目的人设及权限已完成业务审核 |
+| 多轮 | RAG/AGENT 在同一会话逐轮执行 turns，只评分最后一轮；检索模式拒绝多轮题 | 每一轮均有独立质量评分 |
 | 比较 | 校验部分 manifest 字段并返回逐题结果 | 已自动完成显著性检验或跨模式可比性判断 |
 | 门禁 | 检查完成、判定覆盖、成功率、总费用与模式 | 全部安全、性能、部署要求均已验收 |
 
-两个需要实际实验特别核查的细节：
+执行身份、快照范围与多轮行为可沿以下源码核对：
 
-1. 检索模式把快照文档 ID 传给检索流水线，但使用评估发起者的 Actor；RAG/AGENT 使用 persona Actor，当前提交 QA 的请求却没有显式传入快照文档范围。两类模式的权限和检索范围不能未经核查就视为相同。
-2. persona 用户查询不到时，当前代码会退回发起者的 user ID，并设置 `admin=False`。这不能保证与预期测试用户拥有相同权限，因此应在运行前确认账号存在。
+1. [runner.py](../backend/app/evaluation/runner.py) 的 `_persona()` 为所有模式查找同租户的 ACTIVE 用户；不存在或停用时返回 `PERSONA_UNAVAILABLE`，不再退回发起者。检索与 QA 使用该非管理员 Actor，快照可用性检查仍由发起者执行。
+2. `_run_qa_turns()` 按 `question.turns` 逐轮调用真实 QA，复用同一 conversation，并传入快照范围与可信配置。检索模式拒绝多轮题，不会只运行第一轮冒充完整会话。
+3. [context.py](../backend/app/qa/context.py) 的 `run_document_scope()` 核对快照文档仍为 LIVE 且生效 Build 未变；普通检索和 Agent 章节读取应用该范围，外发前还复核来源。变化时中止，不自动切到新资料继续同一实验。
 
-这些是现有实现边界的记录，不是本次文档变更所修复的问题。真实验收仍需要隔离环境与端到端证据。
+这些是当前源码已实现的约束，本次仅同步文档；真实依赖、并发变化与恢复行为仍需要隔离环境的端到端证据。
 
 ### 12.2 一轮评估应交付什么
 

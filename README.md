@@ -119,7 +119,7 @@ flowchart TD
     N --> O["登记 run_source / Evidence"]
     O --> P["ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims"]
     P --> Q["Claim Validation<br/>引用范围与 Evidence 绑定"]
-    Q --> R{"Strict Mode?"}
+    Q --> R{"Strict 且存在 Claims?"}
     R -->|是| S["LiteLLM judge-main<br/>逐 Claim 判断 SUPPORTED"]
     R -->|否| T["Structural Validation"]
     S --> U["Output Guard"]
@@ -132,18 +132,19 @@ flowchart TD
     X -->|read_section| X2["读取授权文档 Source Unit"]
     X1 --> W
     X2 --> W
-    W -->|无 Tool Call| Y["Claim Validation + Output Guard"]
-    V -. "最多6轮 / 8次工具调用<br/>同参数重复3次熔断" .-> Y
+    W -->|无 Tool Call| Y["Claim Validation"]
+    Y --> R
+    V -. "最多6轮 / 8次工具调用<br/>同参数重复3次熔断" .-> LIMIT["超限或重复调用<br/>失败终止"]
+    LIMIT --> Z
 
     G --> Z["写入终态 Result"]
     H --> Z
     NOEV --> Z
     U --> Z
-    Y --> Z
     Z --> FINAL["前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace"]
 ```
 
-当前普通 RAG 与 Agent 的 `search_knowledge` 已统一走同一条 `RetrievalPipeline`：**ACL Scope → Dense + Sparse BM25 → RRF → 可选 Reranker → 可选 Parent Expansion → Final Top-K → 外发前 ACL/Active Build 二次复核**。参数由不可变版本的 Retrieval Config 决定，`qa_run.config_id` 保存本次运行所用配置版本，便于消融实验、回放和回滚。Agent 仍使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断。
+当前普通 RAG 与 Agent 的 `search_knowledge` 已统一走同一条 `RetrievalPipeline`：**ACL Scope → 可选 Rewrite / Multi-Query / HyDE → Dense + Sparse BM25 → 应用层 RRF → 可选 Reranker / MMR → 可选 Parent Expansion → 上下文预算与 Final Top-K → 外发前 ACL/Active Build 二次复核**。参数由不可变版本的 Retrieval Config 决定，`qa_run.config_id` 保存本次运行所用配置版本，便于消融实验、回放和回滚。Agent 仍使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断。两种问答模式的结构化结果都交给 `_verify_answer()`；strict 且有 claims 时调用 `judge-main`，要求判定完整覆盖每个 Claim 且全部为 SUPPORTED，否则失败关闭。
 
 ## 企业化增强（当前分支）
 

@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-09-22，`main` 分支。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-08，`main` 分支，代码提交 `bc3d643`。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -217,7 +217,7 @@ PARENT 主要用于检索后的上下文扩展；CHILD 才是索引和高精度�
 child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
 ```
 
-只有 CHILD 传给 `MilvusHybridService.upsert_chunks()`。PARENT 留在关系数据里，检索后可扩展为上下文。
+只有 CHILD 传给 `MilvusHybridService.upsert_chunks()`。入库还按构建配置为 Child 生成 ORIGINAL，以及可选 SUMMARY / QUESTION 表示；这些表示分别入索引，但都关联原始 Child，生成证据前还原原文。PARENT 留在关系数据里，检索后可扩展为上下文。
 
 在 [milvus_service.py](../backend/app/retrieval/milvus_service.py) 看 `upsert_chunks()`，继续追到 [embedding.py](../backend/app/retrieval/embedding.py) 的 `get_embeddings()`。文档文本转换为 dense 向量，真实 Milvus 集合还通过 BM25 function 生成 sparse 表示。索引携带租户、文档、版本、build、chunk 和索引代次等字段，便于过滤和溯源。
 
@@ -240,13 +240,19 @@ child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
 先完整阅读 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`，再进入 [milvus_service.py](../backend/app/retrieval/milvus_service.py) 的 `search()`。
 
 ```text
-retrieve(actor, query, kb_ids, document_ids, config_id, run_id)
+retrieve(actor, query, kb_ids, document_ids, config_id, run_id, history)
   → load_retrieval_config()
+  → 应用 run_document_scope()（评测运行）
   → get_readable_build_records()
-  → MilvusHybridService.search()
+  → _prepare_queries()：按配置 Rewrite / Multi-Query / HyDE
+  → 各查询变体分别调用 MilvusHybridService.search() 做 BM25 / Dense 召回
+  → 多路结果通过 rrf_fuse() 融合
+  → _hydrate_original_chunks()：多表示命中还原为原始 Child 文本
   → assert_hits_still_readable()
   → 可选 rerank_hits()
+  → 可选 _mmr_select()
   → 可选 _expand_parents()
+  → 按 context_max_bytes 与 final_top_k 限制上下文
   → _attach_provenance()
   → 按 final_top_k 截取
   → 再次 assert_hits_still_readable()
@@ -270,7 +276,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 
 ### 5.3 BM25、Dense 和 Hybrid 在哪里分支
 
-`search()` 根据有效配置选择路线：
+`retrieve()` 根据有效配置选择 BM25 和 Dense 路线，分别调用 `search()`；底层 `search()` 也支持直接 HYBRID 调用：
 
 | 模式 | 核心操作 | 阅读时关注 |
 | --- | --- | --- |
@@ -278,7 +284,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 | DENSE | 问题 embedding → dense 向量搜索 | 查询与索引维度一致 |
 | HYBRID | 两路检索，通过 RRF 融合 | 两路候选数量和融合排名 |
 
-真实服务分支中 Hybrid 使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`。RRF 的直觉是“综合各路线里的名次”，不是直接把两种不可比的原始分数相加。
+当前统一流水线分别执行 BM25 / Dense 搜索，在应用层调用 `rrf_fuse()` 融合各查询路线。底层 `MilvusHybridService.search(mode="HYBRID")` 也分别调用 `client.search()`，将 ORIGINAL / SUMMARY / QUESTION 等表示归一并按 canonical chunk 去重后再做 RRF；不再直接使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`，避免同一子块的不同表示重复投票。RRF 综合各路线里的名次，不直接混加两种不可比的原始分数。
 
 测试环境另有内存检索和确定性 embedding 路径。它们适合验证过滤和执行逻辑，不能代表真实向量的语义质量，也不能用其表现估计生产 Milvus 性能。
 
@@ -286,7 +292,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 
 `rerank_hits()` 使用问题和候选文本重新排序；是否启用、保留多少条、失败是否允许降级，由有效配置决定。阅读 [config.py](../backend/app/retrieval/config.py) 的 `RetrievalConfig.from_payload()`，不要只看配置 JSON 的名字就认为某个开关已被执行。
 
-`_expand_parents()` 找到命中 CHILD 对应的 PARENT，将较完整的父文本放进 `hit.text`，原命中文本留在 `matchedText`，并增加 `parentChunkId`。同父块去重，过长父文本按 `parent_max_chars` 截取。
+`_expand_parents()` 找到命中 CHILD 对应的 PARENT，将未超过 `parent_max_chars` 的父文本放进 `hit.text`，原命中文本留在 `matchedText`，并增加 `parentChunkId`，同父块去重。父文本过长时保留 Child，不截断父文本，并记录 `PARENT_TRIMMED` / `parentTruncated=true`。扩展后还按 `context_max_bytes` 限制 UTF-8 字节总量；若最佳父块独自超限，尝试退回原始 Child，不能满足预算则不保留该项。
 
 因此：
 
@@ -299,7 +305,7 @@ text           = 后续用于上下文的文本
 
 `_attach_provenance()` 通过 `chunk_span → source_unit` 补充来源。能在当前上下文找到完整单元时，设置 `contextMapped=true` 并保存上下文偏移；找不到时仍保留来源信息，不能把 `contextMapped=false` 解释为已有精确上下文映射。
 
-当前 `retrieve()` 的直接执行链没有 Rewrite、HyDE、Multi-Query、MMR 调用。设计或实验配置里出现这些名称，不等于本函数已经执行了这些策略。
+当前 `retrieve()` 已接入 Rewrite、HyDE、Multi-Query 和 MMR，但都由配置开关控制。Rewrite 还要求存在历史，并保留原问题与改写问题；Multi-Query 增加等价问法；HyDE 只贡献 Dense 路线，不把假想文本作为事实证据；MMR 在重排后、父块扩展前选择候选。开启策略不等于已证明效果更好，仍需固定其他条件做实验。
 
 **对应测试：** [test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`；[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()`。
 
@@ -336,7 +342,7 @@ Chat.vue::submit()
 | 5 | 写 `run_source` | 记录本次运行依赖的文档与来源 |
 | 6 | `ModelGateway.chat()` | 将问题与 evidence 交给 chat-main |
 | 7 | `validate_claims()` | 核对结构、引用编号和区间 |
-| 8 | strict 分支与 `validate_output()` | 可选语义检查、输出规则检查 |
+| 8 | `_verify_answer()` 与 `validate_output()` | 统一严格验证、输出规则检查 |
 | 9 | `_finalize_run()` | 保存结果及任务终态 |
 
 问题路由见 [question_router.py](../backend/app/qa/question_router.py)：当前是正则规则。问候语和少数不支持请求返回固定文本，不需要检索和模型；其余默认进入知识问答。
@@ -360,13 +366,14 @@ evidence_map[eid] = h["text"]
 ```python
 messages = [
     {"role": "system", "content": INSTRUCTION},
+    *history,
     {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
 ]
 ```
 
-本例的 user 内容是“问题 + 本次证据”，不是把整个数据库都发给模型。普通 RAG 这段生成 messages 也没有直接拼接完整历史对话；有会话存储并不等于每次生成都使用全部历史。
+本例的 user 内容是“问题 + 本次证据”，生成 messages 还包含 `_rag_history()` 取得的授权历史。历史只取当前 segment 中最多四条较早的成功运行，并受问题与答案合计 4000 字符限制，不是整个会话。历史来源会重新检查权限；评测运行还检查快照范围和生效 Build，并登记依赖供模型外发前复核。相同 `history` 也传给检索流水线，配置允许时用于 Rewrite。
 
-实际材料大小主要受检索条数、父段截断等影响。这条普通 RAG 路径没有展示设计文档中那套完整的 token 级上下文装箱流程。
+实际材料大小受检索条数、父块长度、`context_max_bytes` 和历史字符预算等限制。检索上下文使用 UTF-8 字节预算，不是设计文档中的完整 token 级装箱流程；Agent 的消息裁剪则另有 token 预算。
 
 ### 6.4 模型输出 → claims → answer
 
@@ -397,13 +404,13 @@ rendered_claims.append(f"{text} [{', '.join(ev_labels)}]")
 
 最终用户看到的文本类似“重试前需要检查幂等键。 [E1]”。真实问题要求三项事实，仅给出这一项不代表内容完整，即使结构校验通过。
 
-**注意当前代码的实际行为：** 引用编号不存在会报错，但整数区间越界、倒置等情况会被改成覆盖整条 evidence，而非一律拒绝。结构通过只表示格式与来源约束通过，不证明证据在语义上支持断言。
+**注意当前代码的实际行为：** 引用编号不存在、证据正文为空、区间非整数、负起点、倒置或超出正文长度，都会以 `INVALID_MODEL_EVIDENCE` 拒绝；不再把错误区间扩成整条 evidence。结构通过只表示格式与来源约束通过，不证明证据在语义上支持断言。
 
 ### 6.5 模型网关做什么
 
 顺着 `ModelGateway.chat()` 到 [model_clients.py](../backend/app/qa/model_clients.py) 的 `get_chat_model()`，可以看到 LangChain 消息适配与模型客户端。网关使用内部别名调用 LiteLLM，记录 `model_call`，并使用运行策略进行有限重试。
 
-如果没有真实网关配置，测试环境可以走可控替身；非测试环境会返回网关不可用，不能把单元测试的生成文本当成真实模型效果。Embedding 还有独立的 `get_embeddings()` HTTP 路径，不能仅凭 ModelGateway 存在就推断所有调用都具有相同账本覆盖。
+如果没有真实网关配置，测试环境可以走可控替身；非测试环境会返回网关不可用，不能把单元测试的生成文本当成真实模型效果。Embedding 仍有独立的 `get_embeddings()` HTTP 路径，但当前每个批次也执行预算预留、运行/任务检查及 `model_call` 记录；缺少实际 usage 时标记 `UNKNOWN`。记录调用不等于已经完成供应商账单对账或验证绝对硬预算。
 
 ### 6.6 保存状态与读取结果不是同一件事
 
@@ -426,7 +433,7 @@ if r.result_json:
 
 ### 7.1 Agent 增加了什么决策
 
-普通 RAG 由程序固定执行一次检索再生成；Agent 让模型根据已有信息选择工具、检索内容和停止时机。它不是把普通 RAG 固定重复若干次。
+普通 RAG 由程序按配置执行检索流水线再生成，其中可包含多个查询变体和召回路线；Agent 让模型根据已有信息选择工具、检索内容和停止时机。它不是把普通 RAG 固定重复若干次。
 
 在 `_execute_run()` 的 `mode == "AGENT"` 分支进入 [agent.py](../backend/app/qa/agent.py) 的 `LangGraphAgent.run()`。按这个顺序阅读：
 
@@ -485,13 +492,13 @@ builder.add_edge("tools", "model")
 
 需要审批的工具通过 LangGraph `interrupt()` 暂停；`JobCheckpointSaver` 将图状态持久化到任务相关存储。审批接口进入 `QaService.resolve_tool_approval()`，随后 `queue_resume()` 安排恢复。理解普通 model/tools 循环后，再读 [job_checkpointer.py](../backend/app/qa/job_checkpointer.py)，不必第一遍就深入 checkpoint 序列化。
 
-### 7.4 严格模式有一处必须分清的实现边界
+### 7.4 普通 RAG 与 Agent 共用严格验证
 
-普通 RAG 的 strict 分支确实额外调用 judge-main，但目前只检查返回的 verdicts 是否全部为 SUPPORTED，没有完整核对判定数量和 claim ID 覆盖；空列表也会满足 Python 的 `all([])`。因此不能把标志值当成充分的逐条语义证明。
+普通 RAG 在 `validate_claims()` 后、Agent 在 `LangGraphAgent.run()` 返回后，都由 [service.py](../backend/app/qa/service.py) 的 `_verify_answer()` 执行同一验证合同。默认标记 `verification=STRUCTURAL_ONLY`；只有 strict 开启且存在 claims，才额外调用 `judge-main` 做逐 Claim 支持性判定。无 claims 时不会调用严格裁判，也不会因此标为 `SUPPORTED`。
 
-Agent 分支在 strict 且存在 claims 时直接设置 `verification=SUPPORTED`；在这条当前路径中，不能找到与普通 RAG 对等的独立语义裁判调用。它的最终 `validate_claims()` 仍是结构校验。
+`_validate_strict_verdicts()` 要求返回 verdicts 列表完整覆盖全部 claim ID、每个 ID 恰好一次且状态全部为 `SUPPORTED`。存在 claims 时，空列表、漏判、重复 ID、未知 ID、`UNSUPPORTED` 或 `UNCERTAIN` 都会以 `VERIFICATION_FAILED` 拒绝；校验通过后还会复核来源权限，再标记 `verification=SUPPORTED`。模型裁判可能判断错误，这个标记不是正确性的证明。
 
-这与离线评估中的 [evaluation/judge.py](../backend/app/evaluation/judge.py) 不同，后者对事实与断言的裁判索引做完整性检查。三者名字相似，职责与强度却不同。本次仅记录实际行为，没有修复这些业务逻辑。
+在线严格验证检查“每条断言是否被引用资料支持”；离线 [evaluation/judge.py](../backend/app/evaluation/judge.py) 还根据完整答案、金标准事实、问题与历史评估正确性、相关性和题型预期，二者不能混用。回归入口包括 [test_migration_parity.py](../backend/tests/test_migration_parity.py) 的 `test_strict_judge_requires_complete_claim_coverage()`，以及 [审计回归](reviews/2026-09-26-audit/test_audit.py) 的 `test_strict_rag_rejects_empty_judge_verdicts()` / `test_strict_agent_actually_calls_judge()`。
 
 **对应测试：** [test_agent.py](../backend/tests/test_agent.py) 的 `test_agent_single_tool_search_and_answer()`、`test_agent_repeated_calls_termination()`；[test_agent_runtime.py](../backend/tests/test_agent_runtime.py) 的 `test_agent_hitl_checkpoint_and_resume()`。
 
@@ -504,7 +511,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
   → Worker._run_evaluate()
   → EvaluationRunner._execute_run()
       ├─ 检索模式 → RetrievalPipeline.retrieve()
-      └─ RAG/AGENT → QaService.create_conversation / submit_run / get_run
+      └─ RAG/AGENT → _run_qa_turns() → 同一会话逐轮 submit_run / get_run
   → _compute_retrieval_metrics()
   → 状态检查 + 可选 judge_answer()
   → 保存单题结果 → aggregate() → export_run()/compare()
@@ -512,7 +519,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 
 对本例，金标准应有“幂等键、重试次数上限、补偿日志”三个事实组。只找到一组也可能 Hit@5=1；模型只答出一项不应算完整成功。`judgeMode=HUMAN` 默认保留待复核结果，LLM 模式才进行语义裁判。
 
-指标、API 示例、成功率分母、快照范围、多轮执行限制和门禁详见 [RAG 评估完整说明](rag-evaluation-guide.md)。这里优先理解它怎样调用已读过的问答服务，而不是另外实现一套独立 RAG。
+指标、API 示例、成功率分母、快照范围、多轮执行与最后一轮评分范围、门禁详见 [RAG 评估完整说明](rag-evaluation-guide.md)。这里优先理解它怎样调用已读过的问答服务，而不是另外实现一套独立 RAG。
 
 ## 8. 第二遍阅读：追踪权限、状态和失败
 
@@ -619,6 +626,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 推荐顺序是：[README 总览](../README.md) → 本源码导读 → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
-本导读的关键边界都来自当前代码：同步测试与异步生产不同、普通 RAG 与 Agent 的 strict 路径不同、引用越界会被扩成整段、部分设计策略没有进入当前流水线。这些差异应在阅读时保留，不能为了画出理想流程而隐藏。
+本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；普通 RAG 与 Agent 共用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。
 
 文档核对不代替真实依赖端到端运行。后续修改代码时，应一起检查这里的函数链、数据字段和分支说明是否仍然成立。
