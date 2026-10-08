@@ -1,6 +1,6 @@
 # 检索消融实验事实记录
 
-本记录总结 2026-09-13 的本地脱敏报告 [retrieval-ablation-d3e668c7db334cde87301f5d3db8feea.json](../../.runtime/reports/retrieval-ablation-d3e668c7db334cde87301f5d3db8feea.json)，不包含问题、原文或密钥。2026-10-08 复核了报告字段与生成脚本；该历史报告未记录代码提交或后端类型，不能直接归属于当前 Python/Milvus 版本。
+本记录总结 2026-09-13 的本地脱敏报告 `retrieval-ablation-d3e668c7db334cde87301f5d3db8feea.json`（本地 `.runtime/reports/`，未纳入 Git 仓库），不包含问题、原文或密钥。2026-10-08 复核了报告字段与生成脚本；该历史报告未记录代码提交或后端类型，不能直接归属于当前 Python/Milvus 版本。
 
 ## 可比性
 
