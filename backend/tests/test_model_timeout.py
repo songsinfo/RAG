@@ -59,3 +59,20 @@ def test_answer_json_mode_preserves_plain_text_retrieval_calls(monkeypatch, purp
     else:
         assert result == "hypothetical passage"
         assert not options
+
+
+@pytest.mark.parametrize("requested, expected", [(60, 60), (45, 45), (30, 30), (90, 60)])
+def test_chat_model_client_preserves_answer_timeout(monkeypatch, requested, expected):
+    import app.qa.model_clients as clients
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://model.test")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key")
+    captured = {}
+
+    def fake_build(base_url, api_key, model_alias, max_tokens, timeout_seconds):
+        captured["timeout"] = timeout_seconds
+        return object()
+
+    monkeypatch.setattr(clients, "_build_chat_model", fake_build)
+    assert clients.get_chat_model("chat-main", 512, requested) is not None
+    assert captured["timeout"] == expected
