@@ -144,6 +144,7 @@ class ModelGateway:
                     run_source_table.c.document_id,
                     run_source_table.c.build_id,
                     run_source_table.c.purpose,
+                    run_source_table.c.source_type,
                 )
                 .where(
                     and_(
@@ -155,6 +156,9 @@ class ModelGateway:
             ).fetchall()
             # run_source 不是永久授权：每次把来源送给外部模型前都重新检查当前 ACL。
             for source in sources:
+                # 工具快照是 tenant/run 所属的合成业务数据，不存在文档 ACL/build。
+                if source.source_type == "TOOL":
+                    continue
                 if not can_read_document(conn, actor, str(source.document_id)):
                     raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
                 # HISTORY 允许引用当时记录的 build；当前轮实际检索来源则要求 active_build_id 仍一致，
