@@ -21,6 +21,8 @@ jobs:
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r requirements.txt
       - run: python -m compileall -q app tests
+      - name: Export compiled RAG LangGraph diagram
+        run: python scripts/export_rag_retrieval_graph.py --print
       - run: python -m pytest -q
       - run: python -m pytest ../docs/reviews/pr-1/test_review.py -q -p no:cacheprovider --tb=short
       - name: Stack review regressions
