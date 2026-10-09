@@ -1,8 +1,8 @@
 """问答业务主服务。
 
 这是普通 RAG 和 Agent 共用的运行状态机：
-submit_run 只负责校验并把请求持久化为 QA_RUN job；
-execute_queued_run 由 DurableJobWorker 抢占后执行；
+submit_run 持久化 QA run；只有 Agent 同时创建 QA_RUN durable job；
+普通 RAG 由 API BackgroundTasks 直接启动，Agent 由 DurableJobWorker 抢占；
 _execute_run 再完成路由、历史构建、检索/Agent、生成、claim 校验、可选 strict Judge 与最终落库。
 
 核心原则：
@@ -436,9 +436,9 @@ class QaService:
         *,
         evaluation_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """创建一个可恢复的 QA run，并同步创建对应 DurableJob。
+        """创建 QA run：普通 RAG 直接启动，Agent 才创建可恢复的 DurableJob。
 
-        这里不直接做检索/模型调用；生产环境真正执行由 Worker 完成。
+        此方法只负责事务内持久化；普通 RAG 的实时执行由 API BackgroundTasks 启动。
         """
         if not idempotency_key or len(idempotency_key) > 128:
             raise ApiException(400, "IDEMPOTENCY_KEY_REQUIRED", "请提供最多128字符的 Idempotency-Key")
@@ -534,6 +534,7 @@ class QaService:
                         "runId": str(existing.id),
                         "status": str(existing.status),
                         "pollAfterMs": 1000,
+                        "reused": True,
                     }
 
             # 4. 同一用户只允许一个活动中的在线 run，避免会话 turn 顺序和预算并发失控。
@@ -549,7 +550,8 @@ class QaService:
             if active_run:
                 raise ApiException(409, "ACTIVE_RUN_EXISTS", "已有活动请求")
 
-            # 5. 先落 qa_run，再落 durable job；两者在同一事务提交，避免出现“有 run 无 job”。
+            # 5. 先持久化 qa_run；Agent 才需要同事务创建 durable job。
+            #    普通 RAG 无 job：不等待 MySQL 轮询；进程异常后由启动恢复标为 PROCESS_RESTARTED。
             run_id = str(uuid.uuid4())
             max_turn = conn.execute(
                 select(qa_run_table.c.turn_no)
@@ -606,41 +608,46 @@ class QaService:
                     updated_at=now,
                 )
             )
-            qa_job_id = str(uuid.uuid4())
-            conn.execute(
-                job_table.insert().values(
-                    tenant_id=actor.tenant_id,
-                    id=qa_job_id,
-                    kind="QA_RUN",
-                    target_id=run_id,
-                    requested_by=actor.user_id,
-                    idempotency_key=f"qa:{run_id}",
-                    request_hash=req_hash,
-                    status="QUEUED",
-                    stage="QA",
-                    attempt=0,
-                    available_at=now,
-                    lease_epoch=0,
-                    checkpoint={"runId": run_id},
-                    created_at=now,
-                    updated_at=now,
+            if mode == "AGENT":
+                # LangGraph Checkpointer + HITL/重试仍由持久化 Worker 驱动。
+                qa_job_id = str(uuid.uuid4())
+                conn.execute(
+                    job_table.insert().values(
+                        tenant_id=actor.tenant_id,
+                        id=qa_job_id,
+                        kind="QA_RUN",
+                        target_id=run_id,
+                        requested_by=actor.user_id,
+                        idempotency_key=f"qa:{run_id}",
+                        request_hash=req_hash,
+                        status="QUEUED",
+                        stage="QA",
+                        attempt=0,
+                        available_at=now,
+                        lease_epoch=0,
+                        checkpoint={"runId": run_id},
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
-            )
             conn.commit()
 
         logger.info("run_submitted", extra={"fields": {
-            "tenant_id": actor.tenant_id, "run_id": run_id, "job_id": qa_job_id, "status": "QUEUED",
+            "tenant_id": actor.tenant_id, "run_id": run_id,
+            "execution_mode": "REALTIME" if mode == "RAG" else "DURABLE", "status": "QUEUED",
         }})
-        # 测试环境同步执行只是为了单测方便；不能据此理解为生产请求在线程内跑完。
+        # 测试环境同步执行用于确定性单测；生产请求由路由即时调度 RAG 或由 Worker 处理 Agent。
         if is_test_env():
             QaService.execute_queued_run(actor, run_id)
 
-        # 生产环境只在这里持久化 QA_RUN job；真正执行由 durable runtime worker 竞争 lease 后完成。
+        # 生产 RAG 不等待 Job Worker：路由在响应后立刻启动执行；Agent 仍等待 Worker claim。
 
         return {
             "runId": run_id,
             "status": "QUEUED",
             "pollAfterMs": 1000,
+            "executionMode": "REALTIME" if mode == "RAG" else "DURABLE",
+            "reused": False,
         }
 
     @staticmethod
