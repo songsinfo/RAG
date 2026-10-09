@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-10-09，`main` 分支，PR #11 合并提交 `65ce345`。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-09，本导读同步 PR #13 的普通 RAG LangGraph 检索图改造；**PR 合并前，`main` 尚无此检索图**。本文解释所在分支的源码行为；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -21,7 +21,7 @@
 | Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
 | LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
-| LangGraph | Agent 的 model/tools 循环和断点恢复 | [agent.py](../backend/app/qa/agent.py) |
+| LangGraph | 普通 RAG 的无 Checkpointer 检索 DAG；Agent 的 model/tools 循环和 Checkpointer 恢复是另一张图 | [rag_graph.py](../backend/app/retrieval/rag_graph.py)、[agent.py](../backend/app/qa/agent.py) |
 
 第一遍按第 2～7 节看成功主线。第二遍看第 8 节的权限、租约和失败分支。第三遍运行第 9 节的测试，观察变量。不要一开始从 `models.py` 第一行一路读到底；先遇到哪个对象，就回头找它对应的表。
 
@@ -57,7 +57,7 @@ flowchart TD
     F --> T[MySQL 筛选可读生效 build]
     DIRECT --> T
     DURABLE --> T
-    T --> U[Milvus 检索、可选重排和父块扩展]
+    T --> U[检索：普通 RAG 走 LangGraph DAG<br/>Agent/Search API 复用 RetrievalPipeline 底层能力]
     U --> V[证据 E1、E2 等]
     V --> W[模型输出 claims 和引用范围]
     W --> X[校验并渲染 answer]
@@ -240,10 +240,29 @@ child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
 
 ### 5.1 先读短函数，再读底层实现
 
-先完整阅读 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`，再进入 [milvus_service.py](../backend/app/retrieval/milvus_service.py) 的 `search()`。
+**先区分入口**：普通问答及 RAG 评估（`mode=RAG`）进入 [rag_graph.py](../backend/app/retrieval/rag_graph.py) 的 `RagRetrievalGraph.retrieve()`，由 LangGraph 编排检索；Agent 的 `search_knowledge`、独立 Search API 和纯检索评估仍调用 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`。这些入口复用同一套 Milvus、RRF、Reranker、MMR、Parent、权限与来源工具。
+
+普通 RAG 检索图的实际节点顺序如下（Dense / BM25 并行完成，再汇入 RRF）：
 
 ```text
-retrieve(actor, query, kb_ids, document_ids, config_id, run_id, history)
+QaService._execute_run(mode=RAG)
+  → RagRetrievalGraph.retrieve()
+  → resolve_scope：config + evaluation_scope + ACL + active_build_id
+       ├─ 无可读 build → no_scope → END (hits=[])
+       └─ 有可读 build → prepare_query (Rewrite / Multi-Query / HyDE)
+                           ├─ dense_recall  (可按配置禁用)
+                           └─ bm25_recall   (可按配置禁用)
+                         → rrf_fusion (汇合两路)
+                         → hydrate_and_acl
+                         → rerank → mmr → parent_expansion
+                         → context_budget → finalize_hits
+                         → END (hits / warnings / config / allowedBuildCount)
+```
+
+Agent / Search API / RETRIEVAL_* 评估继续使用原单体检索函数，函数内部的步骤为：
+
+```text
+RetrievalPipeline.retrieve(actor, query, kb_ids, document_ids, config_id, run_id, history)
   → load_retrieval_config()
   → 应用 run_document_scope()（评测运行）
   → get_readable_build_records()
@@ -262,6 +281,8 @@ retrieve(actor, query, kb_ids, document_ids, config_id, run_id, history)
   → 返回 hits / warnings / config / allowedBuildCount
 ```
 
+**图的执行边界**：本次只编排检索阶段，生成答案、Claims/Judge 验证与最终 `qa_run` 提交依旧在 `QaService`。普通 RAG 图不启用 Checkpointer；在线请求仍在 FastAPI `BackgroundTasks` 中执行，进程异常时不会自动从 `rrf_fusion` 或 `rerank` 节点继续。RAG 评估仍走现有 `QA_RUN` Worker，但暂未获得检索图的节点级恢复能力。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+
 ### 5.2 权限过滤先于检索
 
 ```python
@@ -279,7 +300,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 
 ### 5.3 BM25、Dense 和 Hybrid 在哪里分支
 
-`retrieve()` 根据有效配置选择 BM25 和 Dense 路线，分别调用 `search()`；底层 `search()` 也支持直接 HYBRID 调用：
+无论普通 RAG 的 LangGraph 检索图，还是 Agent / Search API 的 `RetrievalPipeline.retrieve()`，都根据当前有效配置选择 BM25 / Dense 路线，调用 `MilvusHybridService.search()`；底层 `search()` 也支持直接 HYBRID 调用：
 
 | 模式 | 核心操作 | 阅读时关注 |
 | --- | --- | --- |
@@ -287,7 +308,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 | DENSE | 问题 embedding → dense 向量搜索 | 查询与索引维度一致 |
 | HYBRID | 两路检索，通过 RRF 融合 | 两路候选数量和融合排名 |
 
-当前统一流水线分别执行 BM25 / Dense 搜索，在应用层调用 `rrf_fuse()` 融合各查询路线。底层 `MilvusHybridService.search(mode="HYBRID")` 也分别调用 `client.search()`，将 ORIGINAL / SUMMARY / QUESTION 等表示归一并按 canonical chunk 去重后再做 RRF；不再直接使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`，避免同一子块的不同表示重复投票。RRF 综合各路线里的名次，不直接混加两种不可比的原始分数。
+普通 RAG 图通过并行 `dense_recall` / `bm25_recall` 节点取回排名列表，在 `rrf_fusion` 节点调用 `rrf_fuse()`；`RetrievalPipeline.retrieve()` 也沿用相同的应用层加权融合逻辑。底层 `MilvusHybridService.search(mode="HYBRID")` 也分别调用 `client.search()`，将 ORIGINAL / SUMMARY / QUESTION 等表示归一并按 canonical chunk 去重后再做 RRF；不再直接使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`，避免同一子块的不同表示重复投票。RRF 综合各路线里的名次，不直接混加两种不可比的原始分数。
 
 测试环境另有内存检索和确定性 embedding 路径。它们适合验证过滤和执行逻辑，不能代表真实向量的语义质量，也不能用其表现估计生产 Milvus 性能。
 
@@ -308,9 +329,9 @@ text           = 后续用于上下文的文本
 
 `_attach_provenance()` 通过 `chunk_span → source_unit` 补充来源。能在当前上下文找到完整单元时，设置 `contextMapped=true` 并保存上下文偏移；找不到时仍保留来源信息，不能把 `contextMapped=false` 解释为已有精确上下文映射。
 
-当前 `retrieve()` 已接入 Rewrite、HyDE、Multi-Query 和 MMR，但都由配置开关控制。Rewrite 还要求存在历史，并保留原问题与改写问题；Multi-Query 增加等价问法；HyDE 只贡献 Dense 路线，不把假想文本作为事实证据；MMR 在重排后、父块扩展前选择候选。开启策略不等于已证明效果更好，仍需固定其他条件做实验。
+两条检索编排入口均接入 Rewrite、HyDE、Multi-Query 和 MMR，但都由配置开关控制。Rewrite 还要求存在历史，并保留原问题与改写问题；Multi-Query 增加等价问法；HyDE 只贡献 Dense 路线，不把假想文本作为事实证据；MMR 在重排后、父块扩展前选择候选。开启策略不等于已证明效果更好，仍需固定其他条件做实验。
 
-**对应测试：** [test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`；[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()`。
+**对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()` 校验普通 RAG 检索图各阶段事件与实时执行契约；[test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`、[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()` 校验仍被 Agent / Search API 等入口复用的原检索组件。
 
 ## 6. 普通 RAG：证据如何变成用户看到的答案
 
@@ -328,6 +349,8 @@ Chat.vue::submit()
       → 返回 HTTP 202 / runId / executionMode=REALTIME
   → FastAPI BackgroundTasks(QaService.execute_queued_run)
   → QaService._execute_run()
+      → RagRetrievalGraph.retrieve()：检索阶段 LangGraph DAG
+      → Evidence 固化 → ModelGateway 生成 → Claims/Judge 校验
       → 写 run_event 阶段事件，最终保存已验证答案
   → 前端 EventSource /runs/{id}/events → done 后 GET /runs/{id}
 
@@ -336,7 +359,7 @@ Agent / 评估 RAG：submit_run 同事务写 qa_run + job(QA_RUN)
   → QaService.execute_queued_run(job_id, lease_epoch) → _execute_run()
 ```
 
-主要文件：[qa/router.py](../backend/app/qa/router.py)、[qa/service.py](../backend/app/qa/service.py)。在长文件中先按函数名搜索，不要从所有会话管理接口开始逐行阅读。
+主要文件：[qa/router.py](../backend/app/qa/router.py)、[qa/service.py](../backend/app/qa/service.py)、[rag_graph.py](../backend/app/retrieval/rag_graph.py)。在长文件中先按函数名搜索，不要从所有会话管理接口开始逐行阅读。
 
 `conversation` 表示会话，`context_segment` 是会话范围上下文，`qa_run` 始终记录一次问题执行；**只有 Agent、评估 RAG 会同时拥有驱动执行的 `QA_RUN` Job**。在线普通 RAG 的 `qa_run` 没有对应 Job。两种通道复用同一问答核心和最终验证。
 
@@ -346,7 +369,7 @@ Agent / 评估 RAG：submit_run 同事务写 qa_run + job(QA_RUN)
 | --- | --- | --- |
 | 1 | `classify_question()` | 本例归为知识问答 |
 | 2 | 读取 segment 范围 | 确定知识库范围 |
-| 3 | `RetrievalPipeline.retrieve()` | 找到订单规则的 hit |
+| 3 | `RagRetrievalGraph.retrieve()` | 通过 Scope、Dense/BM25、RRF、重排、Parent、上下文预算取得 hit |
 | 4 | 创建 evidence / evidence_map | 为正文分配 E1 等编号 |
 | 5 | 写 `run_source` | 记录本次运行依赖的文档与来源 |
 | 6 | `ModelGateway.chat()` | 将问题与 evidence 交给 chat-main |
@@ -601,7 +624,7 @@ try {
 if ($LASTEXITCODE -ne 0) { throw '检索与问答测试失败' }
 ```
 
-断点按顺序放在 `retrieve()`、`_expand_parents()`、`QaService._execute_run()` 中生成前、`validate_claims()`。检查 `allowed_build_ids`、`hits`、`evidence_map`、`messages`、`parsed_answer` 和 `validated`。
+普通 RAG 的断点按顺序放在 `RagRetrievalGraph._resolve_scope()`、`_dense_recall()` / `_bm25_recall()`、`_rrf_fusion()`、`_rerank()`、`_context_budget()`，然后追到 `QaService._execute_run()` 中生成前及 `validate_claims()`。观察 `allowed_build_ids`、`dense_routes` / `sparse_routes`、`hits`、`evidence_map` 和最终 `messages`。Agent / Search API 的旧检索路径仍可在 `RetrievalPipeline.retrieve()` 设置断点。
 
 运行 pytest 命令本身不会自动启用 IDE 断点；若用命令行交互调试，可在命令中加 `--trace` 从测试入口进入，或用 IDE 的 pytest 调试配置启动。
 
@@ -634,7 +657,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 ## 10. 与现有文档如何配合
 
-推荐顺序是：[README 总览](../README.md) → 本源码导读 → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
+推荐顺序是：[README 总览](../README.md) → 本源码导读 → [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
 本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；普通 RAG 与 Agent 共用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。
 
