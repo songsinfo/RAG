@@ -93,7 +93,10 @@ flowchart TD
     C --> D["MySQL 写入 qa_run<br/>QUEUED"]
     D --> EXEC{"执行通道"}
     EXEC -->|在线普通 RAG| HTTP["HTTP 202 + runId<br/>executionMode=REALTIME"]
+    HTTP --> EVENTS["前端立即订阅 SSE<br/>GET /runs/{run_id}/events"]
     HTTP --> BG["FastAPI BackgroundTasks<br/>响应发送后立即执行"]
+    JOB --> DURABLE_HTTP["HTTP 202 + runId<br/>executionMode=DURABLE"]
+    DURABLE_HTTP --> EVENTS
     EXEC -->|Agent / 评估 RAG| JOB["同事务写入 QA_RUN Job<br/>executionMode=DURABLE"]
     JOB --> WORKER["Durable Worker<br/>Lease / Retry / Recovery"]
     BG --> F{"问题路由"}
@@ -146,9 +149,11 @@ flowchart TD
     H --> Z
     NOEV --> Z
     U --> Z
+    BG -.->|"运行期间记录 run_event"| EVENTS
+    WORKER -.->|"运行期间记录 run_event"| EVENTS
     Z --> FINAL["写入 qa_run 终态；若有 Job 同步更新"]
-    FINAL --> EVENTS["前端 SSE 订阅 /runs/{run_id}/events<br/>阶段实时更新；断线回退 GET"]
-    EVENTS --> VIEW["终态 GET /runs/{run_id}<br/>显示校验后的 Answer / Evidence"]
+    FINAL -.->|"SSE done"| EVENTS
+    EVENTS -->|"done 后或 SSE 断线时轮询"| VIEW["GET /runs/{run_id}<br/>终态显示已校验 Answer / Evidence"]
 ```
 
 **问答执行模式**：浏览器普通 RAG 由 API 进程响应后直接启动，不创建 `QA_RUN` Job；Agent 和携带受信任 `evaluation_scope` 的评估 RAG 同事务创建 `qa_run + QA_RUN Job`，由 Worker 领取执行。两类请求均返回 HTTP 202，`qa_run` 始终记录状态和审计；现有 SSE 推送的是运行阶段，不是模型逐 Token。进程崩溃后在线普通 RAG 记为 `FAILED / PROCESS_RESTARTED`，持久化模式按 Job/Checkpoint 策略恢复。详见 [源码导读第 6 节](docs/source-walkthrough.md#6-普通-rag证据如何变成用户看到的答案)。
