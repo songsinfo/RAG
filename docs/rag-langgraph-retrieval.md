@@ -4,6 +4,27 @@
 生成答案、Claims/Judge 校验、最终事务、Agent 的 `model ↔ tools`、
 独立 `/search` 和 `RetrievalPipeline.retrieve()` 的既有调用者暂不变。
 
+## 编译后的 LangGraph 状态图（源码同步）
+
+下面的图示对应 [`rag_graph.py`](../backend/app/retrieval/rag_graph.py) 中 `builder.compile()` 创建的普通 RAG 检索图。注意它不包含 `QaService` 内的答案生成或 Agent 的 `model/tools` 图。图的内容应以 `compiled.get_graph().draw_mermaid()` 的导出结果为准。
+
+<!-- compiled-rag-retrieval-graph:begin -->
+```mermaid
+flowchart TD
+  __start__([START]) --> resolve_scope
+  resolve_scope -. 有可读 Build .-> prepare_query
+  resolve_scope -. 无可读 Build .-> no_scope
+  no_scope --> __end__([END])
+  prepare_query --> dense_recall
+  prepare_query --> bm25_recall
+  dense_recall --> rrf_fusion
+  bm25_recall --> rrf_fusion
+  rrf_fusion --> hydrate_and_acl --> rerank --> mmr --> parent_expansion --> context_budget --> finalize_hits --> __end__
+```
+<!-- compiled-rag-retrieval-graph:end -->
+
+**再生成（以编译结果覆盖图示）**：在 `backend/` 下运行 `python scripts/export_rag_retrieval_graph.py --write`。脚本真正调用 `RagRetrievalGraph._get_graph().get_graph().draw_mermaid()`，并替换上述图示；也可运行 `--print` 查看原生 Mermaid 或 `--check` 验证文档是否与编译图一致。无需访问 Milvus 或调用 LLM。
+
 ## 节点拓扑
 
 ```mermaid
