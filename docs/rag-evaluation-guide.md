@@ -218,6 +218,8 @@ nDCG@K = DCG@K / IDCG@K
 
 当前 `_compute_retrieval_metrics()` 没有独立使用传入的 `evidence_list` 计算上下文覆盖。检索模式传入流水线 `hits`，RAG/AGENT 模式传入最终 QA `evidence`。虽然指标标注了 `FINAL_RANKED_CANONICAL`，仍应根据调用来源解释它，不能据此声称已经完成各阶段召回和上下文覆盖评估。
 
+**PR #13 普通 RAG 检索图的评估边界**：普通 RAG（包括 `mode=RAG` 的批量评估）现通过 `RagRetrievalGraph` 执行检索节点；纯检索模式 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 和 Agent 的 `search_knowledge` 仍使用 `RetrievalPipeline.retrieve()`。普通 RAG 检索节点新增 `RAG_DENSE_RECALL`、`RAG_BM25_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_CONTEXT_BUDGET` 等 `run_event`，**当前只记录阶段命中数量、耗时和开关，不保存完整有序候选列表，也不自动计算阶段级 Recall@5、NDCG@5 或 Context Coverage**。需在权限受控的评估执行中另行保存各阶段 canonical Chunk ID / Build ID 及排名，才能将阶段数据与 Gold fact groups 对齐计算归因指标。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+
 ## 4. 回答质量怎么判断
 
 ### 4.1 四个维度不要混为一谈
