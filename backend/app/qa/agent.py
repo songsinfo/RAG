@@ -46,6 +46,7 @@ from app.qa.runtime import (
     assert_runtime_budget,
     compact_messages,
     estimate_tokens,
+    message_tokens,
     retry_call,
 )
 from app.retrieval.rag_graph import RagRetrievalGraph
@@ -439,11 +440,22 @@ class LangGraphAgent:
         if state["round"] >= ctx.policy.max_rounds:
             raise ApiException(429, "BUDGET_EXCEEDED", "Agent 主循环次数已耗尽")
 
-        # 每轮都重新压缩上下文，避免工具结果不断累积导致模型上下文无限增长。
-        messages, trim_info = compact_messages(
-            list(state["messages"]),
+        # 工具 schema 与输出预留均计入真正的请求预算；无明确模型容量时采用保守默认。
+        model_window = max(2048, int(os.getenv("AGENT_MODEL_CONTEXT_TOKENS", "8192")))
+        output_reserve = 1200
+        safety_margin = 400
+        tools_budget = estimate_tokens(AGENT_TOOLS)
+        message_budget = min(
             ctx.policy.max_context_tokens,
+            model_window - output_reserve - safety_margin - tools_budget,
         )
+        if message_budget < 256:
+            raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "模型上下文容量不足以容纳工具定义与回答预算")
+        messages, trim_info = compact_messages(list(state["messages"]), message_budget)
+        trim_info["requestEstimateTokens"] = message_tokens(messages) + tools_budget + output_reserve + safety_margin
+        trim_info["estimator"] = "conservative-byte-and-langchain"
+        if trim_info["requestEstimateTokens"] > model_window:
+            raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "模型请求超过安全上下文窗口")
         if trim_info["trimmed"]:
             ctx.record_event_fn(
                 actor.tenant_id,

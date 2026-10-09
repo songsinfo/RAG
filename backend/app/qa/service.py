@@ -1530,6 +1530,7 @@ class QaService:
                     model_call_table.c.output_tokens.label("outputTokens"),
                     model_call_table.c.settled_amount.label("settledAmount"),
                     model_call_table.c.reserved_amount.label("reservedAmount"),
+                    model_call_table.c.usage_detail.label("usageDetail"),
                 ).where(
                     and_(
                         model_call_table.c.tenant_id == actor.tenant_id,
@@ -1545,6 +1546,9 @@ class QaService:
                     "outputTokens": int(c.outputTokens) if c.outputTokens else 0,
                     "settledAmount": str(c.settledAmount) if c.settledAmount is not None else None,
                     "reservedAmount": str(c.reservedAmount or "0.000000"),
+                    "cacheReadTokens": (c.usageDetail or {}).get("cacheReadTokens"),
+                    "model": (c.usageDetail or {}).get("model"),
+                    "durationMs": (c.usageDetail or {}).get("durationMs"),
                 }
                 for c in calls
             ]

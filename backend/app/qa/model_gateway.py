@@ -229,7 +229,12 @@ class ModelGateway:
                         job_id=job_id, purpose=purpose, alias=model_alias,
                         payload={"messages": messages, "tools": []},
                         max_output_tokens=max_tokens,
-                        usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                        usage_reader=lambda response: {
+                            **(getattr(response, "usage_metadata", None) or {}),
+                            "cache_read_tokens": ((getattr(response, "usage_metadata", None) or {}).get("input_token_details") or {}).get("cache_read")
+                                if isinstance((getattr(response, "usage_metadata", None) or {}).get("input_token_details"), dict)
+                                else None,
+                        },
                     )
 
                 try:
@@ -259,7 +264,12 @@ class ModelGateway:
                             job_id=job_id, purpose=purpose, alias=fallback_alias,
                             payload={"messages": messages, "tools": []},
                             max_output_tokens=max_tokens,
-                            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                            usage_reader=lambda response: {
+                                **(getattr(response, "usage_metadata", None) or {}),
+                                "cache_read_tokens": ((getattr(response, "usage_metadata", None) or {}).get("input_token_details") or {}).get("cache_read")
+                                    if isinstance((getattr(response, "usage_metadata", None) or {}).get("input_token_details"), dict)
+                                    else None,
+                            },
                         )
 
                     response = retry_call(

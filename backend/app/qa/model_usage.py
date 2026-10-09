@@ -46,10 +46,20 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         usage = usage_reader(result) if usage_reader else {}
         reported = bool(usage and type(usage.get("input_tokens")) is int and type(usage.get("output_tokens")) is int
                         and usage["input_tokens"] >= 0 and usage["output_tokens"] >= 0)
+        detail = {
+            "cacheReadTokens": usage.get("cache_read_tokens", usage.get("cached_tokens")),
+            "inputTokensReported": usage.get("input_tokens") if reported else None,
+            "model": alias, "durationMs": round((time.perf_counter() - started) * 1000, 2),
+            "usageEstimator": "provider" if reported else "byte-ceiling",
+        }
+        # 不把缺失的缓存字段当作 0；已返回且合法的 0 才是真实零命中。
+        if not isinstance(detail["cacheReadTokens"], int) or detail["cacheReadTokens"] < 0:
+            detail["cacheReadTokens"] = None
         ModelGateway._record_call(
             tenant_id, call_id, run_id, purpose, "SUCCESS" if reported else "UNKNOWN",
             usage["input_tokens"] if reported else input_limit,
             usage["output_tokens"] if reported else output_limit, alias, job_id=job_id,
+            usage_detail=detail,
         )
         logger.info("model_call_finished", extra={"fields": {
             **{k: v for k, v in fields.items() if v is not None},

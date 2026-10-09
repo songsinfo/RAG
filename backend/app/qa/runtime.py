@@ -134,7 +134,10 @@ def _from_langchain_message(message) -> Dict[str, Any]:
 
 def message_tokens(messages: List[Dict[str, Any]]) -> int:
     converted = [_to_langchain_message(message) for message in messages]
-    return int(count_tokens_approximately(converted))
+    approx = int(count_tokens_approximately(converted))
+    # tokenizer 不可用时，额外计入 Unicode/CJK、工具调用结构和消息包装开销。
+    raw = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return max(approx, (len(raw.encode("utf-8")) + 1) // 2)
 
 
 def compact_messages(messages: List[Dict[str, Any]], max_tokens: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
