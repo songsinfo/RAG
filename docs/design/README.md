@@ -6,6 +6,8 @@
 
 本目录把已确认的八份 PRD 转为实现契约。PRD 决定需求，本目录决定调用顺序、数据约束与失败处理；SQL/JSON 是待落地验证的设计附件，不是已经执行的迁移。具体依赖补丁号、容器摘要与模型端点在 C1 环境验证后锁定。
 
+**新增统一 Agent 规格（2026-10-10）**：[统一业务 Agent 规格](10-unified-business-agent-spec.md)为目前的目标契约；[Tickets](../delivery/unified-business-agent-tickets.md)与[实际编码/未验收状态](../delivery/unified-business-agent-implementation-status.md)区分完成与剩余事项。原 01～09 及旧 PRD 均是历史设计，不应用其中的“普通 RAG / Agent 双模式”“Java HTTP 工具”等描述覆盖 PR #14 的新问答入口。
+
 ## 阅读顺序
 
 1. [架构与技术选型](01-architecture.md)：系统如何运行、哪些组件承担哪些工作。

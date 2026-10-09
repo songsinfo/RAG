@@ -2,9 +2,11 @@
 
 Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（供应商 API 密钥由网关独立持有）、Docling 独立解析服务，面向运营、产品和技术共用的企业级内部知识库。前端简洁，重点是细粒度权限控制、文档全生命周期、混合检索策略、可追溯事实断言回答、自动化评测与故障恢复。旧 Java/Spring Boot/Elasticsearch 基线可通过 Git 历史标签或提交记录定位。
 
+> **分支状态（2026-10-10）**：本文以下的统一业务 Agent 流程对应 [PR #14 的开发分支](https://github.com/songsinfo/RAG/pull/14)，**尚未合并 main，尚未满足 UA-01～UA-12 全量验收**。四个业务诊断工具均为固定模拟结果，没有调用 Java 或真实业务系统。实现进度、未完成项与回滚条件见[统一业务 Agent 实施状态](docs/delivery/unified-business-agent-implementation-status.md)。
+
 ## 系统架构与核心流程
 
-> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一通过 Docling Serve 的 `/v1/chunk/hybrid/file` 完成文档解析与 HybridChunker 语义切块，后端再将 Docling Hybrid Chunks 适配为 Parent-Child 结构并保留标题、页码、来源位置等 provenance 信息。后台 INGEST/PURGE/Agent/EVALUATE 及评估 RAG 使用 MySQL 持久化 Job + Lease Worker；在线普通 RAG 只创建 qa_run，HTTP 202 响应后立即在 API 后台执行，不进入 Job 队列。进度通过 SSE 事件通道推送，最终答案在验证完成后展示。
+> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一通过 Docling Serve 的 `/v1/chunk/hybrid/file` 完成文档解析与 HybridChunker 语义切块，后端再将 Docling Hybrid Chunks 适配为 Parent-Child 结构并保留标题、页码、来源位置等 provenance 信息。后台 INGEST/PURGE/EVALUATE 和**所有新建在线问答**使用 MySQL 持久化 Job + Lease Worker；旧普通 RAG 的 REALTIME 路径只为历史未完成任务保留兼容代码。进度通过 SSE 事件通道推送，最终答案在验证完成后展示。
 
 ### 系统架构图
 
@@ -17,8 +19,8 @@ flowchart LR
         AUTH[identity<br/>登录 / 租户 / ACL / CSRF]
         KB[knowledge<br/>文档 / 版本 / 生命周期 / 入库任务]
         PARSER[Docling Adapter<br/>Hybrid Chunks → Parent-Child + Provenance]
-        RET[retrieval<br/>LangGraph 普通 RAG 检索图<br/>共享 Dense / BM25 / RRF / Reranker / Parent]
-        QA[qa<br/>普通 RAG / LangGraph Agent / Claim Validation]
+        RET[retrieval<br/>Agent 的 LangGraph 检索工具图<br/>共享 Dense / BM25 / RRF / Reranker / Parent]
+        QA[qa<br/>统一 LangGraph Agent / Claim Validation / 模拟业务工具]
         EVAL[evaluation<br/>题集 / 指标 / 消融实验]
         MODEL[ModelGateway<br/>LangChain OpenAI Client]
         EMB[embedding.py<br/>Embedding Client]
@@ -84,100 +86,61 @@ flowchart TD
 
 ```
 
-### RAG / Agent 问答流程图
+### 统一业务 Agent 问答流程图（PR #14 开发分支）
 
 ```mermaid
 flowchart TD
-    A["用户提问<br/>POST /conversations/{id}/runs"] --> B["输入安全校验"]
-    B --> C["校验会话归属 / 幂等键 / 单会话并发"]
-    C --> D["MySQL 写入 qa_run<br/>QUEUED"]
-    D --> EXEC{"执行通道"}
-    EXEC -->|在线普通 RAG| HTTP["HTTP 202 + runId<br/>executionMode=REALTIME"]
-    HTTP --> EVENTS["前端立即订阅 SSE<br/>GET /runs/{run_id}/events"]
-    HTTP --> BG["FastAPI BackgroundTasks<br/>响应发送后立即执行"]
-    JOB --> DURABLE_HTTP["HTTP 202 + runId<br/>executionMode=DURABLE"]
-    DURABLE_HTTP --> EVENTS
-    EXEC -->|Agent / 评估 RAG| JOB["同事务写入 QA_RUN Job<br/>executionMode=DURABLE"]
-    JOB --> WORKER["Durable Worker<br/>Lease / Retry / Recovery"]
-    BG --> F{"问题路由"}
-    WORKER --> F
-
-    F -->|闲聊| G["固定回答<br/>不检索 / 不调用模型"]
-    F -->|不支持请求| H["固定拒绝范围说明<br/>不检索 / 不调用模型"]
-    F -->|企业知识问答| I{"mode"}
-
-    I -->|RAG| RG["LangGraph 普通 RAG 检索 DAG<br/>无持久化 Checkpointer"]
-    RG --> J["resolve_scope<br/>MySQL Segment Scope + ACL"]
-    J --> K["当前可读 active_build_id"]
-    K --> L{"有可读 Build?"}
-    L -->|否| NOEV["NO_EVIDENCE"]
-    L -->|是| M["prepare_query<br/>可选 Rewrite / Multi-Query / HyDE"]
-
-    M --> M1["dense_recall<br/>Embedding + Milvus"]
-    M --> M2["bm25_recall<br/>Milvus Sparse"]
-    M1 --> M3["rrf_fusion<br/>等待两路召回"]
-    M2 --> M3
-    M3 --> HACL["hydrate_and_acl<br/>原文回查 + 权限复核"]
-    HACL --> M4{"Rerank Enabled?"}
-    M4 -->|是| M5["rerank<br/>Cross-Encoder / Rerank API"]
-    M4 -->|否| M6["保留融合顺序"]
-    M5 --> MMR["mmr<br/>按配置可选"]
-    M6 --> MMR
-    MMR --> M7{"Parent Expansion?"}
-    M7 -->|是| M8["parent_expansion<br/>Child → Parent Context"]
-    M7 -->|否| CB["context_budget<br/>UTF-8 字节预算 + Final Top-K"]
-    M8 --> CB
-    CB --> N["finalize_hits<br/>Provenance + ACL"]
-    N --> O["登记 run_source / Evidence"]
-    O --> P["ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims"]
-    P --> Q["Claim Validation<br/>引用范围与 Evidence 绑定"]
-    Q --> R{"Strict 且存在 Claims?"}
-    R -->|是| S["LiteLLM judge-main<br/>逐 Claim 判断 SUPPORTED"]
-    R -->|否| T["Structural Validation"]
-    S --> U["Output Guard"]
-    T --> U
-
-    I -->|AGENT| V["LangGraph Agent"]
-    V --> W["LLM 决定工具调用"]
-    W --> X{"工具"}
-    X -->|search_knowledge| X1["ACL Scope + Milvus Hybrid Search"]
-    X -->|read_section| X2["读取授权文档 Source Unit"]
-    X1 --> W
-    X2 --> W
-    W -->|无 Tool Call| Y["Claim Validation"]
-    Y --> R
-    V -. "最多6轮 / 8次工具调用<br/>同参数重复3次熔断" .-> LIMIT["超限或重复调用<br/>失败终止"]
-    LIMIT --> Z
-
-    G --> Z["写入终态 Result"]
-    H --> Z
-    NOEV --> Z
-    U --> Z
-    BG -.->|"运行期间记录 run_event"| EVENTS
-    WORKER -.->|"运行期间记录 run_event"| EVENTS
-    Z --> FINAL["写入 qa_run 终态；若有 Job 同步更新"]
-    FINAL -.->|"SSE done"| EVENTS
-    EVENTS -->|"done 后或 SSE 断线时轮询"| VIEW["GET /runs/{run_id}<br/>终态显示已校验 Answer / Evidence"]
+    A["用户提问<br/>POST /conversations/{id}/runs"] --> B["输入校验 / 会话归属 / 幂等 / Segment"]
+    B --> C["同事务写入 qa_run(mode=AGENT)<br/>和 QA_RUN Durable Job"]
+    C --> D["HTTP 202 / executionMode=DURABLE<br/>前端订阅阶段 SSE"]
+    C --> W["QA Worker 领取 Job<br/>Lease / Cancel / 恢复"]
+    W --> Q{"轻量规则路由"}
+    Q -->|问候或不支持| FIX["固定回复"]
+    Q -->|业务或知识问答| AG["LangGraph Agent<br/>model → tools → model"]
+    AG --> CH{"模型选择工具或最终回答"}
+    CH -->|search_knowledge| RG["RagRetrievalGraph（无内层 Checkpointer）"]
+    RG --> SCOPE["Scope + ACL + 评测范围"]
+    SCOPE --> RECALL["Query Prepare → Dense/BM25 并行"]
+    RECALL --> RRF["RRF → Rerank → MMR → Parent"]
+    RRF --> CONTEXT["Context Budget → Provenance → ACL"]
+    CONTEXT --> DOC["登记 DOCUMENT Evidence / run_source"]
+    CH -->|read_section| SEC["授权文档 / SourceUnit"]
+    SEC --> DOC
+    CH -->|四种模拟业务工具| MOCK["固定 fixture / 参数校验<br/>未查询真实业务系统"]
+    MOCK --> TOOL["登记 TOOL Evidence / 快照<br/>mock=true + queriedAt"]
+    DOC --> REPLY["回填受限工具结果"]
+    TOOL --> REPLY
+    REPLY --> AG
+    CH -->|无工具调用| CLAIM["结构化 Claims + gaps<br/>校验证据 ID 和引用区间"]
+    CLAIM --> J{"strict 且存在 Claims?"}
+    J -->|是| STRICT["Judge 检查证据支持"]
+    J -->|否| GUARD["Output Guard"]
+    STRICT --> GUARD
+    GUARD --> FINISH["保存结果 / 来源 / Job 终态"]
+    FIX --> FINISH
+    FINISH --> VIEW["SSE 完成 / GET runs<br/>展示文档来源与模拟标识"]
 ```
 
-**问答执行模式**：浏览器普通 RAG 由 API 进程响应后直接启动，不创建 `QA_RUN` Job；Agent 和携带受信任 `evaluation_scope` 的评估 RAG 同事务创建 `qa_run + QA_RUN Job`，由 Worker 领取执行。两类请求均返回 HTTP 202，`qa_run` 始终记录状态和审计；现有 SSE 推送的是运行阶段，不是模型逐 Token。进程崩溃后在线普通 RAG 记为 `FAILED / PROCESS_RESTARTED`，持久化模式按 Job/Checkpoint 策略恢复。详见 [源码导读第 6 节](docs/source-walkthrough.md#6-普通-rag证据如何变成用户看到的答案)。
+**执行入口**：新请求不带 `mode`、带旧 `mode=RAG` 或 `mode=AGENT`，均规范化为 AGENT，创建 `qa_run + QA_RUN Job`，由 Worker 执行。原旧运行及历史指标**不更改语义**，旧 REALTIME 执行分支在排空/处理旧队列前仍保留。SSE 当前只推送运行阶段，并非模型逐 Token 输出。
 
-**检索编排边界**：普通 RAG 问答（`mode=RAG`）的检索阶段由 [`RagRetrievalGraph`](backend/app/retrieval/rag_graph.py) 编排：**Scope → 可选 Rewrite / Multi-Query / HyDE → 并行 Dense + BM25 → 应用层 RRF → 原文回查与 ACL → 可选 Reranker / MMR → 可选 Parent Expansion → 上下文预算与 Final Top-K → Provenance / 最终 ACL**。Agent 的 `search_knowledge`、独立 `/search` 及纯检索评估仍调用 [`RetrievalPipeline.retrieve()`](backend/app/retrieval/pipeline.py)，两种入口共享 Milvus、RRF、Reranker 等底层能力。普通 RAG 的图不启用 Checkpointer，仍由 BackgroundTasks 实时执行，进程崩溃后**不能**从图节点自动恢复。参数由版本化 Retrieval Config 决定，`qa_run.config_id` 保存本次配置版本。两种问答模式的结构化结果仍由 `_verify_answer()` 共用校验；strict 且有 claims 时额外调用 `judge-main`，要求全部 Claim 得到支持。详细节点图及范围见 [普通 RAG LangGraph 检索图说明](docs/rag-langgraph-retrieval.md)。
+**两层图职责**：外层 [`LangGraphAgent`](backend/app/qa/agent.py) 模型决定是否检索、调用哪个工具以及何时回答；`search_knowledge` 通过 [`RagRetrievalGraph`](backend/app/retrieval/rag_graph.py) 完成 ACL → Query Prepare → Dense/BM25 → RRF → Rerank/Context → Evidence，不负责生成答案。检索图没有持久化 Checkpointer，外层 Agent checkpoint 不能从内层任意检索节点恢复。独立 `/search` 和纯检索评测仍保留 `RetrievalPipeline.retrieve()`。
 
-## 企业化增强（当前 main 实现）
+**两类证据**：文档引用由 `documentId/buildId`、来源原文和 ACL 约束；`TOOL` 引用存储 `sourceType/toolName/sourceSnapshot`、查询对象、`queriedAt`、`fixtureVersion`、`mock`，不伪造文档链接。页面及回答通过后端字段提示“模拟结果，未查询真实业务系统”。这不意味着真实用户业务资格经过核验。上下文压缩与缓存可观测性尚不等于跨轮稳定 KV cache 已验收；详细状态见实施记录。
+
+## 企业化增强（PR #14 候选实现；以逐项测试结果为准）
 
 - **统一权限真源**：Search API、普通 RAG、Agent 检索统一使用 `get_readable_build_records()`，同时覆盖租户、用户状态、KB ACL、文档 ACL、用户组和 active build。
 - **TOCTOU 防护**：检索后、模型外发前再次核对当前权限与 `active_build_id`；权限撤销或版本切换时返回 `SOURCE_CHANGED`，不把失效来源发送给模型。
 - **完整 Evidence Provenance**：Milvus Hit 返回真实 `kbId/documentId/versionId/buildId/chunkId`，并关联 `source_unit/location`；不再用 `allowed_build_ids[0]` 猜测来源。
 - **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
 - **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
-- **普通 RAG LangGraph 检索图**：Dense/BM25 并行、RRF 汇合、Reranker / MMR / Parent / 上下文预算独立节点；每阶段 `run_event` 记录候选数量与耗时，**尚未**保存完整候选排名或计算阶段级 Recall@5 / NDCG@5。Agent 依旧使用独立的 model/tools 图。
+- **Agent 复用 LangGraph 检索图**：Dense/BM25 并行、RRF 汇合、Reranker / MMR / Parent / 上下文预算独立节点；每阶段 `run_event` 记录候选数量与耗时，**尚未**保存完整候选排名或计算阶段级 Recall@5 / NDCG@5。Agent 依旧使用独立的 model/tools 图。
 - **统一 Docling + HybridChunker 入库**：Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一调用 Docling `/v1/chunk/hybrid/file`；Docling 负责解析与 HybridChunker 子块切分，后端通过 `adapt_docling_hybrid_chunks()` 组织 Parent-Child 结构，并保留 Heading、Page、Doc Item、Location 等 provenance。默认 Child 上限为 400 tokens、Parent 上限为 1200 tokens，均可通过构建配置或环境变量调整。
-- **在线问答分流**：在线普通 RAG 不再排队等待 MySQL Job Worker；提交后通过 FastAPI BackgroundTasks 立即执行，`qa_run` 保留状态、证据和审计，前端订阅 `/runs/{run_id}/events` SSE 进度并在断线时回退查询。模型当前仍生成完整的结构化 JSON，只有验证后的最终答案展示，尚非逐 Token 流式生成。
-- **Durable Job Worker**：INGEST/PURGE/EVALUATE/Agent 及评估 RAG 继续使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
+- **统一 Agent 问答通道**：新提问总是创建 `QA_RUN` Durable Job，前端移除 RAG / Agent 模式选择，保留 SSE、取消、追问与受权限控制的历史展示；旧 REALTIME 代码用于历史兼容，尚未完成清理。
+- **Durable Job Worker**：INGEST/PURGE/EVALUATE 和新建统一 Agent 问答使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
 - **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
-- **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文裁剪使用 LangChain `trim_messages` / `count_tokens_approximately`，不再维护平行的自研 checkpoint/resume 协议。
-- **职责边界**：LangGraph/LangChain 负责图状态、HITL 恢复与消息裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
+- **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文使用保守 Token 估算及高低水位完整对话组裁剪（未达到阈值保留前缀），不再采用 LangChain `trim_messages` 逐轮裁剪；跨问答的持久化稳定上下文尚未实现。
+- **职责边界**：LangGraph 负责图状态和 HITL 恢复，项目实现上下文预算和消息组裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
 - **CI 基线**：GitHub Actions 执行 Python compile/pytest 与前端 type-check/test/build。
 
 ## 阅读顺序
@@ -195,7 +158,10 @@ flowchart TD
 9. [PRD-07 Agent 深入问答](docs/prd/PRD-07-agent-deep-qa.md)
 10. [B0-B3 检索消融实验运行手册](docs/delivery/2026-09-13-retrieval-ablation-runbook.md)
 11. [RAG 评估完整说明：方法、指标、执行流程与当前实现](docs/rag-evaluation-guide.md)
-12. [普通 RAG：LangGraph 检索 DAG、实时运行与阶段事件](docs/rag-langgraph-retrieval.md)
+12. [Agent 检索工具：LangGraph 检索 DAG 与阶段事件](docs/rag-langgraph-retrieval.md)
+13. [统一业务 Agent 规格](docs/design/10-unified-business-agent-spec.md)
+14. [统一业务 Agent 任务与未完成验收](docs/delivery/unified-business-agent-tickets.md)
+15. [PR #14 实施现状与数据库迁移](docs/delivery/unified-business-agent-implementation-status.md)
 
 上述 PRD 按 to-spec 模板组织：问题、方案、用户故事、实现决定、测试决定、范围外事项及备注。它们综合已确认访谈，不代表已实现，也没有发布到外部 Issue Tracker。
 
