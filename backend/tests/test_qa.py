@@ -297,6 +297,19 @@ def test_qa_run_lifecycle_and_evidence(client):
     stages = [e["stage"] for e in events]
     assert "ROUTED" in stages
     assert "RETRIEVING" in stages
+    # 普通 RAG 实际经过 LangGraph 检索图，而非直接调用旧单体 Pipeline。
+    for stage in (
+        "RAG_SCOPE", "RAG_PREPARE_QUERY", "RAG_DENSE_RECALL",
+        "RAG_BM25_RECALL", "RAG_RRF_FUSION", "RAG_RERANK",
+        "RAG_PARENT_EXPANSION", "RAG_CONTEXT_BUDGET", "RAG_FINAL_HITS",
+    ):
+        assert stage in stages
+    stages_with_payload = {event["stage"]: event["payload"] for event in events}
+    assert stages_with_payload["RAG_RRF_FUSION"]["hitCount"] >= len(run_data["evidence"])
+    assert stages_with_payload["RAG_FINAL_HITS"]["hitCount"] == len(run_data["evidence"])
+    # 在线 RAG 继续无 QA_RUN job，避免用户提问等待 worker claim。
+    with app_db.get_db_connection() as conn:
+        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
 
 
 @pytest.mark.parametrize("mode,evaluation_scope,execution_mode", [
