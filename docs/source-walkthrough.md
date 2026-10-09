@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-10-08，`main` 分支，代码提交 `bc3d643`。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-09，`main` 分支，PR #11 合并提交 `65ce345`。本文用于解释当前实现；代码片段为源码节选，省略了无关分支或中间语句，不能当作完整可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -14,10 +14,10 @@
 
 | 组件 | 在本项目中的工作 | 源码入口 |
 | --- | --- | --- |
-| Vue 前端 | 上传、提问、轮询结果、查看引用 | [Chat.vue](../frontend/src/Chat.vue)、[Documents.vue](../frontend/src/Documents.vue) |
+| Vue 前端 | 上传、提问、SSE 阶段进度与轮询兜底、查看引用 | [Chat.vue](../frontend/src/Chat.vue)、[Documents.vue](../frontend/src/Documents.vue) |
 | FastAPI | HTTP 路由、认证依赖、CSRF、错误响应 | [main.py](../backend/app/main.py) |
 | MySQL | 用户权限、文档版本、生效构建、任务和运行记录 | [models.py](../backend/app/models.py)、[db.py](../backend/app/db.py) |
-| Worker | 从数据库领取并执行耗时任务 | [worker.py](../backend/app/runtime/worker.py) |
+| Worker | 从 MySQL 领取 INGEST/PURGE/EVALUATE/Agent/评估 RAG 等持久任务；在线普通 RAG 不经 Worker | [worker.py](../backend/app/runtime/worker.py) |
 | Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
 | LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
@@ -50,15 +50,18 @@ flowchart TD
     C --> D[切块：PARENT / CHILD / chunk_span]
     D --> E[CHILD 写入 Milvus]
     E --> F[MySQL 发布 active_build_id]
-    Q[用户问题] --> R[创建 qa_run 和 QA_RUN job]
-    R --> S[Worker 执行普通 RAG 或 Agent]
+    Q[用户问题] --> R[持久化 qa_run]
+    R --> ROUTE{执行类型}
+    ROUTE -->|在线普通 RAG| DIRECT[HTTP 202 后 BackgroundTasks 立即执行]
+    ROUTE -->|Agent 或评估 RAG| DURABLE[同事务 QA_RUN job → Durable Worker]
     F --> T[MySQL 筛选可读生效 build]
-    S --> T
+    DIRECT --> T
+    DURABLE --> T
     T --> U[Milvus 检索、可选重排和父块扩展]
     U --> V[证据 E1、E2 等]
     V --> W[模型输出 claims 和引用范围]
     W --> X[校验并渲染 answer]
-    X --> Y[保存结果，前端轮询读取]
+    X --> Y[保存结果；前端 SSE 看阶段、终态 GET 获取答案]
     Y --> Z[评估执行器对照标准事实评分]
 ```
 
@@ -97,7 +100,7 @@ app.include_router(eval_router, prefix="/api/v1")
 
 `lifespan()` 检查数据库，初始化种子数据并处理未完成任务恢复；非测试环境且启用内嵌 Worker 时，启动三组工作线程：
 
-- `qa` 领取 `QA_RUN`。
+- `qa` 领取 Agent 和评估 RAG 的 `QA_RUN`，不领取在线普通 RAG。
 - `ingest` 领取 `INGEST / PURGE`。
 - `eval` 领取 `EVALUATE`。
 
@@ -122,7 +125,7 @@ class Actor:
 
 ### 3.3 为什么请求返回了，任务还没完成
 
-本项目采用“接收请求 → 写任务 → Worker 执行”的结构。HTTP 202 表示接收，并不表示文件已入库或答案已生成。
+不同任务采用不同执行通道：文档入库、评估主任务、Agent 和评估 RAG 写入 MySQL Job，由 Worker 执行；**在线普通 RAG 只写入 `qa_run`，HTTP 202 响应发送后由 FastAPI `BackgroundTasks` 立即启动**，不排队等待 Job Worker。HTTP 202 只表示请求已接收，均不意味着答案生成完成。
 
 在 [worker.py](../backend/app/runtime/worker.py) 按下面顺序读：
 
@@ -313,7 +316,7 @@ text           = 后续用于上下文的文本
 
 ### 6.1 前端提交与后端接收
 
-从 [Chat.vue](../frontend/src/Chat.vue) 的 `submit()` 和 `poll()` 开始：提交后保存 run ID，再反复 GET `/runs/{id}`。当前页面使用轮询；后端提供 SSE events 接口，不意味着页面已在使用 SSE 或逐 token 输出。
+从 [Chat.vue](../frontend/src/Chat.vue) 的 `submit()` 和 `watchRun()` 开始：前端拿到 run ID 后，使用 `EventSource` 订阅 GET `/runs/{id}/events`，收到阶段事件更新进度；`done` 后调用 GET `/runs/{id}` 获取最终答案，SSE 不可用或出错时退回 `poll()`。**这只是阶段 SSE，不是模型逐 Token 流式生成**；完整的结构化 JSON 必须先经引用和可选 strict Judge 校验。
 
 ```text
 Chat.vue::submit()
@@ -321,15 +324,21 @@ Chat.vue::submit()
   → qa/router.py::submit_run()
   → QaService.submit_run()
       → 输入检查、会话归属、上下文分段、幂等与并发检查
-      → 写 qa_run(QUEUED) 和 job(QA_RUN)
-  → Worker._run_qa()
-  → QaService.execute_queued_run()
+      → 写 qa_run(QUEUED)，在线 RAG 不写 job
+      → 返回 HTTP 202 / runId / executionMode=REALTIME
+  → FastAPI BackgroundTasks(QaService.execute_queued_run)
   → QaService._execute_run()
+      → 写 run_event 阶段事件，最终保存已验证答案
+  → 前端 EventSource /runs/{id}/events → done 后 GET /runs/{id}
+
+Agent / 评估 RAG：submit_run 同事务写 qa_run + job(QA_RUN)
+  → DurableJobWorker._run_qa()
+  → QaService.execute_queued_run(job_id, lease_epoch) → _execute_run()
 ```
 
 主要文件：[qa/router.py](../backend/app/qa/router.py)、[qa/service.py](../backend/app/qa/service.py)。在长文件中先按函数名搜索，不要从所有会话管理接口开始逐行阅读。
 
-`conversation` 表示会话，`context_segment` 表示该会话的一段范围上下文，`qa_run` 表示一次问题执行，`job` 表示驱动它的后台任务。这几个对象有联系但不是同一条记录。
+`conversation` 表示会话，`context_segment` 是会话范围上下文，`qa_run` 始终记录一次问题执行；**只有 Agent、评估 RAG 会同时拥有驱动执行的 `QA_RUN` Job**。在线普通 RAG 的 `qa_run` 没有对应 Job。两种通道复用同一问答核心和最终验证。
 
 ### 6.2 `_execute_run()` 的九步主线
 
@@ -543,7 +552,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 
 **权限不是只在入口检查一次。** 入口认身份，检索前限制 build，外发前检查候选，读取历史时检查来源。这些调用散落在多个文件，但沿同一份证据追踪就能理解各自目的。
 
-**任务重试不等于任意重放。** 入库重试会清理未发布 build 的部分产物并重建；QA 通过 `qa_execution_scope()` 和 `qa_lease_is_current()` 限制执行权；Agent 可以通过 checkpoint 恢复。租约过期时旧执行者不能继续发布，但这些机制也不意味着模型外部调用已获得全局 exactly-once 保证。
+**任务重试不等于任意重放。** 入库重试会清理未发布 build 的部分产物并重建；有 Durable Job 的 QA（Agent、评估 RAG）通过 `qa_execution_scope()` 和 `qa_lease_is_current()` 进行 lease fencing，Agent 还能通过 checkpoint 恢复；在线 RAG 没有 Job Lease，进程中断后启动恢复将遗留 run 标为 `FAILED / PROCESS_RESTARTED`，不自动重放。租约过期时旧执行者不能继续发布，但这些机制也不意味着模型外部调用已获得全局 exactly-once 保证。
 
 **业务终态与工程成功分开看。** 无证据是业务结果，网关不可用是执行故障，格式正确是结构检查通过，答案正确则需要语义或人工评价。
 
@@ -554,7 +563,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 | 上传返回了但搜不到 | job 状态 → source_unit/chunk → build READY → active_build_id → ACL → 索引 |
 | 检索命中但答非所问 | hit.text → evidence → 模型 messages → claims → 金标准事实 |
 | 子块命中，引用却显示一大段 | `_expand_parents()`、matchedText、parentChunkId |
-| 调用没有继续执行 | Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
+| 在线普通 RAG 没有继续执行 | `qa_run.status/stage` → API BackgroundTasks → `run_event` → `PROCESS_RESTARTED` / cancel / 模型服务；不必检查 QA_RUN Job |\n| Agent / 评估 RAG 没有继续执行 | `QA_RUN` Job → Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
 | 数据库是 SUCCEEDED，接口是 PARTIAL | `result_json.status` 与 `get_run()` 的合并 |
 | 以前能读的答案现在隐藏 | `get_run()` → `_all_sources()` → `can_read_document()` |
 | 评估成功率很高但大量题没审核 | judgedCases、judgmentCoverage、最新人工标签 |
@@ -610,7 +619,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 尝试不看文档回答这些问题，然后回到对应函数验证：
 
-1. 为什么上传成功还要等待 job？为什么要同时有 version 和 build？
+1. 为什么上传成功还要等待 job，但在线普通 RAG 不进入 job？为什么要同时有 version 和 build？
 2. 为什么只索引 CHILD，模型却可能看到 PARENT？
 3. 文档撤权后，Milvus 里还有向量为什么也不应该被使用？
 4. E1 是在哪里产生的？怎样追到 source_unit？
