@@ -91,8 +91,16 @@ flowchart TD
     A["用户提问<br/>POST /conversations/{id}/runs"] --> B["输入安全校验"]
     B --> C["校验会话归属 / 幂等键 / 单会话并发"]
     C --> D["MySQL 写入 qa_run<br/>QUEUED"]
-    D --> E["Agent / 评估 RAG：Durable QA_RUN Worker<br/>在线普通 RAG：API 后台立即执行"]
-    E --> F{"问题路由"}
+    D --> EXEC{"执行通道"}
+    EXEC -->|在线普通 RAG| HTTP["HTTP 202 + runId<br/>executionMode=REALTIME"]
+    HTTP --> EVENTS["前端立即订阅 SSE<br/>GET /runs/{run_id}/events"]
+    HTTP --> BG["FastAPI BackgroundTasks<br/>响应发送后立即执行"]
+    JOB --> DURABLE_HTTP["HTTP 202 + runId<br/>executionMode=DURABLE"]
+    DURABLE_HTTP --> EVENTS
+    EXEC -->|Agent / 评估 RAG| JOB["同事务写入 QA_RUN Job<br/>executionMode=DURABLE"]
+    JOB --> WORKER["Durable Worker<br/>Lease / Retry / Recovery"]
+    BG --> F{"问题路由"}
+    WORKER --> F
 
     F -->|闲聊| G["固定回答<br/>不检索 / 不调用模型"]
     F -->|不支持请求| H["固定拒绝范围说明<br/>不检索 / 不调用模型"]
@@ -141,12 +149,18 @@ flowchart TD
     H --> Z
     NOEV --> Z
     U --> Z
-    Z --> FINAL["前端轮询 GET /runs/{run_id}<br/>展示答案 / Evidence / Trace"]
+    BG -.->|"运行期间记录 run_event"| EVENTS
+    WORKER -.->|"运行期间记录 run_event"| EVENTS
+    Z --> FINAL["写入 qa_run 终态；若有 Job 同步更新"]
+    FINAL -.->|"SSE done"| EVENTS
+    EVENTS -->|"done 后或 SSE 断线时轮询"| VIEW["GET /runs/{run_id}<br/>终态显示已校验 Answer / Evidence"]
 ```
+
+**问答执行模式**：浏览器普通 RAG 由 API 进程响应后直接启动，不创建 `QA_RUN` Job；Agent 和携带受信任 `evaluation_scope` 的评估 RAG 同事务创建 `qa_run + QA_RUN Job`，由 Worker 领取执行。两类请求均返回 HTTP 202，`qa_run` 始终记录状态和审计；现有 SSE 推送的是运行阶段，不是模型逐 Token。进程崩溃后在线普通 RAG 记为 `FAILED / PROCESS_RESTARTED`，持久化模式按 Job/Checkpoint 策略恢复。详见 [源码导读第 6 节](docs/source-walkthrough.md#6-普通-rag证据如何变成用户看到的答案)。
 
 当前普通 RAG 与 Agent 的 `search_knowledge` 已统一走同一条 `RetrievalPipeline`：**ACL Scope → 可选 Rewrite / Multi-Query / HyDE → Dense + Sparse BM25 → 应用层 RRF → 可选 Reranker / MMR → 可选 Parent Expansion → 上下文预算与 Final Top-K → 外发前 ACL/Active Build 二次复核**。参数由不可变版本的 Retrieval Config 决定，`qa_run.config_id` 保存本次运行所用配置版本，便于消融实验、回放和回滚。Agent 仍使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断。两种问答模式的结构化结果都交给 `_verify_answer()`；strict 且有 claims 时调用 `judge-main`，要求判定完整覆盖每个 Claim 且全部为 SUPPORTED，否则失败关闭。
 
-## 企业化增强（当前分支）
+## 企业化增强（当前 main 实现）
 
 - **统一权限真源**：Search API、普通 RAG、Agent 检索统一使用 `get_readable_build_records()`，同时覆盖租户、用户状态、KB ACL、文档 ACL、用户组和 active build。
 - **TOCTOU 防护**：检索后、模型外发前再次核对当前权限与 `active_build_id`；权限撤销或版本切换时返回 `SOURCE_CHANGED`，不把失效来源发送给模型。
