@@ -83,7 +83,7 @@ GET /auth/csrf 获取签名双提交 CSRF token：登录前绑定短期 nonce Co
 }
 ```
 
-响应 HTTP 202：{runId,status:"QUEUED",pollAfterMs:1000}。轮询 GET /runs/{id}，运行时只返回 status/stage/counts/degradations，不返回正在生成的正文。初始不用 SSE，1 秒轮询并在页面后台退到 5 秒；终态停止轮询。
+**当前 Python 实现（PR #11，2026-10-09）覆盖本段旧方案：**在线普通 RAG 只写 `qa_run`，返回 HTTP 202（含 `runId`、`status=QUEUED`、`executionMode=REALTIME`），再由 FastAPI BackgroundTasks 立即执行，无 `QA_RUN` Job。Agent 和内部评估 RAG 同事务创建 `qa_run` 与 `QA_RUN` Job（`executionMode=DURABLE`），由 Worker 执行。前端通过 GET `/runs/{id}/events` 订阅 SSE 阶段事件，结束时 GET `/runs/{id}` 获取最终结果，断线时退回轮询。模型仍输出完整结构化 JSON，不是逐 Token 生成；未经验证的正文不展示。
 
 完成结果字段：runId/status/terminalReason/answer/claims/evidence/warnings/verification/usageSummary。answer 由已校验 claims 渲染。evidence 每项含 evidenceId/documentId/versionId/sourceType/location/machineGenerated/isCurrent，但只对仍具备阅读权限的调用者输出。内容撤权后的历史读返回 visibility=HIDDEN 和固定原因提示，不输出旧 answer 或来源标题。
 
@@ -106,7 +106,7 @@ GET 任务资源 HTTP 200 只表示成功读取状态，不能据此把 status=F
 | 429 | RATE_LIMITED、BUDGET_RESERVATION_DENIED | 显示限额及可安全公开的重试时间 |
 | 503 | AUTHORITY_UNAVAILABLE、DEPENDENCY_UNAVAILABLE | 不自动放宽权限；按有限策略重试 |
 
-后台任务业务失败保存在任务 errorCode，不能把已返回的 202 改造成事后 HTTP 错误。请求超时不等于任务取消；用户可凭幂等 key 找回运行再取消。
+在线普通 RAG 的执行错误记录在 `qa_run.terminal_reason`，不存在对应 `QA_RUN` Job；Agent 和评估 RAG 还会更新持久化 Job 的错误状态。已返回 HTTP 202 后，业务失败不能改写原 HTTP 状态码。请求超时不等于任务取消；用户可凭幂等 key 找回运行再取消。
 
 ## 5. 会话、终态及清除
 
