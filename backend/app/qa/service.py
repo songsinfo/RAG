@@ -878,13 +878,17 @@ class QaService:
 
             # 读取历史后、发起新检索前再确认 inherited sources 仍可读。
             assert_run_sources_readable(actor, run_id)
-            retrieval = RetrievalPipeline.retrieve(
+            # 普通 RAG 使用独立 LangGraph 检索 DAG；Agent/search API 保留原 Pipeline。
+            # 不使用 Checkpointer，不改变 REALTIME BackgroundTasks 的执行方式。
+            from app.retrieval.rag_graph import RagRetrievalGraph
+            retrieval = RagRetrievalGraph.retrieve(
                 actor=actor,
                 query=question,
                 kb_ids=allowed_kb_ids or None,
                 config_id=config_id,
                 run_id=run_id,
                 history=history,
+                record_event_fn=QaService._record_event,
             )
             hits = retrieval["hits"]
             QaService._record_event(
