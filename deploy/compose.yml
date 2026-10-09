@@ -23,7 +23,7 @@ services:
       DOCLING_SERVE_ENABLE_UI: "false"
       DOCLING_SERVE_API_KEY: ${DOCLING_API_KEY:?Set DOCLING_API_KEY}
       DOCLING_SERVE_MAX_FILE_SIZE: "26214400"
-      DOCLING_SERVE_MAX_NUM_PAGES: "200"
+      DOCLING_SERVE_MAX_NUM_PAGES: "400"
     ports:
       - "127.0.0.1:${DOCLING_PORT:-5001}:5001"
     mem_limit: 4g
@@ -48,7 +48,7 @@ services:
       LITELLM_CHAT_TARGET: "openai/${CHAT_MODEL:-deepseek-v4-flash-0731}"
       LITELLM_EMBEDDING_TARGET: "openai/${EMBEDDING_MODEL:-qwen3.7-text-embedding-flash}"
       LITELLM_JUDGE_TARGET: "openai/${JUDGE_MODEL:-kimi-k3}"
-      LITELLM_RERANK_TARGET: "openai/${RERANK_MODEL:-rerank-default}"
+      LITELLM_RERANK_TARGET: "dashscope/${RERANK_MODEL:-rerank-default}"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-internal-master-key}
       LITELLM_PORT: ${LITELLM_PORT:-4000}
     volumes:

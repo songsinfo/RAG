@@ -50,7 +50,8 @@ def get_chat_model(
     if not base_url:
         return None
     api_key = os.getenv("LITELLM_MASTER_KEY", "sk-litellm-internal-master-key")
-    timeout_seconds = max(1.0, min(30.0, float(timeout_seconds)))
+    # ANSWER calls may use up to 60 seconds; other purposes are bounded by their caller.
+    timeout_seconds = max(1.0, min(60.0, float(timeout_seconds)))
     return _build_chat_model(base_url, api_key, model_alias, max_tokens, timeout_seconds)
 
 

@@ -27,3 +27,35 @@ test('an HTML error page with HTTP 200 cannot masquerade as successful JSON', as
   globalThis.fetch = async () => new Response('<html>proxy page</html>')
   await assert.rejects(client.api('/me'), error => error.code === 'INVALID_RESPONSE')
 })
+
+test('a rejected CSRF token is refreshed and the question is retried with the same idempotency key', async () => {
+  globalThis.fetch = async () => Response.json({ csrfToken: 'stale-token' })
+  await client.refreshCsrf()
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options: { ...options, headers: { ...options.headers } } })
+    if (url.endsWith('/csrf')) return Response.json({ csrfToken: 'fresh-token' })
+    if (calls.length === 1) return Response.json({ code: 'CSRF_INVALID', message: '请刷新安全凭据后重试' }, { status: 403 })
+    return Response.json({ runId: 'run-retried', status: 'QUEUED' })
+  }
+  const result = await client.api('/conversations/one/runs', 'POST', { question: '旅行预算是多少？' })
+  assert.equal(result.runId, 'run-retried')
+  assert.equal(calls.length, 3)
+  assert.equal(calls[1].url, '/api/v1/auth/csrf')
+  assert.equal(calls[0].options.headers['X-CSRF-Token'], 'stale-token')
+  assert.equal(calls[2].options.headers['X-CSRF-Token'], 'fresh-token')
+  assert.equal(calls[0].options.headers['Idempotency-Key'], calls[2].options.headers['Idempotency-Key'])
+  assert.equal(calls[0].options.body, calls[2].options.body)
+})
+
+test('CSRF recovery retries only once and preserves a second rejection', async () => {
+  let writes = 0, refreshes = 0
+  globalThis.fetch = async url => {
+    if (url.endsWith('/csrf')) { refreshes++; return Response.json({ csrfToken: 'fresh-token' }) }
+    writes++
+    return Response.json({ code: 'CSRF_INVALID', message: '仍然无效' }, { status: 403 })
+  }
+  await assert.rejects(client.api('/conversations/one/runs', 'POST', { question: 'test' }), error => error.status === 403 && error.code === 'CSRF_INVALID')
+  assert.equal(writes, 2)
+  assert.equal(refreshes, 1)
+})

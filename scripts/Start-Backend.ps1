@@ -8,6 +8,7 @@ if(-not(Test-Path -LiteralPath $envFile)){throw 'Initialize the selected isolate
 $env:PORT=$Port.ToString()
 $env:RAG_ARTIFACT_ROOT=Join-Path $ragRoot ".runtime/$Environment/artifacts"
 $env:RAG_IMPORT_ROOT=Join-Path $ragRoot ".runtime/$Environment/import"
+$env:RAG_LOG_FILE=Join-Path $ragRoot ".runtime/$Environment/logs/backend.log"
 $backendDir=Join-Path $ragRoot 'backend'
 $env:PYTHONPATH=$backendDir
 $venvPython=Join-Path $backendDir '.venv/Scripts/python.exe'

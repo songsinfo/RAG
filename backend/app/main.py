@@ -1,5 +1,8 @@
 from contextlib import asynccontextmanager
+import logging
 import threading
+import time
+import uuid
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, Depends, Response
 from fastapi.responses import JSONResponse
@@ -11,10 +14,14 @@ from app.db import get_db_connection
 from app.errors import ApiException, api_exception_handler
 from app.identity.deps import Actor, get_current_actor
 from app.models import tenant_table, app_user_table, user_group_table, group_member_table
+from app.logging_config import configure_logging, log_context
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
     from app.telemetry import configure_telemetry
     configure_telemetry()
 
@@ -120,6 +127,32 @@ async def csrf_middleware(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.scope["request_id"] = request_id
+    started = time.perf_counter()
+    with log_context(request_id=request_id):
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception("request_failed", extra={"fields": {
+                "method": request.method,
+                "route": getattr(request.scope.get("route"), "path", "<unmatched>"),
+                "status": 500, "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            }})
+            raise
+        response.headers["X-Request-ID"] = request_id
+        logger.log(logging.WARNING if response.status_code >= 400 else logging.INFO,
+                   "request_finished", extra={"fields": {
+                       "method": request.method,
+                       "route": getattr(request.scope.get("route"), "path", "<unmatched>"),
+                       "status": response.status_code,
+                       "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                   }})
+        return response
+
+
 from app.identity.router import router as auth_router
 from app.identity.admin_router import router as identity_admin_router
 from app.knowledge.router import router as knowledge_router
@@ -143,11 +176,10 @@ app.include_router(budget_router, prefix="/api/v1")
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    import logging
-    logging.getLogger("uvicorn.error").error(f"Unhandled exception: {exc.__class__.__name__}")
     return JSONResponse(
         status_code=500,
         content={"code": "INTERNAL_ERROR", "message": "服务器内部错误，请稍后重试"},
+        headers={"X-Request-ID": request.scope.get("request_id", "")},
     )
 
 

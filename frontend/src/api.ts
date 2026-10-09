@@ -16,14 +16,24 @@ export async function refreshCsrf() {
 export async function api(path: string, method = 'GET', body?: unknown): Promise<any> {
   const headers: Record<string, string> = {}
   // 所有非只读请求统一附带 CSRF + Idempotency-Key。
-  // 幂等键由每次用户操作生成；真正的“同一次重试”应复用上层传入的业务语义，而不是重复点击。
+  // 每次用户操作生成幂等键；安全令牌刷新后的重试复用同一幂等键。
   if (!['GET', 'HEAD'].includes(method)) {
     if (!csrf) await refreshCsrf()
     headers[csrfHeader] = csrf
     headers['Idempotency-Key'] = crypto.randomUUID()
   }
   if (body !== undefined && !(body instanceof FormData)) headers['Content-Type'] = 'application/json'
-  const response = await fetch('/api/v1' + path, { method, credentials: 'include', cache: 'no-store', headers, body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body) })
+  const options: RequestInit = { method, credentials: 'include', cache: 'no-store', headers, body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body) }
+  let response = await fetch('/api/v1' + path, options)
+  // CSRF 校验在业务执行前拒绝请求，刷新后仅重试一次，避免令牌过期阻断问答。
+  if (response.status === 403 && !['GET', 'HEAD'].includes(method)) {
+    const rejection = await response.clone().json().catch(() => null)
+    if (rejection?.code === 'CSRF_INVALID') {
+      await refreshCsrf()
+      headers[csrfHeader] = csrf
+      response = await fetch('/api/v1' + path, options)
+    }
+  }
   const text = await response.text()
   let data: any
   try { data = text ? JSON.parse(text) : {} } catch { throw new ApiError(response.status, 'INVALID_RESPONSE', '后端返回了无法解析的响应') }

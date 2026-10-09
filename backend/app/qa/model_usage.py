@@ -1,10 +1,14 @@
 """Account for every provider attempt using the shared budget service."""
 import json
+import logging
+import time
 import uuid
 
 from app.errors import ApiException
 from app.model_budget import BudgetService
 from app.qa.runtime import AgentRuntimePolicy, get_run_usage
+
+logger = logging.getLogger(__name__)
 
 
 def token_ceiling(payload):
@@ -26,6 +30,11 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
     BudgetService.reserve(tenant_id, call_id, alias, input_limit, output_limit,
                           run_id=run_id, job_id=job_id)
     sent = False
+    started = time.perf_counter()
+    fields = {"tenant_id": tenant_id, "run_id": run_id, "job_id": job_id,
+              "call_id": call_id, "purpose": purpose, "model_alias": alias}
+    # Never include payloads: they contain questions, retrieved documents and prompts.
+    logger.info("model_call_started", extra={"fields": {k: v for k, v in fields.items() if v is not None}})
     try:
         ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
         ModelGateway.assert_job_current(tenant_id, job_id)
@@ -41,9 +50,22 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
             usage["input_tokens"] if reported else input_limit,
             usage["output_tokens"] if reported else output_limit, alias, job_id=job_id,
         )
+        logger.info("model_call_finished", extra={"fields": {
+            **{k: v for k, v in fields.items() if v is not None},
+            "status": "SUCCESS" if reported else "UNKNOWN",
+            "input_tokens": usage["input_tokens"] if reported else input_limit,
+            "output_tokens": usage["output_tokens"] if reported else output_limit,
+            "usage_reported": reported, "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }})
         return result
-    except Exception:
+    except Exception as exc:
         ModelGateway._record_call(tenant_id, call_id, run_id, purpose,
             "FAILED" if sent else "NOT_SENT", input_limit if sent else 0,
             output_limit if sent else 0, alias, job_id=job_id)
+        logger.exception("model_call_failed", extra={"fields": {
+            **{k: v for k, v in fields.items() if v is not None},
+            "status": "FAILED" if sent else "NOT_SENT",
+            "error_code": exc.code if isinstance(exc, ApiException) else type(exc).__name__,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }})
         raise

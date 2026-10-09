@@ -4,6 +4,8 @@ model_list:
       model: os.environ/LITELLM_CHAT_TARGET
       api_base: os.environ/MODEL_BASE_URL
       api_key: os.environ/MODEL_API_KEY
+      extra_body:
+        enable_thinking: false
   - model_name: embedding-main
     litellm_params:
       model: os.environ/LITELLM_EMBEDDING_TARGET

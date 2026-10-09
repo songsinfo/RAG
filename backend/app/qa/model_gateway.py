@@ -37,6 +37,14 @@ from app.qa.model_usage import invoke_tracked
 
 logger = logging.getLogger(__name__)
 
+
+def _rerank_usage(response):
+    payload = response.json()
+    usage = payload.get("usage") or {}
+    tokens = (payload.get("meta") or {}).get("tokens") or {}
+    return {"input_tokens": usage.get("total_tokens", tokens.get("input_tokens")), "output_tokens": 0}
+
+
 MODEL_CONFIG_IDS = {
     "chat-main": "cfg-model-chat-main",
     "embedding-main": "cfg-model-embedding-main",
@@ -195,15 +203,18 @@ class ModelGateway:
                     else:
                         lc_messages.append(AIMessage(content=content))
 
-                timeout_seconds = 30.0
+                # 回答包含检索上下文，等待时间与 LiteLLM 的 60 秒配置对齐。
+                timeout_seconds = 60.0 if purpose == "ANSWER" else 30.0
                 # 单次请求超时不能突破 Agent 的整体 deadline；取两者更小值。
                 if deadline_epoch is not None:
-                    timeout_seconds = max(1.0, min(30.0, deadline_epoch - time.time()))
+                    timeout_seconds = max(1.0, min(timeout_seconds, deadline_epoch - time.time()))
                     if deadline_epoch <= time.time():
                         raise ApiException(408, "AGENT_TIMEOUT", "Agent 执行超过整体时间预算")
                 llm = get_chat_model(model_alias, max_tokens, timeout_seconds)
                 if llm is None:
                     raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "未配置大模型网关地址")
+                if purpose == "ANSWER":
+                    llm = llm.bind(response_format={"type": "json_object"})
 
                 policy = AgentRuntimePolicy.from_env()
 
@@ -235,6 +246,8 @@ class ModelGateway:
                     fallback = get_chat_model(fallback_alias, max_tokens, timeout_seconds)
                     if fallback is None:
                         raise
+                    if purpose == "ANSWER":
+                        fallback = fallback.bind(response_format={"type": "json_object"})
 
                     def invoke_fallback():
                         return invoke_tracked(
@@ -557,7 +570,7 @@ class ModelGateway:
                     timeout=20.0,
                 ), tenant_id=tenant_id, run_id=run_id, job_id=job_id, purpose="RERANK", alias=model_alias,
                     payload={"query": query, "documents": documents},
-                    usage_reader=lambda response: {"input_tokens": response.json().get("usage", {}).get("total_tokens"), "output_tokens": 0})
+                    usage_reader=_rerank_usage)
                 if response.status_code != 200:
                     raise ApiException(
                         503,

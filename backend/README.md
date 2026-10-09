@@ -27,7 +27,41 @@ backend/app/
 └── evaluation/           # 评测体系与消融实验指标计算
 ```
 
+## 运行日志
+
+API 与独立 Worker 使用统一的 JSON 行日志，默认级别为 `INFO`，可用 `LOG_LEVEL` 调整。
+从项目根目录通过 `scripts/Start-Backend.ps1 -Environment demo` 启动时，同时输出到终端与
+`.runtime/demo/logs/backend.log`；文件达到 10 MiB 自动轮转，最多保留 5 个备份。
+直接启动 Uvicorn 或独立 Worker 时，可设置 `RAG_LOG_FILE` 指定日志文件，否则仅输出到终端。
+多个进程应使用不同日志文件；容器部署可只输出到终端，由平台集中采集与管理保留期限。
+
+在项目根目录查看实时日志：
+
+```powershell
+Get-Content -LiteralPath .runtime/demo/logs/backend.log -Tail 50 -Wait
+```
+
+用一次问答的 `runId` 筛选日志：
+
+```powershell
+Select-String -LiteralPath .runtime/demo/logs/backend.log -SimpleMatch '替换为你的 runId'
+```
+
+请求日志包含 `request_id`、HTTP 状态与耗时，响应头 `X-Request-ID` 可用于定位提交失败。
+`run_submitted` 关联请求、`run_id` 与 `job_id`；Worker 日志记录领取、结束及重试。
+`run_stage` / `ingest_stage` 的 `duration_ms` 表示上一阶段耗时，并通过 `previous_stage` 标识；
+`job_finished` 和模型调用日志的 `duration_ms` 分别表示一次任务尝试和一次模型调用的耗时。
+模型日志包含别名、用途与 Token 用量；`usage_reported=false` 表示用量为估算值。
+日志不记录请求正文、提示词、文档正文、模型输出和 Cookie。异常保留类型与堆栈位置，
+省略可能携带 SQL 参数或模型内容的原始异常消息；环境中的密钥与密码值会被脱敏。
+现有数据库 `run_event` 与网页的受控 Trace 保持原有功能；`run_id` 是业务运行 ID，并非分布式 `traceId`。
+
 ## 本地开发与运行
+
+已有 MySQL 数据库若 `job.kind` 约束尚未允许 `QA_RUN`，需先应用
+`docs/design/migrations/20260921_add_qa_run_job_kind.sql`；新数据库使用当前 `schema.sql`。
+Embedding 批量由 `EMBEDDING_BATCH_SIZE` 控制，配置模板设为 20，以适配当前供应商上限。
+Docling 的页数限制为 400；实际处理能力仍取决于文档复杂度和容器内存。
 
 ### 1. 虚拟环境与依赖
 ```powershell
