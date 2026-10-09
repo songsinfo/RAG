@@ -17,8 +17,8 @@ flowchart LR
         AUTH[identity<br/>登录 / 租户 / ACL / CSRF]
         KB[knowledge<br/>文档 / 版本 / 生命周期 / 入库任务]
         PARSER[Docling Adapter<br/>Hybrid Chunks → Parent-Child + Provenance]
-        RET[retrieval<br/>Dense + Sparse BM25 + RRF<br/>Reranker + Parent Expansion]
-        QA[qa<br/>RAG / LangGraph Agent / Claim Validation]
+        RET[retrieval<br/>LangGraph 普通 RAG 检索图<br/>共享 Dense / BM25 / RRF / Reranker / Parent]
+        QA[qa<br/>普通 RAG / LangGraph Agent / Claim Validation]
         EVAL[evaluation<br/>题集 / 指标 / 消融实验]
         MODEL[ModelGateway<br/>LangChain OpenAI Client]
         EMB[embedding.py<br/>Embedding Client]
@@ -106,24 +106,28 @@ flowchart TD
     F -->|不支持请求| H["固定拒绝范围说明<br/>不检索 / 不调用模型"]
     F -->|企业知识问答| I{"mode"}
 
-    I -->|RAG| J["从 MySQL 读取 Segment Scope + ACL"]
-    J --> K["得到当前可读 active_build_id 列表"]
+    I -->|RAG| RG["LangGraph 普通 RAG 检索 DAG<br/>无持久化 Checkpointer"]
+    RG --> J["resolve_scope<br/>MySQL Segment Scope + ACL"]
+    J --> K["当前可读 active_build_id"]
     K --> L{"有可读 Build?"}
     L -->|否| NOEV["NO_EVIDENCE"]
-    L -->|是| M["Milvus Hybrid Search"]
+    L -->|是| M["prepare_query<br/>可选 Rewrite / Multi-Query / HyDE"]
 
-    M --> M1["Dense Recall<br/>Query Embedding / LiteLLM"]
-    M --> M2["Sparse BM25 Recall"]
-    M1 --> M3["RRF Fusion<br/>参数来自 Retrieval Config"]
+    M --> M1["dense_recall<br/>Embedding + Milvus"]
+    M --> M2["bm25_recall<br/>Milvus Sparse"]
+    M1 --> M3["rrf_fusion<br/>等待两路召回"]
     M2 --> M3
-    M3 --> M4{"Rerank Enabled?"}
-    M4 -->|是| M5["Cross-Encoder / Rerank API"]
-    M4 -->|否| M6["保持 RRF 顺序"]
-    M5 --> M7{"Parent Expansion?"}
-    M6 --> M7
-    M7 -->|是| M8["Child 命中 → Parent Context"]
-    M7 -->|否| N["Final Top-K Evidence"]
-    M8 --> N
+    M3 --> HACL["hydrate_and_acl<br/>原文回查 + 权限复核"]
+    HACL --> M4{"Rerank Enabled?"}
+    M4 -->|是| M5["rerank<br/>Cross-Encoder / Rerank API"]
+    M4 -->|否| M6["保留融合顺序"]
+    M5 --> MMR["mmr<br/>按配置可选"]
+    M6 --> MMR
+    MMR --> M7{"Parent Expansion?"}
+    M7 -->|是| M8["parent_expansion<br/>Child → Parent Context"]
+    M7 -->|否| CB["context_budget<br/>UTF-8 字节预算 + Final Top-K"]
+    M8 --> CB
+    CB --> N["finalize_hits<br/>Provenance + ACL"]
     N --> O["登记 run_source / Evidence"]
     O --> P["ModelGateway 调用 LiteLLM<br/>chat-main 生成结构化 Claims"]
     P --> Q["Claim Validation<br/>引用范围与 Evidence 绑定"]
@@ -158,7 +162,7 @@ flowchart TD
 
 **问答执行模式**：浏览器普通 RAG 由 API 进程响应后直接启动，不创建 `QA_RUN` Job；Agent 和携带受信任 `evaluation_scope` 的评估 RAG 同事务创建 `qa_run + QA_RUN Job`，由 Worker 领取执行。两类请求均返回 HTTP 202，`qa_run` 始终记录状态和审计；现有 SSE 推送的是运行阶段，不是模型逐 Token。进程崩溃后在线普通 RAG 记为 `FAILED / PROCESS_RESTARTED`，持久化模式按 Job/Checkpoint 策略恢复。详见 [源码导读第 6 节](docs/source-walkthrough.md#6-普通-rag证据如何变成用户看到的答案)。
 
-当前普通 RAG 与 Agent 的 `search_knowledge` 已统一走同一条 `RetrievalPipeline`：**ACL Scope → 可选 Rewrite / Multi-Query / HyDE → Dense + Sparse BM25 → 应用层 RRF → 可选 Reranker / MMR → 可选 Parent Expansion → 上下文预算与 Final Top-K → 外发前 ACL/Active Build 二次复核**。参数由不可变版本的 Retrieval Config 决定，`qa_run.config_id` 保存本次运行所用配置版本，便于消融实验、回放和回滚。Agent 仍使用两个只读工具：`search_knowledge` 与 `read_section`，并设置轮次、工具次数及重复调用熔断。两种问答模式的结构化结果都交给 `_verify_answer()`；strict 且有 claims 时调用 `judge-main`，要求判定完整覆盖每个 Claim 且全部为 SUPPORTED，否则失败关闭。
+**检索编排边界**：普通 RAG 问答（`mode=RAG`）的检索阶段由 [`RagRetrievalGraph`](backend/app/retrieval/rag_graph.py) 编排：**Scope → 可选 Rewrite / Multi-Query / HyDE → 并行 Dense + BM25 → 应用层 RRF → 原文回查与 ACL → 可选 Reranker / MMR → 可选 Parent Expansion → 上下文预算与 Final Top-K → Provenance / 最终 ACL**。Agent 的 `search_knowledge`、独立 `/search` 及纯检索评估仍调用 [`RetrievalPipeline.retrieve()`](backend/app/retrieval/pipeline.py)，两种入口共享 Milvus、RRF、Reranker 等底层能力。普通 RAG 的图不启用 Checkpointer，仍由 BackgroundTasks 实时执行，进程崩溃后**不能**从图节点自动恢复。参数由版本化 Retrieval Config 决定，`qa_run.config_id` 保存本次配置版本。两种问答模式的结构化结果仍由 `_verify_answer()` 共用校验；strict 且有 claims 时额外调用 `judge-main`，要求全部 Claim 得到支持。详细节点图及范围见 [普通 RAG LangGraph 检索图说明](docs/rag-langgraph-retrieval.md)。
 
 ## 企业化增强（当前 main 实现）
 
@@ -167,6 +171,7 @@ flowchart TD
 - **完整 Evidence Provenance**：Milvus Hit 返回真实 `kbId/documentId/versionId/buildId/chunkId`，并关联 `source_unit/location`；不再用 `allowed_build_ids[0]` 猜测来源。
 - **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
 - **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
+- **普通 RAG LangGraph 检索图**：Dense/BM25 并行、RRF 汇合、Reranker / MMR / Parent / 上下文预算独立节点；每阶段 `run_event` 记录候选数量与耗时，**尚未**保存完整候选排名或计算阶段级 Recall@5 / NDCG@5。Agent 依旧使用独立的 model/tools 图。
 - **统一 Docling + HybridChunker 入库**：Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一调用 Docling `/v1/chunk/hybrid/file`；Docling 负责解析与 HybridChunker 子块切分，后端通过 `adapt_docling_hybrid_chunks()` 组织 Parent-Child 结构，并保留 Heading、Page、Doc Item、Location 等 provenance。默认 Child 上限为 400 tokens、Parent 上限为 1200 tokens，均可通过构建配置或环境变量调整。
 - **在线问答分流**：在线普通 RAG 不再排队等待 MySQL Job Worker；提交后通过 FastAPI BackgroundTasks 立即执行，`qa_run` 保留状态、证据和审计，前端订阅 `/runs/{run_id}/events` SSE 进度并在断线时回退查询。模型当前仍生成完整的结构化 JSON，只有验证后的最终答案展示，尚非逐 Token 流式生成。
 - **Durable Job Worker**：INGEST/PURGE/EVALUATE/Agent 及评估 RAG 继续使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
@@ -177,7 +182,7 @@ flowchart TD
 
 ## 阅读顺序
 
-若目标是理解当前 Python 项目并阅读主要源码，先看[源码导读：从上传文件到回答与评估](docs/source-walkthrough.md)，再看[RAG 评估完整说明](docs/rag-evaluation-guide.md)。下面的 PRD 与技术设计用于理解需求和设计意图，其中部分仍描述旧 Java / Elasticsearch 方案，当前行为以源码及这两份导读的核对基线为准。
+若目标是理解当前 Python 项目并阅读主要源码，先看[源码导读：从上传文件到回答与评估](docs/source-walkthrough.md)，再看[普通 RAG LangGraph 检索图说明](docs/rag-langgraph-retrieval.md)和[RAG 评估完整说明](docs/rag-evaluation-guide.md)。下面的 PRD 与技术设计用于理解需求和设计意图，其中部分仍描述旧 Java / Elasticsearch 方案，当前行为以源码及这两份导读的核对基线为准。
 
 1. [当前范围与交付顺序](docs/00-project-assessment.md)
 2. [PRD-00 产品总览](docs/prd/PRD-00-product-overview.md)
@@ -190,6 +195,7 @@ flowchart TD
 9. [PRD-07 Agent 深入问答](docs/prd/PRD-07-agent-deep-qa.md)
 10. [B0-B3 检索消融实验运行手册](docs/delivery/2026-09-13-retrieval-ablation-runbook.md)
 11. [RAG 评估完整说明：方法、指标、执行流程与当前实现](docs/rag-evaluation-guide.md)
+12. [普通 RAG：LangGraph 检索 DAG、实时运行与阶段事件](docs/rag-langgraph-retrieval.md)
 
 上述 PRD 按 to-spec 模板组织：问题、方案、用户故事、实现决定、测试决定、范围外事项及备注。它们综合已确认访谈，不代表已实现，也没有发布到外部 Issue Tracker。
 
