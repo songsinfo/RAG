@@ -464,7 +464,7 @@ class LangGraphAgent:
         )
         # evidence 即将再次进入模型上下文，发送前重新鉴权，防止中途撤权。
         with get_db_connection() as conn:
-            assert_hits_still_readable(conn, actor, state["evidence"])
+            assert_hits_still_readable(conn, actor, [ev for ev in state["evidence"] if ev.get("sourceType") != "TOOL"])
         assert_run_sources_readable(actor, ctx.run_id)
 
         with agent_span("agent.model", {"agent.round": state["round"] + 1}):
@@ -636,6 +636,7 @@ class LangGraphAgent:
 
                                 ev_item = {
                                     "evidenceId": eid,
+                                    "sourceType": "DOCUMENT",
                                     "kbId": hit.get("kbId"),
                                     "documentId": hit.get("documentId"),
                                     "versionId": hit.get("versionId"),

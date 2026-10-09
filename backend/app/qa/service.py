@@ -1368,6 +1368,8 @@ class QaService:
                 question = str(row.question or "").strip()
                 result = row.result_json if isinstance(row.result_json, dict) else {}
                 answer = str(result.get("answer") or "").strip()
+                if result.get("mock"):
+                    answer += "（历史模拟结果，未查询真实业务系统，不能作为当前诊断。）"
                 next_chars = len(question) + len(answer)
                 # 历史预算按最近轮次优先；超过总字符预算后停止继续向前扩展。
                 if total_chars + next_chars > 4000:
@@ -1437,7 +1439,7 @@ class QaService:
                     messages.append({"role": "assistant", "content": answer[:4000]})
 
             conn.commit()
-            return list(reversed([msg for pair in [messages[i:i + 2] for i in range(0, len(messages), 2)] for msg in reversed(pair)])) if False else [msg for pair in reversed([messages[i:i + 2] for i in range(0, len(messages), 2)]) for msg in pair]
+            return [msg for pair in reversed([messages[i:i + 2] for i in range(0, len(messages), 2)]) for msg in pair]
 
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
@@ -1647,12 +1649,16 @@ class QaService:
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
 
         run_data = QaService.get_run(actor, run_id)
-        if run_data.get("visibility") == "HIDDEN":
+        if rs is None or run_data.get("visibility") == "HIDDEN":
             raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
 
         evidence_list = run_data.get("evidence", [])
         for ev in evidence_list:
             if ev.get("evidenceId") == evidence_id:
+                if rs.source_type == "TOOL":
+                    snapshot = rs.source_snapshot or {}
+                    if not ev.get("mock") or ev.get("toolName") != rs.tool_name or ev.get("queryObjects") != snapshot.get("queryObjects"):
+                        raise ApiException(409, "SOURCE_CHANGED", "模拟来源快照不一致")
                 return ev
         raise ApiException(404, "RESOURCE_NOT_FOUND", "证据不存在")
 

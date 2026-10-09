@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def token_ceiling(payload):
+    # UTF-8 bytes 上界比“每 3 字符一个 token”更保守，包含工具 schema。
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 256
 
 

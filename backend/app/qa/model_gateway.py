@@ -650,6 +650,7 @@ class ModelGateway:
         output_tokens: int,
         model_alias: str,
         job_id: Optional[str] = None,
+        usage_detail: Optional[Dict[str, Any]] = None,
     ):
         """结算并持久化一次模型调用。
 
@@ -700,7 +701,7 @@ class ModelGateway:
                         output_tokens=output_tokens,
                         provider_request_id=f"req-{call_id[:8]}",
                         pricing_snapshot=budget.get("pricing") or {},
-                        usage_detail={"model": model_alias},
+                        usage_detail={"model": model_alias, **(usage_detail or {})},
                         reservation_authority=budget.get("authority") or "NONE",
                         reservation_id=budget.get("reservationId"),
                         created_at=now,

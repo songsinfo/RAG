@@ -56,7 +56,7 @@ def execute_business_tool(
     if name not in BUSINESS_TOOL_NAMES:
         raise ApiException(400, "UNKNOWN_TOOL", "不支持此工具")
     required = next(req for tool_name, _, req in _TOOL_SPECS if tool_name == name)
-    if not isinstance(args, dict) or set(args) != set(required):
+    if not isinstance(args, dict) or set(args) != set(required) or any(not isinstance(args.get(key), str) or not args[key].strip() for key in required):
         missing = [key for key in required if not isinstance((args or {}).get(key), str)
                    or not str(args[key]).strip()] if isinstance(args, dict) else required
         message = "请补充：" + "、".join(missing) if missing else "业务工具参数不匹配"
