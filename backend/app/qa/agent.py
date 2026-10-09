@@ -515,7 +515,7 @@ class LangGraphAgent:
         actor = ctx.actor
         cls._guard_runtime(state, ctx)
         with get_db_connection() as conn:
-            assert_hits_still_readable(conn, actor, state["evidence"])
+            assert_hits_still_readable(conn, actor, [ev for ev in state["evidence"] if ev.get("sourceType") != "TOOL"])
 
         last_msg = state["messages"][-1]
         tool_calls = last_msg.get("tool_calls", [])
