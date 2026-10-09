@@ -111,7 +111,10 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
     if rendered_claims:
         answer_text = "\n\n".join(rendered_claims)
     elif status == "NEED_CLARIFICATION":
-        answer_text = "请补充具体对象、条件或问题。"
+        gaps = a.get("gaps", [])
+        if not isinstance(gaps, list) or not all(isinstance(g, str) and 0 < len(g) <= 300 for g in gaps):
+            raise ApiException(422, "INVALID_MODEL_EVIDENCE", "追问 gaps 格式无效")
+        answer_text = "；".join(gaps) if gaps else "请补充具体对象、条件或问题。"
     else:
         answer_text = "当前可访问资料不足以回答。"
 
@@ -119,6 +122,7 @@ def validate_claims(a: Dict[str, Any], evidence_map: Dict[str, str]) -> Dict[str
         "status": status,
         "claims": claims,
         "conflicts": conflicts,
+        "gaps": a.get("gaps", []),
         "answer": answer_text,
     }
     if status == "PARTIAL":
