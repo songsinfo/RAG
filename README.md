@@ -4,7 +4,7 @@ Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（�
 
 ## 系统架构与核心流程
 
-> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一通过 Docling Serve 的 `/v1/chunk/hybrid/file` 完成文档解析与 HybridChunker 语义切块，后端再将 Docling Hybrid Chunks 适配为 Parent-Child 结构并保留标题、页码、来源位置等 provenance 信息。后台 INGEST/PURGE 使用 MySQL 持久化 Job + Lease Worker，可在单机内嵌运行，也可独立启动 Worker。
+> 以下图基于当前 Python 实现整理。当前后端采用 FastAPI + MySQL + Milvus + LiteLLM；Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一通过 Docling Serve 的 `/v1/chunk/hybrid/file` 完成文档解析与 HybridChunker 语义切块，后端再将 Docling Hybrid Chunks 适配为 Parent-Child 结构并保留标题、页码、来源位置等 provenance 信息。后台 INGEST/PURGE/Agent/EVALUATE 使用 MySQL 持久化 Job + Lease Worker；普通 RAG 只创建 qa_run，HTTP 202 响应后立即在 API 后台执行，不进入 Job 队列。进度通过 SSE 事件通道推送，最终答案在验证完成后展示。
 
 ### 系统架构图
 
@@ -91,7 +91,7 @@ flowchart TD
     A["用户提问<br/>POST /conversations/{id}/runs"] --> B["输入安全校验"]
     B --> C["校验会话归属 / 幂等键 / 单会话并发"]
     C --> D["MySQL 写入 qa_run<br/>QUEUED"]
-    D --> E["后台执行<br/>RUNNING"]
+    D --> E["Agent：Durable QA_RUN Worker<br/>普通 RAG：API 后台立即执行"]
     E --> F{"问题路由"}
 
     F -->|闲聊| G["固定回答<br/>不检索 / 不调用模型"]
@@ -154,7 +154,7 @@ flowchart TD
 - **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
 - **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
 - **统一 Docling + HybridChunker 入库**：Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一调用 Docling `/v1/chunk/hybrid/file`；Docling 负责解析与 HybridChunker 子块切分，后端通过 `adapt_docling_hybrid_chunks()` 组织 Parent-Child 结构，并保留 Heading、Page、Doc Item、Location 等 provenance。默认 Child 上限为 400 tokens、Parent 上限为 1200 tokens，均可通过构建配置或环境变量调整。
-- **Durable Job Worker**：INGEST/PURGE 从进程内 ThreadPool 升级为 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
+- **在线问答分流**：普通 RAG 不再排队等待 MySQL Job Worker；提交后通过 FastAPI BackgroundTasks 立即执行，`qa_run` 保留状态、证据和审计，前端订阅 `/runs/{run_id}/events` SSE 进度并在断线时回退查询。模型当前仍生成完整的结构化 JSON，只有验证后的最终答案展示，尚非逐 Token 流式生成。\n- **Durable Job Worker**：INGEST/PURGE/EVALUATE/Agent 继续使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
 - **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
 - **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文裁剪使用 LangChain `trim_messages` / `count_tokens_approximately`，不再维护平行的自研 checkpoint/resume 协议。
 - **职责边界**：LangGraph/LangChain 负责图状态、HITL 恢复与消息裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
