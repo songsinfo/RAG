@@ -11,6 +11,7 @@ from app.models import (
     chunk_table,
     kb_grant_table,
     qa_run_table,
+    job_table,
 )
 import app.db as app_db
 from app.qa.content_guard import validate_input, validate_output
@@ -249,6 +250,10 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
     assert run_resp.json()["status"] == "QUEUED"
+    assert run_resp.json()["executionMode"] == "REALTIME"
+    # 普通问答只建 qa_run，不创建 QA_RUN durable job，不需要等待 Worker 抢占。
+    with app_db.get_db_connection() as conn:
+        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
 
     # 第 3 步：重复提交相同幂等键，验证不会创建第二个 run。
     dup_resp = client.post(
@@ -258,6 +263,8 @@ def test_qa_run_lifecycle_and_evidence(client):
     )
     assert dup_resp.status_code == 202
     assert dup_resp.json()["runId"] == run_id
+    assert dup_resp.json()["reused"] is True
+    assert dup_resp.json()["executionMode"] == "REALTIME"
 
     # 第 4 步：轮询直到 run 结束，确认最终 answer/evidence 已落库。
     run_data = None
