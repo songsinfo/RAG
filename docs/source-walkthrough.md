@@ -563,7 +563,8 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 | 上传返回了但搜不到 | job 状态 → source_unit/chunk → build READY → active_build_id → ACL → 索引 |
 | 检索命中但答非所问 | hit.text → evidence → 模型 messages → claims → 金标准事实 |
 | 子块命中，引用却显示一大段 | `_expand_parents()`、matchedText、parentChunkId |
-| 在线普通 RAG 没有继续执行 | `qa_run.status/stage` → API BackgroundTasks → `run_event` → `PROCESS_RESTARTED` / cancel / 模型服务；不必检查 QA_RUN Job |\n| Agent / 评估 RAG 没有继续执行 | `QA_RUN` Job → Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
+| 在线普通 RAG 没有继续执行 | `qa_run.status/stage` → API BackgroundTasks → `run_event` → `PROCESS_RESTARTED` / cancel / 模型服务；不必检查 QA_RUN Job |
+| Agent / 评估 RAG 没有继续执行 | `QA_RUN` Job → Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
 | 数据库是 SUCCEEDED，接口是 PARTIAL | `result_json.status` 与 `get_run()` 的合并 |
 | 以前能读的答案现在隐藏 | `get_run()` → `_all_sources()` → `can_read_document()` |
 | 评估成功率很高但大量题没审核 | judgedCases、judgmentCoverage、最新人工标签 |
