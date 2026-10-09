@@ -20,6 +20,7 @@ from app.qa.claim_validator import validate_claims
 from app.qa.service import QaService
 from app.retrieval.milvus_service import MilvusHybridService
 from app.errors import ApiException
+from app.identity.deps import Actor
 
 
 def get_auth_context(client: TestClient, login_name: str = "admin", password: str = "admin123"):
@@ -296,6 +297,40 @@ def test_qa_run_lifecycle_and_evidence(client):
     stages = [e["stage"] for e in events]
     assert "ROUTED" in stages
     assert "RETRIEVING" in stages
+
+
+@pytest.mark.parametrize("mode,evaluation_scope,execution_mode", [
+    ("RAG", None, "REALTIME"),
+    ("RAG", {"snapshotId": "review-snapshot"}, "DURABLE"),
+    ("AGENT", None, "DURABLE"),
+])
+def test_qa_production_execution_mode_and_idempotency(monkeypatch, mode, evaluation_scope, execution_mode):
+    import app.qa.service as qa_service
+
+    # 禁用测试环境的同步执行，检查真实生产分支的调度与幂等行为。
+    monkeypatch.setattr(qa_service, "is_test_env", lambda: False)
+    actor = Actor("tenant-demo-1", "user-admin-1", True)
+    conv = QaService.create_conversation(actor, {"title": "Execution mode"})
+    body = {"question": "你好", "segmentId": conv["currentSegmentId"], "mode": mode}
+    submitted = QaService.submit_run(
+        actor, conv["conversationId"], body, "execution-mode", evaluation_scope=evaluation_scope,
+    )
+    reused = QaService.submit_run(
+        actor, conv["conversationId"], body, "execution-mode", evaluation_scope=evaluation_scope,
+    )
+    assert submitted["executionMode"] == reused["executionMode"] == execution_mode
+    assert submitted["reused"] is False
+    assert reused["reused"] is True
+    assert submitted["runId"] == reused["runId"]
+    with app_db.get_db_connection() as conn:
+        jobs = conn.execute(job_table.select().where(job_table.c.target_id == submitted["runId"])).all()
+        run = conn.execute(qa_run_table.select().where(qa_run_table.c.id == submitted["runId"])).first()
+    assert run.status == "QUEUED"
+    assert run.started_at is None
+    assert len(jobs) == (1 if execution_mode == "DURABLE" else 0)
+    if jobs:
+        assert jobs[0].kind == "QA_RUN"
+        assert jobs[0].status == "QUEUED"
 
 
 def test_qa_no_evidence_handling(client):
