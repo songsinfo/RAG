@@ -535,6 +535,7 @@ class QaService:
                         "status": str(existing.status),
                         "pollAfterMs": 1000,
                         "reused": True,
+                        "executionMode": "REALTIME" if existing.mode == "RAG" else "DURABLE",
                     }
 
             # 4. 同一用户只允许一个活动中的在线 run，避免会话 turn 顺序和预算并发失控。
