@@ -529,6 +529,17 @@ class ModelGateway:
                 ],
             }
         else:
+            tool_payloads = []
+            for m in messages:
+                if m.get("role") == "tool":
+                    try:
+                        tool_payloads.append(json.loads(m.get("content") or "{}"))
+                    except (ValueError, TypeError):
+                        tool_payloads.append({})
+            if not any(t.get("evidence") for t in tool_payloads):
+                return {"role": "assistant", "content": json.dumps({
+                    "status": "NO_EVIDENCE", "claims": [], "gaps": [], "conflicts": []
+                }), "tool_calls": []}
             return {
                 "role": "assistant",
                 "content": json.dumps({

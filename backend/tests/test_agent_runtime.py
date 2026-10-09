@@ -136,7 +136,7 @@ def test_agent_hitl_checkpoint_and_resume(client, monkeypatch):
 
         completed = client.get(f"/api/v1/runs/{run_id}").json()
         assert completed["status"] in {"SUCCEEDED", "COMPLETED", "NO_EVIDENCE"}
-        assert completed["terminalReason"] == "COMPLETED"
+        assert completed["terminalReason"] == "NO_EVIDENCE"
     finally:
         ModelGateway._agent_mock_handler = None
 

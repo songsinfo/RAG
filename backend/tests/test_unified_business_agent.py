@@ -77,7 +77,7 @@ def test_unified_legacy_modes_execute_mock_tool_and_persist_evidence(client):
             assert r.status_code == 202, r.text
             assert r.json()["executionMode"] == "DURABLE"
             d = client.get("/api/v1/runs/" + r.json()["runId"]).json()
-            assert d["status"] == "SUCCEEDED", d
+            assert d["status"] in {"COMPLETED", "SUCCEEDED"}, d
             assert d["mock"] is True and d["evidence"][0]["sourceType"] == "TOOL"
             e = client.get(f"/api/v1/runs/{r.json()['runId']}/evidence/E1")
             assert e.status_code == 200

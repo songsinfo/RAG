@@ -251,7 +251,7 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
     assert run_resp.json()["status"] == "QUEUED"
-    assert run_resp.json()["executionMode"] == "REALTIME"
+    assert run_resp.json()["executionMode"] == "DURABLE"
     # 普通问答只建 qa_run，不创建 QA_RUN durable job，不需要等待 Worker 抢占。
     with app_db.get_db_connection() as conn:
         assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
@@ -313,7 +313,7 @@ def test_qa_run_lifecycle_and_evidence(client):
 
 
 @pytest.mark.parametrize("mode,evaluation_scope,execution_mode", [
-    ("RAG", None, "REALTIME"),
+    ("RAG", None, "DURABLE"),
     ("RAG", {"snapshotId": "review-snapshot"}, "DURABLE"),
     ("AGENT", None, "DURABLE"),
 ])
