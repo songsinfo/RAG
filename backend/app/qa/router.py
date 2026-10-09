@@ -1,7 +1,7 @@
 import json
 import time
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, Header, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Response, status
 from fastapi.responses import StreamingResponse
 from app.identity.deps import Actor, get_current_actor
 from app.qa.service import QaService
@@ -64,11 +64,18 @@ def submit_run(
     conversation_id: str,
     body: Dict[str, Any],
     response: Response,
+    background_tasks: BackgroundTasks,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     actor: Actor = Depends(get_current_actor),
 ):
     response.status_code = status.HTTP_202_ACCEPTED
-    return QaService.submit_run(actor, conversation_id, body, idempotency_key)
+    result = QaService.submit_run(actor, conversation_id, body, idempotency_key)
+    # 使用 Starlette 线程池在响应发送后立刻执行普通 RAG，避免同步阻塞请求。
+    # 已有幂等结果不得再次调度，以免两个请求同时重复生成。
+    from app.config import is_test_env
+    if result.get("executionMode") == "REALTIME" and not result.get("reused") and not is_test_env():
+        background_tasks.add_task(QaService.execute_queued_run, actor, result["runId"])
+    return result
 
 
 @router.get("/runs/{run_id}")

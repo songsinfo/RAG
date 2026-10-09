@@ -36,6 +36,54 @@ from app.models import (
 # 第 1 组：算法指标测试，并与 Java 基线公式保持一致。
 # ==============================================================================
 
+def test_evaluation_rag_is_executed_by_worker_outside_test_mode(monkeypatch, eval_env):
+    from types import SimpleNamespace
+    import app.qa.service as qa_service
+    import app.evaluation.runner as evaluation_runner
+    from app.models import job_table, qa_run_table
+    from app.qa.service import QaService
+    from app.runtime.worker import DurableJobWorker
+
+    # 走真实 submit/poll/Worker 链路，避免测试环境的同步执行掩盖缺失的调度。
+    monkeypatch.setattr(qa_service, "is_test_env", lambda: False)
+    worker = DurableJobWorker(kinds={"QA_RUN"})
+    executed = []
+
+    def execute_pending_run(_):
+        QaService.recover_unfinished_runs()
+        assert worker.run_once(), "评估 RAG 必须有可领取的 QA_RUN Job"
+        executed.append(True)
+
+    monkeypatch.setattr(evaluation_runner, "time", SimpleNamespace(
+        monotonic=lambda: 0.0, sleep=execute_pending_run,
+    ))
+    actor = eval_env["admin"]
+    case = {"caseKey": "worker-rag", "question": {"text": "你好"}}
+    manifest = {"mode": "RAG", "configId": "cfg-enterprise-retrieval-v2"}
+    snapshot = EvaluationCatalog.create_snapshot(actor, {
+        "name": "Worker RAG", "documentIds": [eval_env["doc_id"]],
+        "approvedSyntheticOrRedacted": True,
+    })
+    scope = {**snapshot["manifest"], "snapshotId": snapshot["id"]}
+    detail, run_ids = EvaluationRunner._run_qa_turns(
+        actor, actor, "review-eval", "review-result", case, manifest, scope,
+    )
+    assert detail["status"] == "COMPLETED"
+    assert detail["answer"]
+    reused_detail, reused_ids = EvaluationRunner._run_qa_turns(
+        actor, actor, "review-eval", "review-result", case, manifest, scope,
+    )
+    assert reused_ids == run_ids
+    assert reused_detail["status"] == "COMPLETED"
+    assert len(executed) == 1
+    with get_db_connection() as conn:
+        run = conn.execute(select(qa_run_table).where(qa_run_table.c.id == run_ids[0])).first()
+        jobs = conn.execute(select(job_table).where(job_table.c.target_id == run_ids[0])).all()
+    assert run.started_at is not None
+    assert len(jobs) == 1
+    assert jobs[0].status == "COMPLETED"
+
+
 def test_one_of_three_facts_is_a_hit_but_only_third_recall():
     m = EvaluationMetrics.retrieval(
         groups=[{"a"}, {"b"}, {"c"}],
