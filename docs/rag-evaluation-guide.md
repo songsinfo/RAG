@@ -338,7 +338,7 @@ router.py
   → export_run / compare：导出或比较
 ```
 
-测试环境会在启动后直接执行；非测试环境交给持久化 Worker。请求中应使用稳定的 `Idempotency-Key`，在同一启动请求因网络原因重试时复用；改了请求内容则使用新键。
+测试环境部分入口同步执行以便确定性测试；非测试环境的评估主任务交给持久化 `EVALUATE` Worker。**评估 RAG 即使 `mode=RAG`，因携带 `evaluation_scope`，仍会创建 `QA_RUN` Job 并由 QA Worker 执行**，不同于浏览器普通 RAG 的 BackgroundTasks 路径。这让批量评估能够按持久化任务恢复、重试。请求中应使用稳定的 `Idempotency-Key`，在同一启动请求因网络原因重试时复用；改了请求内容则使用新键。
 
 预建全部 PENDING 结果的意义是：未开始的题也不会从计划总数中消失。执行完毕、回答正确和可发布，是三个不同层次的判断。
 
