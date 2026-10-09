@@ -1,7 +1,7 @@
 # 统一业务 Agent 实施 Tickets
 
-状态：TODO。日期：2026-10-09；更新：2026-10-10。规格：[统一业务 Agent](../design/10-unified-business-agent-spec.md)。
-本轮只交付规格与任务，以下实现均未完成。所有 Java 接口均不接入，四个业务工具只返回明确标注的模拟数据。
+状态：IN_PROGRESS（PR #14 分阶段实现，以下 Tickets 尚未全部验收）。日期：2026-10-09；更新：2026-10-10。规格：[统一业务 Agent](../design/10-unified-business-agent-spec.md)。
+本文件保留原任务/验收合同，部分已有编码但不能据此视为全部完成；详见[实施状态](unified-business-agent-implementation-status.md)。所有 Java 接口均不接入，四个业务工具只返回明确标注的模拟数据。
 
 ## UA-T01：提供四个固定模拟业务工具
 

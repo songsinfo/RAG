@@ -1,7 +1,7 @@
 # 统一业务 Agent 规格
 
-状态：READY_FOR_IMPLEMENTATION（规格完成，功能尚未实现）。日期：2026-10-09；更新：2026-10-10。
-任务清单：[统一业务 Agent Tickets](../delivery/unified-business-agent-tickets.md)。
+状态：IMPLEMENTING（PR #14 草稿已编码部分功能，UA-01～UA-12 尚未全部验收）。日期：2026-10-09；更新：2026-10-10。
+任务清单：[统一业务 Agent Tickets](../delivery/unified-business-agent-tickets.md)。实际状态：[实施进度与剩余验收](../delivery/unified-business-agent-implementation-status.md)。
 
 ## 1. 目标与已确认范围
 
