@@ -300,6 +300,13 @@ context_segment_table = Table(
     Column("conversation_id", String(36), nullable=False),
     Column("segment_no", Integer, nullable=False, default=1, server_default="1"),
     Column("scope_mode", String(8), nullable=False, default="ALL", server_default="ALL"),
+    # Persistent, per-segment context for new Agent turns; the version advances
+    # only on initialization and compaction (turn_no tracks normal append).
+    Column("context_payload", JSON, nullable=True),
+    Column("context_version", Integer, nullable=False, default=0, server_default="0"),
+    Column("context_through_turn", Integer, nullable=False, default=0, server_default="0"),
+    Column("context_boundary_turn", Integer, nullable=False, default=0, server_default="0"),
+    Column("context_last_run_id", String(36), nullable=True),
     Column("created_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
     Column("updated_at", DateTime(6), nullable=False, default=lambda: datetime.now(timezone.utc), server_default=func.now()),
 )
