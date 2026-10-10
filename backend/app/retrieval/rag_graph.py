@@ -128,7 +128,7 @@ class RagRetrievalGraph:
         history: Optional[List[Dict[str, str]]] = None,
         record_event_fn: Optional[Callable[..., Any]] = None,
     ) -> Dict[str, Any]:
-        """仅普通 RAG 使用；返回值与 RetrievalPipeline.retrieve 的契约一致。"""
+        """Agent 检索工具与独立检索共用；内部图无需持久化 checkpoint。"""
         ctx = RagRetrievalContext(
             actor=actor,
             query=query,

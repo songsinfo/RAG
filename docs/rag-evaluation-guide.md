@@ -6,7 +6,7 @@
 
 若要先理解上传、解析、检索、普通 RAG 和 Agent 如何串起来，请从[项目源码导读](source-walkthrough.md)开始，再回到本文学习评估。
 
-**实现核对基线：2026-10-08，`main` 分支，代码提交 `bc3d643`。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
+**历史评测核对基线：2026-10-08，`main` 的提交 `bc3d643`；统一 Agent 增量以 PR #14 开发分支为准，仍未完全验收。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
 
 ## 目录
 
@@ -218,7 +218,7 @@ nDCG@K = DCG@K / IDCG@K
 
 当前 `_compute_retrieval_metrics()` 没有独立使用传入的 `evidence_list` 计算上下文覆盖。检索模式传入流水线 `hits`，RAG/AGENT 模式传入最终 QA `evidence`。虽然指标标注了 `FINAL_RANKED_CANONICAL`，仍应根据调用来源解释它，不能据此声称已经完成各阶段召回和上下文覆盖评估。
 
-**PR #13 普通 RAG 检索图的评估边界**：普通 RAG（包括 `mode=RAG` 的批量评估）现通过 `RagRetrievalGraph` 执行检索节点；纯检索模式 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 和 Agent 的 `search_knowledge` 仍使用 `RetrievalPipeline.retrieve()`。普通 RAG 检索节点新增 `RAG_DENSE_RECALL`、`RAG_BM25_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_CONTEXT_BUDGET` 等 `run_event`，**当前只记录阶段命中数量、耗时和开关，不保存完整有序候选列表，也不自动计算阶段级 Recall@5、NDCG@5 或 Context Coverage**。需在权限受控的评估执行中另行保存各阶段 canonical Chunk ID / Build ID 及排名，才能将阶段数据与 Gold fact groups 对齐计算归因指标。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+**PR #13 历史检索图、PR #14 统一 Agent 的评估边界**：新完整问答（旧 `mode=RAG` 输入也规范化为 `AGENT`）在模型选择 `search_knowledge` 时通过 `RagRetrievalGraph` 执行检索节点；纯检索模式 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 仍使用 `RetrievalPipeline.retrieve()`。普通 RAG 检索节点新增 `RAG_DENSE_RECALL`、`RAG_BM25_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_CONTEXT_BUDGET` 等 `run_event`，**当前只记录阶段命中数量、耗时和开关，不保存完整有序候选列表，也不自动计算阶段级 Recall@5、NDCG@5 或 Context Coverage**。需在权限受控的评估执行中另行保存各阶段 canonical Chunk ID / Build ID 及排名，才能将阶段数据与 Gold fact groups 对齐计算归因指标。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
 
 ## 4. 回答质量怎么判断
 
@@ -316,7 +316,7 @@ Relevancy 是 **OBSERVE_ONLY**：它独立展示，不会因为“切题”而�
 | --- | --- | --- |
 | `RETRIEVAL_ONLY` | 仅无模型 BM25；拒绝需要模型的检索配置 | 不能 |
 | `RETRIEVAL_PIPELINE` | 检索流水线，可包含 Dense、Hybrid、重排等 | 不能 |
-| `RAG` | 调用真实 QA 服务执行普通 RAG | 可以，但需要质量判定 |
+| `RAG`（兼容输入） | 新建评测规范化为 `AGENT`；旧报告保留原模式 | 可以，但需要质量判定 |
 | `AGENT` | 调用真实 QA 服务执行 Agent 问答 | 可以，还需看轨迹与额外成本 |
 
 检索模式的 `judge.correctness` 为 `NOT_EVALUATED`。其 `taskSuccess` 对非拒答题主要表示是否命中证据，不能与 RAG 的语义成功率混用。
@@ -340,7 +340,7 @@ router.py
   → export_run / compare：导出或比较
 ```
 
-测试环境部分入口同步执行以便确定性测试；非测试环境的评估主任务交给持久化 `EVALUATE` Worker。**评估 RAG 即使 `mode=RAG`，因携带 `evaluation_scope`，仍会创建 `QA_RUN` Job 并由 QA Worker 执行**，不同于浏览器普通 RAG 的 BackgroundTasks 路径。这让批量评估能够按持久化任务恢复、重试。请求中应使用稳定的 `Idempotency-Key`，在同一启动请求因网络原因重试时复用；改了请求内容则使用新键。
+测试环境部分入口同步执行以便确定性测试；非测试环境的评估主任务交给持久化 `EVALUATE` Worker。**新建完整问答评测与在线提问都创建 `QA_RUN` Job，并由 QA Worker 运行统一 Agent**；旧评测报告的 `mode=RAG` 不被改写。这让批量评估能够按持久化任务恢复、重试。请求中应使用稳定的 `Idempotency-Key`，在同一启动请求因网络原因重试时复用；改了请求内容则使用新键。
 
 预建全部 PENDING 结果的意义是：未开始的题也不会从计划总数中消失。执行完毕、回答正确和可发布，是三个不同层次的判断。
 
@@ -565,6 +565,11 @@ RAG 与 AGENT 模式不同，会被当前接口标为不可直接比较。要研
 可给失败案例加多个归因标签：`corpus_missing`、`parse_error`、`anchor_error`、`retrieval_miss`、`rerank_drop`、`context_drop`、`generation_error`、`citation_error`、`permission`、`provider_failure`、`budget`。
 
 为了区分检索与生成问题，可以做一个诊断实验：直接把人工确认的正确证据交给生成模块。如果这样仍然答错，应优先处理生成；如果这样答对而完整 RAG 答错，就继续检查检索和上下文链路。这个实验提供故障定位证据，不能代替真实端到端结果。
+
+
+### PR #14：统一 Agent 模拟业务工具的评测边界
+
+四个固定模拟工具只证明调度/参数/证据协议，不代表真实系统资格。评测新完整问答时，应记录选用的工具名、参数对象、DOCUMENT/TOOL 来源及 mock 标志；分别检查无参数规则查询、缺少 ID 追问、知识检索、混合调用、切换用户、无证据、网关失败与撤权。不能将 fake model 测试通过率说成真实模型选工具准确率。真实模型、LiteLLM 缓存命中/延迟和费用必须另外实测；没有外部环境时明确写“未实测”。
 
 ## 11. Agentic RAG 与线上持续评估
 

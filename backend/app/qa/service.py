@@ -448,10 +448,11 @@ class QaService:
         # 输入 guard 在任何持久化/模型调用之前执行，避免明显危险内容进入后续链路。
         validate_input(question)
 
-        mode = body.get("mode", "RAG")
-        if mode not in {"RAG", "AGENT"}:
+        requested_mode = body.get("mode", "AGENT")
+        if requested_mode not in {"RAG", "AGENT"}:
             raise ApiException(400, "INVALID_INPUT", "问答模式无效")
-        durable = mode == "AGENT" or evaluation_scope is not None
+        mode = "AGENT"
+        durable = True
 
         strict_mode = bool(body.get("strictMode") or body.get("strict", False))
         # 客户端不能自由指定历史/隐藏检索配置；只有内部可信调用（评估）可 pin config。
@@ -810,7 +811,9 @@ class QaService:
                 conn.commit()
 
             # 历史不是直接从 conversation 文本拼出来，而是逐轮验证来源当前仍可读后再继承。
-            history = QaService._rag_history(actor, seg_id, run_id)
+            # Old REALTIME RAG still depends on legacy history. Unified Agent
+            # loads the persisted, ACL-checked segment context on first graph entry.
+            history = QaService._rag_history(actor, seg_id, run_id) if mode == "RAG" else []
 
             # 1. 先做轻量问题路由：非知识库问题不进入检索/模型主链，节省费用。
             decision = classify_question(question)
@@ -849,7 +852,11 @@ class QaService:
                 )
                 QaService._verify_answer(actor, run_id, agent_res, strict_mode)
                 validate_output(agent_res.get("answer", ""))
-                QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", "COMPLETED", agent_res)
+                QaService._record_event(actor.tenant_id, run_id, "ANSWER_VERIFIED", {
+                    "strictMode": strict_mode,
+                    "verification": agent_res.get("verification", "STRUCTURAL_ONLY"),
+                })
+                QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", agent_res.get("status", "COMPLETED"), agent_res)
                 return
 
             # 2. 普通 RAG：先解析 segment 的 KB scope，再交给 RetrievalPipeline 做 ACL + 多路检索。
@@ -1179,6 +1186,32 @@ class QaService:
             return r and (r.status == "CANCELLED" or r.cancel_requested_at is not None)
 
     @staticmethod
+    def _insert_terminal_event(conn, tenant_id: str, run_id: str, now, status: str,
+                               terminal_reason: str, error_code=None) -> None:
+        """与 run/job 的终态同事务写入事件，避免 finalization 后 lease 消失而漏写。"""
+        sequence = conn.execute(
+            select(run_event_table.c.sequence_no)
+            .where(and_(
+                run_event_table.c.tenant_id == tenant_id,
+                run_event_table.c.run_id == run_id,
+            ))
+            .order_by(run_event_table.c.sequence_no.desc())
+            .limit(1)
+        ).scalar() or 0
+        conn.execute(run_event_table.insert().values(
+            tenant_id=tenant_id,
+            id=str(uuid.uuid4()),
+            run_id=run_id,
+            sequence_no=int(sequence) + 1,
+            stage="FINISHED",
+            duration_ms=0,
+            payload={"runStatus": status, "terminalReason": terminal_reason},
+            error_code=error_code,
+            created_at=now,
+            updated_at=now,
+        ))
+
+    @staticmethod
     def _finalize_run(
         tenant_id: str,
         run_id: str,
@@ -1220,7 +1253,7 @@ class QaService:
                     ))
                     .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
                 )
-            conn.execute(
+            updated = conn.execute(
                 update(qa_run_table)
                 .where(and_(
                     qa_run_table.c.tenant_id == tenant_id,
@@ -1236,6 +1269,13 @@ class QaService:
                     updated_at=now,
                 )
             )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            if status in {"COMPLETED", "SUCCEEDED"}:
+                from app.qa.segment_context import append_completed_turn
+                append_completed_turn(conn, tenant_id, run_id, result_json)
+            QaService._insert_terminal_event(conn, tenant_id, run_id, now, status, terminal_reason)
             conn.commit()
             log_stage(logger, "run_finished", stage, tenant_id=tenant_id, run_id=run_id,
                       status=status, terminal_reason=terminal_reason)
@@ -1287,7 +1327,7 @@ class QaService:
                         updated_at=now,
                     )
                 )
-            conn.execute(
+            updated = conn.execute(
                 update(qa_run_table)
                 .where(and_(
                     qa_run_table.c.tenant_id == tenant_id,
@@ -1302,6 +1342,10 @@ class QaService:
                     updated_at=now,
                 )
             )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            QaService._insert_terminal_event(conn, tenant_id, run_id, now, "FAILED", error_code, error_code)
             conn.commit()
             return True
 
@@ -1335,7 +1379,7 @@ class QaService:
                         qa_run_table.c.tenant_id == actor.tenant_id,
                         qa_run_table.c.segment_id == segment_id,
                         qa_run_table.c.turn_no < int(current_turn),
-                        qa_run_table.c.status.in_(["COMPLETED", "SUCCEEDED", "PARTIAL", "CONFLICT"]),
+                        qa_run_table.c.status.in_(["COMPLETED", "SUCCEEDED", "PARTIAL", "CONFLICT", "NEED_CLARIFICATION"]),
                     )
                 )
                 .order_by(qa_run_table.c.turn_no.desc())
@@ -1344,7 +1388,7 @@ class QaService:
 
             messages: List[Dict[str, str]] = []
             total_chars = 0
-            for row in reversed(rows):
+            for row in rows:
                 source_rows = conn.execute(
                     select(
                         run_source_table.c.document_id,
@@ -1357,16 +1401,18 @@ class QaService:
                     ).distinct()
                 ).fetchall()
                 # 任一历史来源已经撤权，则整轮历史跳过，不能只保留“看起来无敏感内容”的回答文本。
-                if any(not can_read_document(conn, actor, str(src.document_id)) for src in source_rows):
+                if any(src.document_id is not None and not can_read_document(conn, actor, str(src.document_id)) for src in source_rows):
                     continue
                 if scope is not None:
                     assert_hits_still_readable(conn, actor, [
-                        {"documentId": src.document_id, "buildId": src.build_id} for src in source_rows
+                        {"documentId": src.document_id, "buildId": src.build_id} for src in source_rows if src.document_id is not None
                     ], document_ids=scope)
 
                 question = str(row.question or "").strip()
                 result = row.result_json if isinstance(row.result_json, dict) else {}
                 answer = str(result.get("answer") or "").strip()
+                if result.get("mock"):
+                    answer += "（历史模拟结果，未查询真实业务系统，不能作为当前诊断。）"
                 next_chars = len(question) + len(answer)
                 # 历史预算按最近轮次优先；超过总字符预算后停止继续向前扩展。
                 if total_chars + next_chars > 4000:
@@ -1396,6 +1442,8 @@ class QaService:
                     )
 
                 for src in source_rows:
+                    if src.document_id is None:
+                        continue
                     inherited = conn.execute(
                         select(run_source_table.c.id).where(
                             and_(
@@ -1434,7 +1482,7 @@ class QaService:
                     messages.append({"role": "assistant", "content": answer[:4000]})
 
             conn.commit()
-            return messages
+            return [msg for pair in reversed([messages[i:i + 2] for i in range(0, len(messages), 2)]) for msg in pair]
 
     @staticmethod
     def _all_sources(conn, tenant_id: str, segment_id: str, turn_no: int) -> List[str]:
@@ -1458,7 +1506,7 @@ class QaService:
             )
         )
         rows = conn.execute(stmt).fetchall()
-        return [str(r[0]) for r in rows]
+        return [str(r[0]) for r in rows if r[0] is not None]
 
     @staticmethod
     def get_run(actor: Actor, run_id: str) -> Dict[str, Any]:
@@ -1525,6 +1573,7 @@ class QaService:
                     model_call_table.c.output_tokens.label("outputTokens"),
                     model_call_table.c.settled_amount.label("settledAmount"),
                     model_call_table.c.reserved_amount.label("reservedAmount"),
+                    model_call_table.c.usage_detail.label("usageDetail"),
                 ).where(
                     and_(
                         model_call_table.c.tenant_id == actor.tenant_id,
@@ -1540,6 +1589,9 @@ class QaService:
                     "outputTokens": int(c.outputTokens) if c.outputTokens else 0,
                     "settledAmount": str(c.settledAmount) if c.settledAmount is not None else None,
                     "reservedAmount": str(c.reservedAmount or "0.000000"),
+                    "cacheReadTokens": (c.usageDetail or {}).get("cacheReadTokens"),
+                    "model": (c.usageDetail or {}).get("model"),
+                    "durationMs": (c.usageDetail or {}).get("durationMs"),
                 }
                 for c in calls
             ]
@@ -1640,16 +1692,20 @@ class QaService:
                     )
                 )
             ).first()
-            if rs and not can_read_document(conn, actor, str(rs.document_id)):
+            if rs and rs.source_type != "TOOL" and not can_read_document(conn, actor, str(rs.document_id)):
                 raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
 
         run_data = QaService.get_run(actor, run_id)
-        if run_data.get("visibility") == "HIDDEN":
+        if rs is None or run_data.get("visibility") == "HIDDEN":
             raise ApiException(404, "RESOURCE_NOT_FOUND", "构件不存在")
 
         evidence_list = run_data.get("evidence", [])
         for ev in evidence_list:
             if ev.get("evidenceId") == evidence_id:
+                if rs.source_type == "TOOL":
+                    snapshot = rs.source_snapshot or {}
+                    if not ev.get("mock") or ev.get("toolName") != rs.tool_name or ev.get("queryObjects") != snapshot.get("queryObjects"):
+                        raise ApiException(409, "SOURCE_CHANGED", "模拟来源快照不一致")
                 return ev
         raise ApiException(404, "RESOURCE_NOT_FOUND", "证据不存在")
 

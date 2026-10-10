@@ -144,6 +144,7 @@ class ModelGateway:
                     run_source_table.c.document_id,
                     run_source_table.c.build_id,
                     run_source_table.c.purpose,
+                    run_source_table.c.source_type,
                 )
                 .where(
                     and_(
@@ -155,6 +156,9 @@ class ModelGateway:
             ).fetchall()
             # run_source 不是永久授权：每次把来源送给外部模型前都重新检查当前 ACL。
             for source in sources:
+                # 工具快照是 tenant/run 所属的合成业务数据，不存在文档 ACL/build。
+                if source.source_type == "TOOL":
+                    continue
                 if not can_read_document(conn, actor, str(source.document_id)):
                     raise ApiException(409, "SOURCE_CHANGED", "来源权限已变化，请重新提问")
                 # HISTORY 允许引用当时记录的 build；当前轮实际检索来源则要求 active_build_id 仍一致，
@@ -225,7 +229,12 @@ class ModelGateway:
                         job_id=job_id, purpose=purpose, alias=model_alias,
                         payload={"messages": messages, "tools": []},
                         max_output_tokens=max_tokens,
-                        usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                        usage_reader=lambda response: {
+                            **(getattr(response, "usage_metadata", None) or {}),
+                            "cache_read_tokens": ((getattr(response, "usage_metadata", None) or {}).get("input_token_details") or {}).get("cache_read")
+                                if isinstance((getattr(response, "usage_metadata", None) or {}).get("input_token_details"), dict)
+                                else None,
+                        },
                     )
 
                 try:
@@ -255,7 +264,12 @@ class ModelGateway:
                             job_id=job_id, purpose=purpose, alias=fallback_alias,
                             payload={"messages": messages, "tools": []},
                             max_output_tokens=max_tokens,
-                            usage_reader=lambda response: getattr(response, "usage_metadata", None) or {},
+                            usage_reader=lambda response: {
+                                **(getattr(response, "usage_metadata", None) or {}),
+                                "cache_read_tokens": ((getattr(response, "usage_metadata", None) or {}).get("input_token_details") or {}).get("cache_read")
+                                    if isinstance((getattr(response, "usage_metadata", None) or {}).get("input_token_details"), dict)
+                                    else None,
+                            },
                         )
 
                     response = retry_call(
@@ -501,7 +515,13 @@ class ModelGateway:
         cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias, job_id=job_id)
         has_tool_response = any(m.get("role") == "tool" for m in messages)
         if not has_tool_response:
-            user_msg = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+            # The earlier history precedes the current question. Select the
+            # last real user turn, never the first historical message/snapshot.
+            user_msg = next(
+                (m.get("content", "") for m in reversed(messages)
+                 if m.get("role") == "user" and m.get("kind") != "context_snapshot"),
+                "",
+            )
             return {
                 "role": "assistant",
                 "content": "",
@@ -515,6 +535,17 @@ class ModelGateway:
                 ],
             }
         else:
+            tool_payloads = []
+            for m in messages:
+                if m.get("role") == "tool":
+                    try:
+                        tool_payloads.append(json.loads(m.get("content") or "{}"))
+                    except (ValueError, TypeError):
+                        tool_payloads.append({})
+            if not any(t.get("evidence") for t in tool_payloads):
+                return {"role": "assistant", "content": json.dumps({
+                    "status": "NO_EVIDENCE", "claims": [], "gaps": [], "conflicts": []
+                }), "tool_calls": []}
             return {
                 "role": "assistant",
                 "content": json.dumps({
@@ -646,6 +677,7 @@ class ModelGateway:
         output_tokens: int,
         model_alias: str,
         job_id: Optional[str] = None,
+        usage_detail: Optional[Dict[str, Any]] = None,
     ):
         """结算并持久化一次模型调用。
 
@@ -696,7 +728,7 @@ class ModelGateway:
                         output_tokens=output_tokens,
                         provider_request_id=f"req-{call_id[:8]}",
                         pricing_snapshot=budget.get("pricing") or {},
-                        usage_detail={"model": model_alias},
+                        usage_detail={"model": model_alias, **(usage_detail or {})},
                         reservation_authority=budget.get("authority") or "NONE",
                         reservation_id=budget.get("reservationId"),
                         created_at=now,

@@ -44,18 +44,19 @@ def assert_run_sources_readable(actor, run_id):
     """
     with get_db_connection() as conn:
         document_ids = run_document_scope(conn, actor, run_id)
-        rows = conn.execute(select(run_source_table.c.document_id, run_source_table.c.build_id, run_source_table.c.purpose).where(and_(
+        rows = conn.execute(select(run_source_table.c.document_id, run_source_table.c.build_id,
+                   run_source_table.c.source_type, run_source_table.c.purpose).where(and_(
             run_source_table.c.tenant_id == actor.tenant_id, run_source_table.c.run_id == run_id,
         )).distinct()).fetchall()
         # HISTORY 来源需要额外检查当前文档 ACL。
         # 这是为了防止历史回答在撤权后又被重新送入后续模型/Judge。
         for row in rows:
-            if row.purpose == "HISTORY" and not can_read_document(conn, actor, str(row.document_id)):
+            if row.source_type != "TOOL" and row.purpose == "HISTORY" and not can_read_document(conn, actor, str(row.document_id)):
                 raise ApiException(409, "SOURCE_CHANGED", "历史来源权限已变化")
         # 对实际命中的 document/build 再做一次“当前仍可读 + build 未漂移”的检查。
         assert_hits_still_readable(conn, actor, [
             {"documentId": r.document_id, "buildId": r.build_id} for r in rows
-            if r.purpose != "HISTORY" or document_ids is not None
+            if r.source_type != "TOOL" and (r.purpose != "HISTORY" or document_ids is not None)
         ], document_ids=document_ids)
 
 
@@ -72,4 +73,10 @@ def conversation_memory(actor, conversation_id, current_run_id, max_turns=4):
     # 找不到当前 run 所属 segment 时不跨段猜测历史，直接视为无历史。
     if not segment_id:
         return []
+    from app.qa.segment_context import load_segment_context
+    with get_db_connection() as conn:
+        messages, meta = load_segment_context(conn, actor, str(segment_id), current_run_id)
+        conn.commit()
+    if meta["source"] == "PERSISTED":
+        return messages
     return QaService._rag_history(actor, str(segment_id), current_run_id)

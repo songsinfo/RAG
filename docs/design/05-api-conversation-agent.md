@@ -3,6 +3,8 @@
 > **历史设计说明（2026-09-22）**：本文保留早期技术设计基线，其中可能包含 Java、Spring、Elasticsearch、旧 Docling API/切块方案或尚未落地的设计，不代表 `main` 当前实现。当前系统行为请以仓库根目录 `README.md`、`docs/source-walkthrough.md`、`docs/rag-evaluation-guide.md` 与 `backend/app` 源码为准。
 
 
+> **2026-10-10 当前分支补充**：下文保留早期 Java 与双问答模式的历史设计文本供溯源，**不是 PR #14 新请求的实现事实**。新在线问答始终创建 Durable AGENT run，`search_knowledge` 调用 `RagRetrievalGraph`，四业务工具使用无网络模拟 fixture，TOOL evidence 不生成假文档。以[统一业务 Agent 规格](10-unified-business-agent-spec.md)及[实施状态](../delivery/unified-business-agent-implementation-status.md)为准。
+
 对应 PRD-01/03/04/07，评估与运维接口同时覆盖 PRD-05/06。API 前缀 /api/v1；JSON 使用 camelCase，ID 为 UUID，日期使用 UTC ISO-8601。以下是实现契约，尚未有运行中的接口。
 
 ## 1. 登录与统一协议

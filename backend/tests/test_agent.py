@@ -400,4 +400,4 @@ def test_agent_unknown_tool_handled(client):
 
     assert run_data is not None
     assert run_data["status"] in ("SUCCEEDED", "COMPLETED", "NO_EVIDENCE")
-    assert run_data["terminalReason"] == "COMPLETED"
+    assert run_data["terminalReason"] == "NO_EVIDENCE"

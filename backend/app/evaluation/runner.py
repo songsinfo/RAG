@@ -157,7 +157,9 @@ class EvaluationRunner:
             if repeats < 1 or repeats > 3:
                 raise ApiException(400, "INVALID_INPUT", "重复次数1..3")
 
-            mode = str(body.get("mode", "RAG")).strip().upper()
+            mode = str(body.get("mode", "AGENT")).strip().upper()
+            if mode == "RAG":
+                mode = "AGENT"
             judge_mode = str(body.get("judgeMode", "HUMAN")).upper()
             if judge_mode not in {"HUMAN", "LLM"}:
                 raise ApiException(400, "INVALID_INPUT", "judgeMode 必须 HUMAN/LLM")

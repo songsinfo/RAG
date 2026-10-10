@@ -13,12 +13,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
 from sqlalchemy import and_, func, select
 
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
+from app.qa.business_context import has_business_context, state_from_messages, state_message
 
 
 T = TypeVar("T")
@@ -134,46 +135,66 @@ def _from_langchain_message(message) -> Dict[str, Any]:
 
 def message_tokens(messages: List[Dict[str, Any]]) -> int:
     converted = [_to_langchain_message(message) for message in messages]
-    return int(count_tokens_approximately(converted))
+    approx = int(count_tokens_approximately(converted))
+    # tokenizer 不可用时，额外计入 Unicode/CJK、工具调用结构和消息包装开销。
+    raw = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return max(approx, (len(raw.encode("utf-8")) + 1) // 2)
 
 
 def compact_messages(
-    messages: List[Dict[str, Any]],
-    max_tokens: int,
+    messages: List[Dict[str, Any]], max_tokens: int,
+    business_state: Optional[Dict[str, Any]] = None,
+    *, source_run_id: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """压缩上下文，但尽量保持一条“语义完整”的最近对话尾部。
+    """85% 触发、尝试压至 60%；压缩前提取显式对象和已执行工具来源。
 
-    保留 system 指令，并从最近消息向前截取；start_on="human" 防止留下孤立的
-    ToolMessage——如果工具结果还在、触发它的用户/助手轮次却被裁掉，模型会误解上下文。
+    未压缩时原有消息字节/次序完全不变；压缩时只移除完整交互组，
+    保留最新用户轮次、其 tool_calls 和所有对应 ToolMessage，不截断 JSON。
+    无空间保留受保护内容/必要状态时失败关闭。
     """
-    converted = [_to_langchain_message(message) for message in messages]
-    original_tokens = int(count_tokens_approximately(converted))
-    # 未超预算时原样返回，避免为了“统一格式”无谓重建消息。
-    if original_tokens <= max_tokens:
+    original = message_tokens(messages)
+    state = state_from_messages(messages, business_state, source_run_id=source_run_id)
+    if original <= int(max_tokens * .85):
         return list(messages), {
-            "trimmed": False,
-            "droppedMessages": 0,
-            "estimatedTokens": original_tokens,
-            "strategy": "langchain.trim_messages",
+            "trimmed": False, "droppedMessages": 0, "estimatedTokens": original,
+            "strategy": "stable-prefix-v2", "businessState": state,
         }
 
-    # allow_partial=False：宁可整条消息丢掉，也不从消息中间硬截断 JSON/tool payload。
-    trimmed = trim_messages(
-        converted,
-        max_tokens=max_tokens,
-        token_counter="approximate",
-        strategy="last",
-        allow_partial=False,
-        start_on="human",
-        include_system=True,
-    )
-    compacted = [_from_langchain_message(message) for message in trimmed]
-    estimated = int(count_tokens_approximately(trimmed))
+    system = [m for m in messages if m.get("role") == "system"]
+    previous_snapshot = any(m.get("kind") == "context_snapshot" for m in messages)
+    others = [m for m in messages if m.get("role") != "system" and m.get("kind") != "context_snapshot"]
+    # Do not split a user turn from assistant tool_calls and corresponding ToolMessages.
+    groups: List[List[Dict[str, Any]]] = []
+    for msg in others:
+        if msg.get("role") == "user" or not groups:
+            groups.append([msg])
+        else:
+            groups[-1].append(msg)
+    if not groups or groups[-1][0].get("role") != "user":
+        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "缺少当前问题，不能安全压缩")
+
+    keep = list(groups)
+    # Add a snapshot only when it carries useful state AND older messages were
+    # actually discarded (or an earlier snapshot is being replaced).
+    # In particular, do not spend tokens on an empty snapshot.
+    while True:
+        dropped_groups = len(groups) - len(keep)
+        should_snapshot = has_business_context(state) and (dropped_groups > 0 or previous_snapshot)
+        snapshot = [state_message(state)] if should_snapshot else []
+        compacted = system + snapshot + [msg for group in keep for msg in group]
+        tokens = message_tokens(compacted)
+        if tokens <= int(max_tokens * .60) or len(keep) <= 1:
+            break
+        keep.pop(0)
+
+    if tokens > max_tokens:
+        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "当前问题或必要的上下文对象超出硬限制，请缩小问题")
+    trimmed = compacted != messages
     return compacted, {
-        "trimmed": True,
-        "droppedMessages": max(0, len(messages) - len(compacted)),
-        "estimatedTokens": estimated,
-        "strategy": "langchain.trim_messages",
+        "trimmed": trimmed, "droppedMessages": max(0, len(messages) - len(compacted)),
+        "estimatedTokens": tokens, "beforeTokens": original,
+        "businessState": state, "strategy": "complete-turns-with-state-v3",
+        "reason": "HIGH_WATERMARK" if trimmed else "PROTECTED_CONTEXT",
     }
 
 

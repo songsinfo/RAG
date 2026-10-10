@@ -716,8 +716,8 @@ def test_ai_gateway_failure_leads_to_clean_terminal_failure(client: TestClient):
     conv_id = conv_resp.json()["conversationId"]
     segment_id = conv_resp.json()["currentSegmentId"]
 
-    # 替换 ModelGateway.chat 模拟网关故障，验证错误收敛、重试与脱敏行为。
-    with patch.object(ModelGateway, "chat", side_effect=ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "大模型网关故障")):
+    # 统一 Agent 使用 chat_tools；注入网关故障，验证错误收敛、重试与脱敏行为。
+    with patch.object(ModelGateway, "chat_tools", side_effect=ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", "大模型网关故障")):
         run_resp = client.post(
             f"/api/v1/conversations/{conv_id}/runs",
             json={"question": "会话网关测试相关证据内容？", "segmentId": segment_id, "mode": "RAG"},

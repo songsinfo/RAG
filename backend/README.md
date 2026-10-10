@@ -9,7 +9,7 @@
 - **向量检索与混合检索**: Milvus 2.5 (Dense Vector + Sparse BM25 / RRF 混合融合)
 - **文档解析**: Docling 独立服务
 - **大模型网关**: LiteLLM AI Gateway (持有真实供应商 API 密钥，对外统一提供 OpenAI 兼容端点)
-- **问答与编排**: LangChain / LangGraph 状态机，支持严格模式、证据绑定与事实断言校验
+- **问答与编排**: LangGraph 统一 Agent 主循环与嵌套检索图，支持文档/模拟工具双来源、严格校验和 Durable Job（PR #14 开发分支，未全面验收）
 
 ## 模块划分
 
@@ -26,6 +26,16 @@ backend/app/
 ├── qa/                   # 问答服务、LangGraph Agent、断言验证与模型网关
 └── evaluation/           # 评测体系与消融实验指标计算
 ```
+
+## 统一 Agent 代码与运行边界（PR #14）
+
+- `app/qa/agent.py`：外层 Agent `model → tools → model`，由 `JobCheckpointSaver` 持久化状态；`search_knowledge` 委托 `RagRetrievalGraph.retrieve()`，`read_section` 从可读 SourceUnit 获取文档原文。
+- `app/qa/business_tools.py`：`diagnose_coupon(user_id,coupon_id)`、`get_final_price_rules()`、`diagnose_product_group(user_id,product_group_id)`、`diagnose_subsidy(user_id,activity_id)`。**均为合成 fixture，不访问 Java 或真实业务系统**。缺必填 ID 不能编造，模拟失败条件不是实际资格计算结果。
+- `app/models.py` 的 `run_source` 使用 DOCUMENT / TOOL 来源类型；`TOOL` 保存结构化快照且无 `document_id/build_id`，文档依然逐次执行 ACL/build 复核，工具来源不可冒充文档引用。
+- `QaService.submit_run()` 将新建问答规范化为 `mode=AGENT`、`executionMode=DURABLE`；历史旧运行按原模式读取，未排空的旧 REALTIME 分支保留，不能用新逻辑重放旧排队任务。
+- `app/qa/runtime.py` 当前在 Agent run 内进行完整轮次裁剪与硬上限检查；`AGENT_MODEL_CONTEXT_TOKENS` 默认按保守 8192 窗口估算，**不是供应商实际上下文容量保证**。跨提问前缀快照/压缩版本持久化、真实 KV cache 效益仍未完成/实测。
+
+详见[统一业务 Agent 规格](../docs/design/10-unified-business-agent-spec.md)与[当前实现状态](../docs/delivery/unified-business-agent-implementation-status.md)。
 
 ## 运行日志
 
@@ -59,7 +69,7 @@ Select-String -LiteralPath .runtime/demo/logs/backend.log -SimpleMatch '替换�
 ## 本地开发与运行
 
 已有 MySQL 数据库若 `job.kind` 约束尚未允许 `QA_RUN`，需先应用
-`docs/design/migrations/20260921_add_qa_run_job_kind.sql`；新数据库使用当前 `schema.sql`。
+`docs/design/migrations/20260921_add_qa_run_job_kind.sql`。部署 PR #14 的业务工具来源前，还需备份并执行 `docs/design/migrations/20261010_add_tool_run_sources.sql`；新数据库使用当前 `schema.sql`。旧程序回滚时不得删除已保存的 TOOL 快照，也不得恢复 source 列的非空约束。
 Embedding 批量由 `EMBEDDING_BATCH_SIZE` 控制，配置模板设为 20，以适配当前供应商上限。
 Docling 的页数限制为 400；实际处理能力仍取决于文档复杂度和容器内存。
 

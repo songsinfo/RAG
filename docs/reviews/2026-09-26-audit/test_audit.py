@@ -108,17 +108,34 @@ def test_agent_does_not_reuse_previous_segment(monkeypatch, tmp_path):
 
 
 def test_regular_rag_followup_receives_history(monkeypatch, tmp_path):
+    # 新建问答统一调用 chat_tools；原审计测试监听 chat 已不再覆盖生产路径。
     ingested(monkeypatch, tmp_path)
     conv = QaService.create_conversation(ACTOR, {})
-    submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus first question"})
+    first = submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus first question"})
+    assert QaService.get_run(ACTOR, first["runId"])["status"] in {"SUCCEEDED", "COMPLETED", "NO_EVIDENCE"}
     observed = []
-    real_chat = ModelGateway.chat
+    real_chat_tools = ModelGateway.chat_tools
+
     def capture(**kwargs):
-        observed.append(kwargs["messages"])
-        return real_chat(**kwargs)
-    monkeypatch.setattr(ModelGateway, "chat", capture)
-    submit_test_run(ACTOR, conv["conversationId"], {"question": "Milvus: what about its limitations?"})
-    assert "Milvus first question" in json.dumps(observed), observed
+        response = real_chat_tools(**kwargs)
+        observed.append({"messages": kwargs["messages"], "reply": response})
+        return response
+
+    monkeypatch.setattr(ModelGateway, "chat_tools", capture)
+    current_question = "Milvus: what about its limitations?"
+    second = submit_test_run(ACTOR, conv["conversationId"], {"question": current_question})
+    assert QaService.get_run(ACTOR, second["runId"])["status"] in {"SUCCEEDED", "COMPLETED", "NO_EVIDENCE"}
+    assert any(
+        any(m.get("role") == "user" and m.get("content") == "Milvus first question"
+            for m in call["messages"])
+        and any(m.get("role") == "user" and m.get("content") == current_question
+                for m in call["messages"])
+        for call in observed
+    ), observed
+    assert any(
+        tc.get("name") == "search_knowledge" and tc.get("args", {}).get("query") == current_question
+        for call in observed for tc in call["reply"].get("tool_calls", [])
+    ), observed
 
 
 def test_production_upsert_does_not_fill_mock_store(monkeypatch):

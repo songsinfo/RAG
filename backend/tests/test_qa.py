@@ -251,10 +251,10 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert run_resp.status_code == 202
     run_id = run_resp.json()["runId"]
     assert run_resp.json()["status"] == "QUEUED"
-    assert run_resp.json()["executionMode"] == "REALTIME"
-    # 普通问答只建 qa_run，不创建 QA_RUN durable job，不需要等待 Worker 抢占。
+    assert run_resp.json()["executionMode"] == "DURABLE"
+    # 统一 Agent 模式总是创建 QA_RUN durable job，由 Worker 处理。
     with app_db.get_db_connection() as conn:
-        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
+        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is not None
 
     # 第 3 步：重复提交相同幂等键，验证不会创建第二个 run。
     dup_resp = client.post(
@@ -265,7 +265,7 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert dup_resp.status_code == 202
     assert dup_resp.json()["runId"] == run_id
     assert dup_resp.json()["reused"] is True
-    assert dup_resp.json()["executionMode"] == "REALTIME"
+    assert dup_resp.json()["executionMode"] == "DURABLE"
 
     # 第 4 步：轮询直到 run 结束，确认最终 answer/evidence 已落库。
     run_data = None
@@ -296,7 +296,13 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert len(events) >= 3
     stages = [e["stage"] for e in events]
     assert "ROUTED" in stages
-    assert "RETRIEVING" in stages
+    # 统一 Agent 有单独的运行/模型/工具事件；检索阶段属于 search_knowledge 子图。
+    for name in ("AGENT_RUNTIME", "AGENT_MODEL", "AGENT_TOOL", "RAG_SCOPE", "RAG_FINAL_HITS",
+                 "ANSWER_VERIFIED", "FINISHED"):
+        assert name in stages, f"missing {name}: {stages}"
+    assert stages.index("AGENT_MODEL") < stages.index("RAG_SCOPE") < stages.index("AGENT_TOOL")
+    assert stages.index("RAG_FINAL_HITS") < stages.index("ANSWER_VERIFIED") < stages.index("FINISHED")
+    assert stages.count("FINISHED") == 1
     # 普通 RAG 实际经过 LangGraph 检索图，而非直接调用旧单体 Pipeline。
     for stage in (
         "RAG_SCOPE", "RAG_PREPARE_QUERY", "RAG_DENSE_RECALL",
@@ -307,13 +313,14 @@ def test_qa_run_lifecycle_and_evidence(client):
     stages_with_payload = {event["stage"]: event["payload"] for event in events}
     assert stages_with_payload["RAG_RRF_FUSION"]["hitCount"] >= len(run_data["evidence"])
     assert stages_with_payload["RAG_FINAL_HITS"]["hitCount"] == len(run_data["evidence"])
-    # 在线 RAG 继续无 QA_RUN job，避免用户提问等待 worker claim。
+    # 新在线问答都由 durable QA_RUN Job 调度，完成时 Job 必须收敛至终态。
     with app_db.get_db_connection() as conn:
-        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
+        job = conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first()
+        assert job is not None and job.status == "COMPLETED"
 
 
 @pytest.mark.parametrize("mode,evaluation_scope,execution_mode", [
-    ("RAG", None, "REALTIME"),
+    ("RAG", None, "DURABLE"),
     ("RAG", {"snapshotId": "review-snapshot"}, "DURABLE"),
     ("AGENT", None, "DURABLE"),
 ])

@@ -70,7 +70,7 @@ def submit_run(
 ):
     response.status_code = status.HTTP_202_ACCEPTED
     result = QaService.submit_run(actor, conversation_id, body, idempotency_key)
-    # 使用 Starlette 线程池在响应发送后立刻执行普通 RAG，避免同步阻塞请求。
+    # 新请求统一 Durable Agent，旧 REALTIME 代码仅供旧任务兼容。
     # 已有幂等结果不得再次调度，以免两个请求同时重复生成。
     from app.config import is_test_env
     if result.get("executionMode") == "REALTIME" and not result.get("reused") and not is_test_env():

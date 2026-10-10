@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-10-09，本导读同步 PR #13 的普通 RAG LangGraph 检索图改造；**PR 合并前，`main` 尚无此检索图**。本文解释所在分支的源码行为；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-10，本导读同步 **PR #14 的统一业务 Agent 开发分支**；本 PR 尚为草稿，未合并 main，部分上下文持久化及上线收缩验收未完成。本文解释所在分支的源码行为；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -10,14 +10,14 @@
 
 ## 1. 先认识项目，再确定阅读顺序
 
-这个项目是企业内部知识问答系统：先把文件转换为可检索内容，再在当前用户可读范围内检索，把证据交给模型，最后校验并展示带引用的答案。Agent 模式允许模型决定后续检索动作，评估模块则批量执行并检查这些流程。
+这个项目是企业内部知识问答系统：先把文件转换为可检索内容，再在当前用户可读范围内检索，把证据交给模型，最后校验并展示带引用的答案。统一 Agent 让模型决定是否调用知识检索或四个固定模拟业务工具；评估模块则批量执行并检查这些流程。
 
 | 组件 | 在本项目中的工作 | 源码入口 |
 | --- | --- | --- |
 | Vue 前端 | 上传、提问、SSE 阶段进度与轮询兜底、查看引用 | [Chat.vue](../frontend/src/Chat.vue)、[Documents.vue](../frontend/src/Documents.vue) |
 | FastAPI | HTTP 路由、认证依赖、CSRF、错误响应 | [main.py](../backend/app/main.py) |
 | MySQL | 用户权限、文档版本、生效构建、任务和运行记录 | [models.py](../backend/app/models.py)、[db.py](../backend/app/db.py) |
-| Worker | 从 MySQL 领取 INGEST/PURGE/EVALUATE/Agent/评估 RAG 等持久任务；在线普通 RAG 不经 Worker | [worker.py](../backend/app/runtime/worker.py) |
+| Worker | 从 MySQL 领取 INGEST/PURGE/EVALUATE/全部新问答的持久任务；旧 REALTIME RAG 仅作历史兼容 | [worker.py](../backend/app/runtime/worker.py) |
 | Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
 | LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
@@ -51,13 +51,13 @@ flowchart TD
     D --> E[CHILD 写入 Milvus]
     E --> F[MySQL 发布 active_build_id]
     Q[用户问题] --> R[持久化 qa_run]
-    R --> ROUTE{执行类型}
-    ROUTE -->|在线普通 RAG| DIRECT[HTTP 202 后 BackgroundTasks 立即执行]
-    ROUTE -->|Agent 或评估 RAG| DURABLE[同事务 QA_RUN job → Durable Worker]
+    R --> DURABLE[同事务 QA_RUN job → Durable Worker]
     F --> T[MySQL 筛选可读生效 build]
-    DIRECT --> T
-    DURABLE --> T
-    T --> U[检索：普通 RAG 走 LangGraph DAG<br/>Agent/Search API 复用 RetrievalPipeline 底层能力]
+    DURABLE --> AGENT[LangGraph Agent：模型选择工具]
+    AGENT -->|选择知识检索| T
+    T --> U[RagRetrievalGraph：ACL / Dense+BM25 / RRF / Rerank]
+    AGENT -->|选择模拟业务工具| MOCK[固定 fixture：TOOL 来源，mock=true]
+    MOCK --> V[证据 E1、E2 等]
     U --> V[证据 E1、E2 等]
     V --> W[模型输出 claims 和引用范围]
     W --> X[校验并渲染 answer]
@@ -100,7 +100,7 @@ app.include_router(eval_router, prefix="/api/v1")
 
 `lifespan()` 检查数据库，初始化种子数据并处理未完成任务恢复；非测试环境且启用内嵌 Worker 时，启动三组工作线程：
 
-- `qa` 领取 Agent 和评估 RAG 的 `QA_RUN`，不领取在线普通 RAG。
+- `qa` 领取所有新在线问答和新完整问答评估的 `QA_RUN`，旧 REALTIME 运行仅保留兼容执行代码。
 - `ingest` 领取 `INGEST / PURGE`。
 - `eval` 领取 `EVALUATE`。
 
@@ -125,7 +125,7 @@ class Actor:
 
 ### 3.3 为什么请求返回了，任务还没完成
 
-不同任务采用不同执行通道：文档入库、评估主任务、Agent 和评估 RAG 写入 MySQL Job，由 Worker 执行；**在线普通 RAG 只写入 `qa_run`，HTTP 202 响应发送后由 FastAPI `BackgroundTasks` 立即启动**，不排队等待 Job Worker。HTTP 202 只表示请求已接收，均不意味着答案生成完成。
+文档入库、评估主任务及**所有新在线问答**均写 MySQL Job，由 Worker 执行；新问答先同事务写 `qa_run + QA_RUN Job`，HTTP 202 只表示提交，不表示已生成答案。HTTP 202 只表示请求已接收，均不意味着答案生成完成。
 
 在 [worker.py](../backend/app/runtime/worker.py) 按下面顺序读：
 
@@ -240,12 +240,13 @@ child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
 
 ### 5.1 先读短函数，再读底层实现
 
-**先区分入口**：普通问答及 RAG 评估（`mode=RAG`）进入 [rag_graph.py](../backend/app/retrieval/rag_graph.py) 的 `RagRetrievalGraph.retrieve()`，由 LangGraph 编排检索；Agent 的 `search_knowledge`、独立 Search API 和纯检索评估仍调用 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`。这些入口复用同一套 Milvus、RRF、Reranker、MMR、Parent、权限与来源工具。
+**先区分入口**：新完整问答走 `LangGraphAgent`；Agent 选择 `search_knowledge` 才调用 [rag_graph.py](../backend/app/retrieval/rag_graph.py) 的 `RagRetrievalGraph.retrieve()`。独立 Search API 和纯检索评估仍调用 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`。旧 `mode=RAG` 在线代码暂保留供历史任务兼容，不再承接新请求。这些入口复用同一套 Milvus、RRF、Reranker、MMR、Parent、权限与来源工具。
 
 普通 RAG 检索图的实际节点顺序如下（Dense / BM25 并行完成，再汇入 RRF）：
 
 ```text
-QaService._execute_run(mode=RAG)
+QaService._execute_run(mode=AGENT)
+  → LangGraphAgent._tools_step(search_knowledge)
   → RagRetrievalGraph.retrieve()
   → resolve_scope：config + evaluation_scope + ACL + active_build_id
        ├─ 无可读 build → no_scope → END (hits=[])
@@ -259,7 +260,7 @@ QaService._execute_run(mode=RAG)
                          → END (hits / warnings / config / allowedBuildCount)
 ```
 
-Agent / Search API / RETRIEVAL_* 评估继续使用原单体检索函数，函数内部的步骤为：
+独立 Search API / RETRIEVAL_* 纯检索评估继续使用原单体检索函数，函数内部的步骤为：
 
 ```text
 RetrievalPipeline.retrieve(actor, query, kb_ids, document_ids, config_id, run_id, history)
@@ -281,7 +282,7 @@ RetrievalPipeline.retrieve(actor, query, kb_ids, document_ids, config_id, run_id
   → 返回 hits / warnings / config / allowedBuildCount
 ```
 
-**图的执行边界**：本次只编排检索阶段，生成答案、Claims/Judge 验证与最终 `qa_run` 提交依旧在 `QaService`。普通 RAG 图不启用 Checkpointer；在线请求仍在 FastAPI `BackgroundTasks` 中执行，进程异常时不会自动从 `rrf_fusion` 或 `rerank` 节点继续。RAG 评估仍走现有 `QA_RUN` Worker，但暂未获得检索图的节点级恢复能力。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+**图的执行边界**：内层检索图只返回证据，外层 Agent 负责模型、工具调用和最终回答，`QaService` 负责 Judge/提交。检索子图不启用 Checkpointer，即使外层 Agent 有 Durable Job，也不能从内部 `rrf_fusion` 或 `rerank` 节点恢复。RAG 评估仍走现有 `QA_RUN` Worker，但暂未获得检索图的节点级恢复能力。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
 
 ### 5.2 权限过滤先于检索
 
@@ -333,139 +334,38 @@ text           = 后续用于上下文的文本
 
 **对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()` 校验普通 RAG 检索图各阶段事件与实时执行契约；[test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`、[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()` 校验仍被 Agent / Search API 等入口复用的原检索组件。
 
-## 6. 普通 RAG：证据如何变成用户看到的答案
+## 6. 统一问答：工具证据如何变成用户答案
 
-### 6.1 前端提交与后端接收
-
-从 [Chat.vue](../frontend/src/Chat.vue) 的 `submit()` 和 `watchRun()` 开始：前端拿到 run ID 后，使用 `EventSource` 订阅 GET `/runs/{id}/events`，收到阶段事件更新进度；`done` 后调用 GET `/runs/{id}` 获取最终答案，SSE 不可用或出错时退回 `poll()`。**这只是阶段 SSE，不是模型逐 Token 流式生成**；完整的结构化 JSON 必须先经引用和可选 strict Judge 校验。
+**PR #14 的新运行路径**：
 
 ```text
-Chat.vue::submit()
-  → POST /api/v1/conversations/{id}/runs
-  → qa/router.py::submit_run()
+Chat.vue::submit()（不再发送 mode）
   → QaService.submit_run()
-      → 输入检查、会话归属、上下文分段、幂等与并发检查
-      → 写 qa_run(QUEUED)，在线 RAG 不写 job
-      → 返回 HTTP 202 / runId / executionMode=REALTIME
-  → FastAPI BackgroundTasks(QaService.execute_queued_run)
-  → QaService._execute_run()
-      → RagRetrievalGraph.retrieve()：检索阶段 LangGraph DAG
-      → Evidence 固化 → ModelGateway 生成 → Claims/Judge 校验
-      → 写 run_event 阶段事件，最终保存已验证答案
-  → 前端 EventSource /runs/{id}/events → done 后 GET /runs/{id}
-
-Agent / 评估 RAG：submit_run 同事务写 qa_run + job(QA_RUN)
-  → DurableJobWorker._run_qa()
-  → QaService.execute_queued_run(job_id, lease_epoch) → _execute_run()
+  → qa_run(mode=AGENT) + QA_RUN Job
+  → DurableJobWorker → QaService._execute_run()
+  → LangGraphAgent.run() → model / tools 循环
+      ├─ search_knowledge → RagRetrievalGraph.retrieve()
+      ├─ read_section → 章节内容与文档 ACL
+      └─ diagnose_coupon / get_final_price_rules /
+         diagnose_product_group / diagnose_subsidy → 固定模拟 fixture
+  → 注册 DOCUMENT 或 TOOL evidence（E1、E2 …）
+  → validate_claims(evidence_map) → 可选 strict Judge
+  → _finalize_run() → SSE 阶段事件与 GET /runs/{runId}
 ```
 
-主要文件：[qa/router.py](../backend/app/qa/router.py)、[qa/service.py](../backend/app/qa/service.py)、[rag_graph.py](../backend/app/retrieval/rag_graph.py)。在长文件中先按函数名搜索，不要从所有会话管理接口开始逐行阅读。
+`DOCUMENT` 证据包含文档/build、原文、source unit / location；`TOOL` 证据包含 `toolName`、`queryObjects`、`queriedAt`、`fixtureVersion`、`mock` 和固定结果快照，不创建假 `documentId/buildId`。两者都使用本次运行的 `evidenceId` 与 Unicode 字符半开范围做结构校验。文档读取继续 ACL/build 复核；TOOL 快照只表示本地演示，未查询真实系统。
 
-`conversation` 表示会话，`context_segment` 是会话范围上下文，`qa_run` 始终记录一次问题执行；**只有 Agent、评估 RAG 会同时拥有驱动执行的 `QA_RUN` Job**。在线普通 RAG 的 `qa_run` 没有对应 Job。两种通道复用同一问答核心和最终验证。
+**示例（合成数据，并非实际查询）：**调用 `diagnose_coupon(user_id="u-demo",coupon_id="c-demo")` 会得到“参与金额 168 元、门槛 200 元、排除商品 70 元”的固定演示结论。无参数的 `get_final_price_rules()` 给出“先活动优惠、再券、再补贴、价格最低为零”的演示规则，示例到手价 `200-20-30-10=140` 元。
 
-### 6.2 `_execute_run()` 的九步主线
+页面展示后端确定的“**模拟结果，未查询真实业务系统**”，并区分文档来源与工具来源。模型没有引用到真实取得的 Evidence 或引用偏移错误时，应失败关闭，而不是生成无依据答案。严格 Judge 判断本次证据是否支持断言，不证明演示业务结果真实。
 
-| 顺序 | 代码位置或调用 | 本例发生什么 |
-| --- | --- | --- |
-| 1 | `classify_question()` | 本例归为知识问答 |
-| 2 | 读取 segment 范围 | 确定知识库范围 |
-| 3 | `RagRetrievalGraph.retrieve()` | 通过 Scope、Dense/BM25、RRF、重排、Parent、上下文预算取得 hit |
-| 4 | 创建 evidence / evidence_map | 为正文分配 E1 等编号 |
-| 5 | 写 `run_source` | 记录本次运行依赖的文档与来源 |
-| 6 | `ModelGateway.chat()` | 将问题与 evidence 交给 chat-main |
-| 7 | `validate_claims()` | 核对结构、引用编号和区间 |
-| 8 | `_verify_answer()` 与 `validate_output()` | 统一严格验证、输出规则检查 |
-| 9 | `_finalize_run()` | 保存结果及任务终态 |
+**历史/结果注意：**`qa_run` 保存执行状态，`result_json.status` 表示业务回答状态；`get_run()` 会合并这两种信息，因此同一响应的 `status` 不一定等于数据库运行状态。历史文档仍按权限复核；跨提问稳定前缀与上下文快照版本尚未完成，不能称为完整的跨 run KV cache 优化。
 
-问题路由见 [question_router.py](../backend/app/qa/question_router.py)：当前是正则规则。问候语和少数不支持请求返回固定文本，不需要检索和模型；其余默认进入知识问答。
-
-如果检索无命中，直接构造 `NO_EVIDENCE` 业务结果：“当前可访问资料不足以回答。”这不是模型凭记忆尝试回答。
-
-### 6.3 hit → evidence：哪些材料真正交给模型
-
-核心节选：
-
-```python
-eid = f"E{idx}"
-evidence.append(ev_item)
-evidence_map[eid] = h["text"]
-```
-
-`ev_item` 保存 evidenceId、文档/版本/build/chunk、位置、文本和分数；`evidence_map` 是编号到文本的映射，供后续引用校验。
-
-随后构造模型输入：
-
-```python
-messages = [
-    {"role": "system", "content": INSTRUCTION},
-    *history,
-    {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
-]
-```
-
-本例的 user 内容是“问题 + 本次证据”，生成 messages 还包含 `_rag_history()` 取得的授权历史。历史只取当前 segment 中最多四条较早的成功运行，并受问题与答案合计 4000 字符限制，不是整个会话。历史来源会重新检查权限；评测运行还检查快照范围和生效 Build，并登记依赖供模型外发前复核。相同 `history` 也传给检索流水线，配置允许时用于 Rewrite。
-
-实际材料大小受检索条数、父块长度、`context_max_bytes` 和历史字符预算等限制。检索上下文使用 UTF-8 字节预算，不是设计文档中的完整 token 级装箱流程；Agent 的消息裁剪则另有 token 预算。
-
-### 6.4 模型输出 → claims → answer
-
-打开 [claim_validator.py](../backend/app/qa/claim_validator.py)，先看 `INSTRUCTION`，再读 `validate_claims()`。模型被要求输出结构化对象，而不是自行提供 `answer` 自由文本。
-
-为了直观看引用区间，假设某次证据 `E1` 只有“检查幂等键”五个字，一个合法形状的教学输出是：
-
-```json
-{
-  "status": "COMPLETED",
-  "claims": [{
-    "id": "C1",
-    "text": "重试前需要检查幂等键。",
-    "evidence": [{"evidenceId": "E1", "start": 0, "end": 5}]
-  }],
-  "gaps": [],
-  "conflicts": []
-}
-```
-
-区间为 Unicode code point 半开区间 `[start, end)`，在 Python 中对应 `text[start:end]`。真实本例若 evidence 是完整父块，偏移必须按那个实际文本计算，不能复用上述 0..5。
-
-`validate_claims()` 检查允许字段、状态、claims 数量、claim ID、引用编号、引用格式和冲突对，并渲染：
-
-```python
-rendered_claims.append(f"{text} [{', '.join(ev_labels)}]")
-```
-
-最终用户看到的文本类似“重试前需要检查幂等键。 [E1]”。真实问题要求三项事实，仅给出这一项不代表内容完整，即使结构校验通过。
-
-**注意当前代码的实际行为：** 引用编号不存在、证据正文为空、区间非整数、负起点、倒置或超出正文长度，都会以 `INVALID_MODEL_EVIDENCE` 拒绝；不再把错误区间扩成整条 evidence。结构通过只表示格式与来源约束通过，不证明证据在语义上支持断言。
-
-### 6.5 模型网关做什么
-
-顺着 `ModelGateway.chat()` 到 [model_clients.py](../backend/app/qa/model_clients.py) 的 `get_chat_model()`，可以看到 LangChain 消息适配与模型客户端。网关使用内部别名调用 LiteLLM，记录 `model_call`，并使用运行策略进行有限重试。
-
-如果没有真实网关配置，测试环境可以走可控替身；非测试环境会返回网关不可用，不能把单元测试的生成文本当成真实模型效果。Embedding 仍有独立的 `get_embeddings()` HTTP 路径，但当前每个批次也执行预算预留、运行/任务检查及 `model_call` 记录；缺少实际 usage 时标记 `UNKNOWN`。记录调用不等于已经完成供应商账单对账或验证绝对硬预算。
-
-### 6.6 保存状态与读取结果不是同一件事
-
-`_finalize_run()` 保存数据库运行状态和 `result_json`。成功执行的数据库状态可为 `SUCCEEDED`，而 `result_json.status` 可为 `COMPLETED / PARTIAL / NO_EVIDENCE / CONFLICT` 等业务状态。
-
-在 `get_run()` 中：
-
-```python
-if r.result_json:
-    base.update(r.result_json)
-```
-
-因此对外响应中的 `status` 可能被业务结果覆盖。调试时应一起查看数据库运行状态、`terminalReason` 和响应内容，不能把所有 `status` 当成同一层枚举。
-
-`get_run()` 还检查来源当前是否可读，不可读则返回 `visibility=HIDDEN`；对旧 build 的 evidence 增加 `isCurrent`。历史答案不会因为过去生成过就永远可展示。
-
-**对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()`、`test_qa_no_evidence_handling()`、`test_claim_validator_logic()`。
-
-## 7. Agent 与评估：在普通 RAG 主线上的扩展
+## 7. Agent 与评估：统一问答主线
 
 ### 7.1 Agent 增加了什么决策
 
-普通 RAG 由程序按配置执行检索流水线再生成，其中可包含多个查询变体和召回路线；Agent 让模型根据已有信息选择工具、检索内容和停止时机。它不是把普通 RAG 固定重复若干次。
+当前新问答统一使用 Agent：模型可决定检索、调用固定模拟业务工具，或在已有证据足够时结束。检索图负责召回与重排，不把固定知识检索硬编码为每次问答必经步骤。
 
 在 `_execute_run()` 的 `mode == "AGENT"` 分支进入 [agent.py](../backend/app/qa/agent.py) 的 `LangGraphAgent.run()`。按这个顺序阅读：
 
@@ -495,12 +395,16 @@ builder.add_edge("tools", "model")
 
 `AgentState` 保存 messages、round、tool_calls_count、repeated_calls、evidence、evidence_map、warnings 和 final_answer。`AgentContext` 保存身份、run ID、配置、截止时间和回调。前者是循环中的变化状态，后者提供运行依赖。
 
-### 7.2 两个工具与本例轨迹
+### 7.2 六个工具与本例轨迹
 
 | 工具 | 实现路径 | 作用 |
 | --- | --- | --- |
-| `search_knowledge` | `_tools_step()` → `RetrievalPipeline.retrieve()` | 在授权范围检索并登记证据 |
+| `search_knowledge` | `_tools_step()` → `RagRetrievalGraph.retrieve()` | 在授权范围检索并登记 DOCUMENT 证据 |
 | `read_section` | `_tools_step()` → `_read_section()` | 读取指定文档/build/source unit 的内容 |
+| `diagnose_coupon` | `_tools_step()` → `execute_business_tool()` | 根据明确 user_id/coupon_id 返回固定模拟不可用说明 |
+| `get_final_price_rules` | 同上 | 无参数的模拟到手价规则 |
+| `diagnose_product_group` | 同上 | 根据 user_id/product_group_id 返回模拟未出品原因 |
+| `diagnose_subsidy` | 同上 | 根据 user_id/activity_id 返回模拟未命中原因 |
 
 教学轨迹可能是：
 
@@ -524,9 +428,9 @@ builder.add_edge("tools", "model")
 
 需要审批的工具通过 LangGraph `interrupt()` 暂停；`JobCheckpointSaver` 将图状态持久化到任务相关存储。审批接口进入 `QaService.resolve_tool_approval()`，随后 `queue_resume()` 安排恢复。理解普通 model/tools 循环后，再读 [job_checkpointer.py](../backend/app/qa/job_checkpointer.py)，不必第一遍就深入 checkpoint 序列化。
 
-### 7.4 普通 RAG 与 Agent 共用严格验证
+### 7.4 统一 Agent 的严格验证
 
-普通 RAG 在 `validate_claims()` 后、Agent 在 `LangGraphAgent.run()` 返回后，都由 [service.py](../backend/app/qa/service.py) 的 `_verify_answer()` 执行同一验证合同。默认标记 `verification=STRUCTURAL_ONLY`；只有 strict 开启且存在 claims，才额外调用 `judge-main` 做逐 Claim 支持性判定。无 claims 时不会调用严格裁判，也不会因此标为 `SUPPORTED`。
+新运行由 `LangGraphAgent.run()` 产生结构化结果，随后由 [service.py](../backend/app/qa/service.py) 的 `_verify_answer()` 执行严格验证；旧 RAG 代码为历史兼容保留。默认标记 `verification=STRUCTURAL_ONLY`；只有 strict 开启且存在 claims，才额外调用 `judge-main` 做逐 Claim 支持性判定。无 claims 时不会调用严格裁判，也不会因此标为 `SUPPORTED`。
 
 `_validate_strict_verdicts()` 要求返回 verdicts 列表完整覆盖全部 claim ID、每个 ID 恰好一次且状态全部为 `SUPPORTED`。存在 claims 时，空列表、漏判、重复 ID、未知 ID、`UNSUPPORTED` 或 `UNCERTAIN` 都会以 `VERIFICATION_FAILED` 拒绝；校验通过后还会复核来源权限，再标记 `verification=SUPPORTED`。模型裁判可能判断错误，这个标记不是正确性的证明。
 
@@ -575,7 +479,7 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 
 **权限不是只在入口检查一次。** 入口认身份，检索前限制 build，外发前检查候选，读取历史时检查来源。这些调用散落在多个文件，但沿同一份证据追踪就能理解各自目的。
 
-**任务重试不等于任意重放。** 入库重试会清理未发布 build 的部分产物并重建；有 Durable Job 的 QA（Agent、评估 RAG）通过 `qa_execution_scope()` 和 `qa_lease_is_current()` 进行 lease fencing，Agent 还能通过 checkpoint 恢复；在线 RAG 没有 Job Lease，进程中断后启动恢复将遗留 run 标为 `FAILED / PROCESS_RESTARTED`，不自动重放。租约过期时旧执行者不能继续发布，但这些机制也不意味着模型外部调用已获得全局 exactly-once 保证。
+**任务重试不等于任意重放。** 入库重试会清理未发布 build 的部分产物并重建；新建 QA（统一 Agent）通过 `qa_execution_scope()` 和 `qa_lease_is_current()` 进行 lease fencing，Agent 还能通过 checkpoint 恢复；只有旧 REALTIME 记录还需按原执行/恢复语义处理，不能静默换成 Agent 重放。租约过期时旧执行者不能继续发布，但这些机制也不意味着模型外部调用已获得全局 exactly-once 保证。
 
 **业务终态与工程成功分开看。** 无证据是业务结果，网关不可用是执行故障，格式正确是结构检查通过，答案正确则需要语义或人工评价。
 
@@ -586,8 +490,8 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 | 上传返回了但搜不到 | job 状态 → source_unit/chunk → build READY → active_build_id → ACL → 索引 |
 | 检索命中但答非所问 | hit.text → evidence → 模型 messages → claims → 金标准事实 |
 | 子块命中，引用却显示一大段 | `_expand_parents()`、matchedText、parentChunkId |
-| 在线普通 RAG 没有继续执行 | `qa_run.status/stage` → API BackgroundTasks → `run_event` → `PROCESS_RESTARTED` / cancel / 模型服务；不必检查 QA_RUN Job |
-| Agent / 评估 RAG 没有继续执行 | `QA_RUN` Job → Worker kinds、任务租约、cancel、WAITING_APPROVAL、runtime 限制 |
+| 新建问答没有继续执行 | `QA_RUN` Job → Worker / Lease → LangGraph checkpoint → Cancel / 模型服务 |
+| 旧 REALTIME RAG 运行未完成 | 核对旧 `qa_run.mode`、任务清点及历史恢复兼容代码，不能按 Agent 语义恢复 |
 | 数据库是 SUCCEEDED，接口是 PARTIAL | `result_json.status` 与 `get_run()` 的合并 |
 | 以前能读的答案现在隐藏 | `get_run()` → `_all_sources()` → `can_read_document()` |
 | 评估成功率很高但大量题没审核 | judgedCases、judgmentCoverage、最新人工标签 |
@@ -624,7 +528,7 @@ try {
 if ($LASTEXITCODE -ne 0) { throw '检索与问答测试失败' }
 ```
 
-普通 RAG 的断点按顺序放在 `RagRetrievalGraph._resolve_scope()`、`_dense_recall()` / `_bm25_recall()`、`_rrf_fusion()`、`_rerank()`、`_context_budget()`，然后追到 `QaService._execute_run()` 中生成前及 `validate_claims()`。观察 `allowed_build_ids`、`dense_routes` / `sparse_routes`、`hits`、`evidence_map` 和最终 `messages`。Agent / Search API 的旧检索路径仍可在 `RetrievalPipeline.retrieve()` 设置断点。
+统一 Agent 的 `search_knowledge` 工具调用后，检索图断点按顺序放在 `RagRetrievalGraph._resolve_scope()`、`_dense_recall()` / `_bm25_recall()`、`_rrf_fusion()`、`_rerank()`、`_context_budget()`，然后追到 `QaService._execute_run()` 中生成前及 `validate_claims()`。观察 `allowed_build_ids`、`dense_routes` / `sparse_routes`、`hits`、`evidence_map` 和最终 `messages`。独立 Search API 与纯检索评测路径仍可在 `RetrievalPipeline.retrieve()` 设置断点。
 
 运行 pytest 命令本身不会自动启用 IDE 断点；若用命令行交互调试，可在命令中加 `--trace` 从测试入口进入，或用 IDE 的 pytest 调试配置启动。
 
@@ -643,7 +547,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 尝试不看文档回答这些问题，然后回到对应函数验证：
 
-1. 为什么上传成功还要等待 job，但在线普通 RAG 不进入 job？为什么要同时有 version 和 build？
+1. 为什么文档入库和新建问答都进入 Durable Job？为什么要同时有 version 和 build？
 2. 为什么只索引 CHILD，模型却可能看到 PARENT？
 3. 文档撤权后，Milvus 里还有向量为什么也不应该被使用？
 4. E1 是在哪里产生的？怎样追到 source_unit？
@@ -659,6 +563,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 推荐顺序是：[README 总览](../README.md) → 本源码导读 → [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
-本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；普通 RAG 与 Agent 共用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。
+本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；统一 Agent 使用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。
 
 文档核对不代替真实依赖端到端运行。后续修改代码时，应一起检查这里的函数链、数据字段和分支说明是否仍然成立。
