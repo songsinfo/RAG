@@ -237,6 +237,7 @@ class LangGraphAgent:
             from app.qa.segment_context import load_segment_context
             with get_db_connection() as conn:
                 _, segment_context_meta = load_segment_context(conn, actor, segment_id, run_id)
+                conn.commit()
             business_state = state_from_messages(
                 [*memory, {"role": "user", "content": question}],
                 segment_context_meta.get("businessState"), source_run_id=run_id,

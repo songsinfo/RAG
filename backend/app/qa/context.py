@@ -76,6 +76,7 @@ def conversation_memory(actor, conversation_id, current_run_id, max_turns=4):
     from app.qa.segment_context import load_segment_context
     with get_db_connection() as conn:
         messages, meta = load_segment_context(conn, actor, str(segment_id), current_run_id)
+        conn.commit()
     if meta["source"] == "PERSISTED":
         return messages
     return QaService._rag_history(actor, str(segment_id), current_run_id)
