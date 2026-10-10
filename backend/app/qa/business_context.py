@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from app.errors import ApiException
+
 FIELDS = ("user_id", "coupon_id", "product_group_id", "activity_id")
 LABELS = {
     "user_id": r"(?:user(?:[_\s-]?id)?|用户(?:ID|id)?)",
@@ -43,6 +45,32 @@ def has_business_context(state: Optional[Dict[str, Any]]) -> bool:
     return bool(normalized["objects"] or normalized["pending"] or normalized["evidenceRefs"])
 
 
+def _evidence_ref_key(item: Dict[str, Any]):
+    """Evidence IDs are scoped to the original run, not to the new run."""
+    run_id, evidence_id = str(item.get("sourceRunId") or ""), str(item.get("evidenceId") or "")
+    if run_id and evidence_id:
+        return ("run_evidence", run_id, evidence_id)
+    return (
+        "legacy_evidence", run_id, evidence_id, str(item.get("toolName") or ""),
+        json.dumps(item.get("queryObjects") or {}, ensure_ascii=False, sort_keys=True),
+        str(item.get("queriedAt") or ""),
+    )
+
+
+def _dedupe_evidence_refs(refs):
+    """The earliest original snapshot wins; a replay never refreshes its timestamp."""
+    out, seen = [], set()
+    for ref in refs:
+        if not isinstance(ref, dict) or ref.get("mock") is not True:
+            continue
+        key = _evidence_ref_key(ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(copy.deepcopy(ref))
+    return out[-8:]
+
+
 def empty_business_state() -> Dict[str, Any]:
     return {"version": 1, "objects": {}, "pending": [], "evidenceRefs": []}
 
@@ -63,8 +91,7 @@ def normalize_business_state(source: Optional[Dict[str, Any]]) -> Dict[str, Any]
                 }
     state["pending"] = [x[:300] for x in source.get("pending", [])
                         if isinstance(x, str) and x][:8]
-    state["evidenceRefs"] = [copy.deepcopy(x) for x in source.get("evidenceRefs", [])[-8:]
-                             if isinstance(x, dict) and x.get("mock") is True]
+    state["evidenceRefs"] = _dedupe_evidence_refs(source.get("evidenceRefs") or [])
     return state
 
 
@@ -110,6 +137,20 @@ def update_from_tool(
     objects = payload.get("queryObjects") or {}
     if not isinstance(objects, dict) or any(k not in FIELDS for k in objects):
         return updated
+    # Existing ToolMessages are scanned again on each model step. Ignore exact
+    # replays before mutating object bindings or re-appending their sources.
+    if evidence_id:
+        candidate = {
+            "sourceRunId": source_run_id, "evidenceId": evidence_id,
+            "toolName": tool_name, "queryObjects": objects,
+            "queriedAt": payload.get("queriedAt"),
+        }
+        key = _evidence_ref_key(candidate)
+        for prior in updated["evidenceRefs"]:
+            if _evidence_ref_key(prior) == key:
+                if prior.get("toolName") != tool_name or prior.get("queryObjects") != objects:
+                    raise ApiException(409, "SOURCE_CHANGED", "同一证据 ID 的业务对象不一致")
+                return updated
     if "user_id" in objects:
         previous = updated["objects"].get("user_id", {}).get("value")
         if previous and previous != objects["user_id"]:
@@ -130,7 +171,7 @@ def update_from_tool(
             "fixtureVersion": payload.get("fixtureVersion"), "mock": True,
             "historical": True,
         })
-        updated["evidenceRefs"] = updated["evidenceRefs"][-8:]
+        updated["evidenceRefs"] = _dedupe_evidence_refs(updated["evidenceRefs"])
     return updated
 
 

@@ -264,3 +264,72 @@ def test_compaction_rejects_ambiguous_business_ids_without_guessing():
     ], state)
     assert "user_id" not in changed["objects"]
     assert any("user_id" in p for p in changed["pending"])
+
+
+def test_tool_evidence_ref_replay_is_idempotent_across_context_cycles():
+    """Repeated E1 ToolMessage must not grow evidenceRefs or refresh queriedAt."""
+    from app.qa.business_context import state_from_messages, state_message
+    from app.qa.runtime import compact_messages
+    payload = {
+        "status": "OK", "mock": True, "queryObjects": {"user_id": "U123", "coupon_id": "C456"},
+        "queriedAt": "2026-10-10T00:00:00+00:00", "fixtureVersion": "business-demo-v1",
+        "evidence": [{"evidenceId": "E1", "toolName": "diagnose_coupon"}],
+    }
+    messages = [
+        {"role": "system", "content": "Stable system"},
+        {"role": "user", "content": "user U123 coupon C456"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call-1", "name": "diagnose_coupon",
+             "args": {"user_id": "U123", "coupon_id": "C456"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": json.dumps(payload)},
+    ]
+    state = state_from_messages(messages, source_run_id="run-1")
+    assert len(state["evidenceRefs"]) == 1
+    assert state["evidenceRefs"][0]["queriedAt"] == payload["queriedAt"]
+    for _ in range(6):
+        replayed = state_from_messages(messages, state, source_run_id="run-1")
+        assert replayed == state
+        state = replayed
+        same_messages, info = compact_messages(messages, 5000, state, source_run_id="run-1")
+        assert same_messages == messages
+        assert info["businessState"] == state
+        assert state_message(info["businessState"]) == state_message(state)
+
+
+def test_source_evidence_ids_are_scoped_to_original_run():
+    from app.qa.business_context import update_from_tool
+    payload = {
+        "status": "OK", "mock": True, "queryObjects": {"user_id": "U123"},
+        "queriedAt": "2026-10-10T00:00:00+00:00",
+    }
+    state = update_from_tool({}, "diagnose_subsidy", payload, source_run_id="old-1", evidence_id="E1")
+    state = update_from_tool(state, "diagnose_subsidy", payload, source_run_id="old-2", evidence_id="E1")
+    assert len(state["evidenceRefs"]) == 2
+    assert {r["sourceRunId"] for r in state["evidenceRefs"]} == {"old-1", "old-2"}
+
+
+def test_tool_replay_rejects_same_evidence_id_with_changed_object():
+    from app.qa.business_context import update_from_tool
+    initial = {
+        "status": "OK", "mock": True, "queryObjects": {"user_id": "U123"},
+        "queriedAt": "2026-10-10T00:00:00+00:00",
+    }
+    state = update_from_tool({}, "diagnose_subsidy", initial, source_run_id="run-1", evidence_id="E1")
+    altered = {**initial, "queryObjects": {"user_id": "U999"}}
+    with pytest.raises(ApiException) as exc:
+        update_from_tool(state, "diagnose_subsidy", altered, source_run_id="run-1", evidence_id="E1")
+    assert exc.value.code == "SOURCE_CHANGED"
+
+
+def test_old_checkpoint_normalization_removes_repeated_refs():
+    from app.qa.business_context import normalize_business_state
+    source = {
+        "sourceRunId": "run-1", "evidenceId": "E1", "toolName": "diagnose_coupon",
+        "queryObjects": {"user_id": "U123"}, "mock": True,
+        "queriedAt": "2026-10-10T00:00:00+00:00",
+    }
+    normalized = normalize_business_state({
+        "version": 1, "objects": {}, "pending": [],
+        "evidenceRefs": [source for _ in range(12)],
+    })
+    assert normalized["evidenceRefs"] == [source]

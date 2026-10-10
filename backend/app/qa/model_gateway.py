@@ -515,7 +515,13 @@ class ModelGateway:
         cls._record_call(tenant_id, call_id, run_id, purpose, "SUCCESS", 30, 30, model_alias, job_id=job_id)
         has_tool_response = any(m.get("role") == "tool" for m in messages)
         if not has_tool_response:
-            user_msg = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+            # The earlier history precedes the current question. Select the
+            # last real user turn, never the first historical message/snapshot.
+            user_msg = next(
+                (m.get("content", "") for m in reversed(messages)
+                 if m.get("role") == "user" and m.get("kind") != "context_snapshot"),
+                "",
+            )
             return {
                 "role": "assistant",
                 "content": "",
