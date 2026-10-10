@@ -232,6 +232,15 @@ class LangGraphAgent:
         else:
             # 新运行只注入授权后的历史；历史内容被明确标记为“不可信数据”。
             memory = cls._conversation_memory(actor, conversation_id, run_id)
+            # Structured state is versioned per segment, separate from the old
+            # run's evidence IDs. It is never treated as fresh tool evidence.
+            from app.qa.segment_context import load_segment_context
+            with get_db_connection() as conn:
+                _, segment_context_meta = load_segment_context(conn, actor, segment_id, run_id)
+            business_state = state_from_messages(
+                [*memory, {"role": "user", "content": question}],
+                segment_context_meta.get("businessState"), source_run_id=run_id,
+            )
             graph_input = {
                 "messages": [
                     {
@@ -245,7 +254,7 @@ class LangGraphAgent:
                     *memory,
                     {"role": "user", "content": question},
                 ],
-                "business_state": state_from_messages([*memory, {"role": "user", "content": question}], source_run_id=run_id),
+                "business_state": business_state,
                 "round": 0,
                 "tool_calls_count": 0,
                 "repeated_calls": {},

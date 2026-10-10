@@ -87,7 +87,7 @@ def append_completed_turn(conn, tenant_id: str, run_id: str, result: Dict[str, A
     if int(segment.context_through_turn or 0) >= int(run.turn_no):
         raise ApiException(409, "VERSION_CONFLICT", "上下文版本已被后续问答推进")
     previous = segment.context_payload if isinstance(segment.context_payload, dict) else {}
-    messages = [dict(m) for m in previous.get("messages", [])]
+    messages = [dict(m) for m in previous.get("messages", []) if m.get("kind") != "context_snapshot"]
     state = normalize_business_state(previous.get("businessState"))
     answer = str(result.get("answer") or "")[:4000]
     user = str(run.question or "")[:2000]
