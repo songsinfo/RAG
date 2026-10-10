@@ -33,3 +33,10 @@
 - 复核 P1：集中压缩前从显式用户参数及已执行的模拟工具中抽取有来源的对象状态；压缩保留当前完整 tool call 组，模型循环与工具节点通过 `AgentState.business_state` 传递状态，使用现有 LangGraph checkpoint 持久化。跨 run 历史初始化暂仍受 `_rag_history` 最近四轮/字符预算限制，**不宣称 T08 全量完成**。
 - 复核 P2：`normalize_provider_usage()` 在共用记账处识别 `input_token_details.cache_read`、顶层缓存字段及 `prompt_tokens_details.cached_tokens`；保留真实 0，缺失记 null；主模型与 fallback 共用。
 - 修复旧 `RETRIEVING` 阶段断言，验证 `AGENT_RUNTIME`、`AGENT_MODEL`、`AGENT_TOOL`、`RAG_SCOPE` 和 `RAG_FINAL_HITS` 及 Durable Job 状态；仍需以最新 CI 为准。
+
+## 2026-10-10 第二轮复查：历史证据幂等和审计测试
+
+- `business_context.py` 按原始 `sourceRunId/evidenceId` 去重工具证据引用。重复扫描 LangGraph 工具消息不会重复写入同一来源或更新最初查询时间；同一 ID 与不同工具/对象冲突时按 `SOURCE_CHANGED` 拒绝。
+- 回归测试覆盖连续 `state_from_messages` / `compact_messages` 重放、跨 run 同名 E1、旧 checkpoint 重复引用及冲突来源。
+- 旧审计测试已迁移至统一 Agent 的 `ModelGateway.chat_tools()`，同时验证历史问题、当前问题均在模型消息内，以及模拟工具选择最新问题作为检索词。
+- 仍有待验收的跨 run 持久化上下文版本与旧路径排空；最新 Actions 是否全绿以 PR Checks 为准，不能用代码提交代替 CI 通过。
