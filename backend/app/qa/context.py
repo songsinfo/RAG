@@ -61,7 +61,7 @@ def assert_run_sources_readable(actor, run_id):
 
 
 def conversation_memory(actor, conversation_id, current_run_id, max_turns=4):
-    """读取同一会话段的授权历史；真正的裁剪/格式化由 QaService._rag_history 负责。"""
+    """优先读取同 Segment 的授权持久化快照；无快照时回退 QaService._rag_history 旧历史裁剪。"""
     from app.qa.service import QaService
     with get_db_connection() as conn:
         segment_id = conn.execute(select(qa_run_table.c.segment_id).where(and_(

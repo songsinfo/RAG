@@ -1,6 +1,6 @@
 # 统一业务 Agent 规格
 
-状态：IMPLEMENTING（PR #14 草稿已编码部分功能，UA-01～UA-12 尚未全部验收）。日期：2026-10-09；更新：2026-10-10。
+状态：IMPLEMENTING（PR #14 已合并 `main`，但 UA-01～UA-12 尚未全部完成生产验收）。日期：2026-10-09；更新：2026-10-10。
 任务清单：[统一业务 Agent Tickets](../delivery/unified-business-agent-tickets.md)。实际状态：[实施进度与剩余验收](../delivery/unified-business-agent-implementation-status.md)。
 
 ## 1. 目标与已确认范围
@@ -18,11 +18,13 @@
 
 本轮不做：Java HTTP 客户端或接口调研、真实价格/资格计算、多 Agent、独立规划器、业务写操作、通用工具平台。保留文档入库、检索及独立检索评测能力。
 
-## 2. 已核对的代码基础
+## 2. 实施前的代码基础（历史设计基线）
+
+本节记录提出 PR #14 之前的设计依据，不代表当前 `main` 仍按旧入口运行；当前真实调用链请看[源码导读](../source-walkthrough.md)与[实施状态](../delivery/unified-business-agent-implementation-status.md)。
 
 - [agent.py](../../backend/app/qa/agent.py) 已有 model/tools 循环、`search_knowledge` / `read_section`、运行预算与暂停恢复；扩展现有实现。
 - [question_router.py](../../backend/app/qa/question_router.py) 当前只有闲聊、知识问答、不支持请求分类；不能增加 RAG/Agent 路由。
-- [router.py](../../backend/app/qa/router.py) 与 [service.py](../../backend/app/qa/service.py) 当前区分 REALTIME 普通 RAG 和 DURABLE Agent；统一新问答需要调整实际执行入口，不只是隐藏前端按钮。
+- [router.py](../../backend/app/qa/router.py) 与 [service.py](../../backend/app/qa/service.py) 在实施前区分 REALTIME 普通 RAG 和 DURABLE Agent；PR #14 已将**新**问答规范化为 DURABLE Agent，旧执行代码仅供历史兼容。
 - [claim_validator.py](../../backend/app/qa/claim_validator.py) 校验本次 evidenceId 与文本引用区间；目前具体 gaps 未保留到最终展示结果。
 - [context.py](../../backend/app/qa/context.py) 与 [models.py](../../backend/app/models.py) 的来源路径以文档/build 为中心；工具来源需覆盖存储、鉴权、历史、Judge 和展示。
 - 前端入口为 [Chat.vue](../../frontend/src/Chat.vue)，共享请求在 [api.ts](../../frontend/src/api.ts)，评测界面为 [Evaluation.vue](../../frontend/src/Evaluation.vue)。
