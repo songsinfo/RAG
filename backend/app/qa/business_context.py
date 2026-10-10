@@ -112,7 +112,13 @@ def update_from_user(
         if not matches:
             continue
         value = next(iter(matches))
-        before = updated["objects"].get(field, {}).get("value")
+        existing = updated["objects"].get(field, {})
+        before = existing.get("value")
+        # State is replayed from the same history on each model step. Preserve
+        # the proven executed-tool provenance when the user ID has not changed.
+        # A different explicit value still triggers the normal user switch.
+        if before == value and existing.get("source") == "executed_mock_tool":
+            continue
         if field == "user_id" and before and before != value:
             # 切换对象会清除上一用户的券/活动/商品组绑定，避免错误跨用户复用。
             for dependent in ("coupon_id", "activity_id", "product_group_id"):
