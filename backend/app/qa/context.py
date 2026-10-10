@@ -73,4 +73,9 @@ def conversation_memory(actor, conversation_id, current_run_id, max_turns=4):
     # 找不到当前 run 所属 segment 时不跨段猜测历史，直接视为无历史。
     if not segment_id:
         return []
+    from app.qa.segment_context import load_segment_context
+    with get_db_connection() as conn:
+        messages, meta = load_segment_context(conn, actor, str(segment_id), current_run_id)
+    if meta["source"] == "PERSISTED":
+        return messages
     return QaService._rag_history(actor, str(segment_id), current_run_id)

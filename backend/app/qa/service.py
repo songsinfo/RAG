@@ -1270,6 +1270,9 @@ class QaService:
             if updated.rowcount != 1:
                 conn.rollback()
                 return False
+            if status in {"COMPLETED", "SUCCEEDED"}:
+                from app.qa.segment_context import append_completed_turn
+                append_completed_turn(conn, tenant_id, run_id, result_json)
             QaService._insert_terminal_event(conn, tenant_id, run_id, now, status, terminal_reason)
             conn.commit()
             log_stage(logger, "run_finished", stage, tenant_id=tenant_id, run_id=run_id,
