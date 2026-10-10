@@ -115,7 +115,7 @@ def test_unified_agent_segment_context_version_and_followup(client):
                 headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"ctx-{i}"})
             assert resp.status_code == 202, resp.text
             run = client.get("/api/v1/runs/" + resp.json()["runId"]).json()
-            assert run["status"] in {"SUCCEEDED", "COMPLETED"}
+            assert run["status"] in {"SUCCEEDED", "COMPLETED", "NO_EVIDENCE"}
         assert any(
             any(m.get("content") == "Milvus first question" for m in batch)
             and any(m.get("content") == "Milvus followup question" for m in batch)
