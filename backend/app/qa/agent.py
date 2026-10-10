@@ -51,6 +51,7 @@ from app.qa.runtime import (
 )
 from app.retrieval.rag_graph import RagRetrievalGraph
 from app.qa.business_tools import BUSINESS_TOOLS, BUSINESS_TOOL_NAMES, execute_business_tool, business_evidence_text, MOCK_NOTICE
+from app.qa.business_context import state_from_messages, update_from_tool
 
 
 # Prompt 版本进入运行事件，方便回放/对比时知道 Agent 当时使用哪套行为约束。
@@ -114,6 +115,7 @@ AGENT_TOOLS = [
 class AgentState(TypedDict):
     """LangGraph 节点间传递的状态；这里只存“可恢复的业务状态”，不放连接/事务对象。"""
     messages: List[Dict[str, Any]]
+    business_state: Dict[str, Any]
     round: int
     tool_calls_count: int
     repeated_calls: Dict[str, int]
@@ -243,6 +245,7 @@ class LangGraphAgent:
                     *memory,
                     {"role": "user", "content": question},
                 ],
+                "business_state": state_from_messages([*memory, {"role": "user", "content": question}], source_run_id=run_id),
                 "round": 0,
                 "tool_calls_count": 0,
                 "repeated_calls": {},
@@ -451,7 +454,9 @@ class LangGraphAgent:
         )
         if message_budget < 256:
             raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "模型上下文容量不足以容纳工具定义与回答预算")
-        messages, trim_info = compact_messages(list(state["messages"]), message_budget)
+        messages, trim_info = compact_messages(
+            list(state["messages"]), message_budget, state.get("business_state"), source_run_id=ctx.run_id,
+        )
         trim_info["requestEstimateTokens"] = message_tokens(messages) + tools_budget + output_reserve + safety_margin
         trim_info["estimator"] = "conservative-byte-and-langchain"
         if trim_info["requestEstimateTokens"] > model_window:
@@ -513,11 +518,13 @@ class LangGraphAgent:
             return {
                 "messages": new_messages,
                 "final_answer": validated,
+                "business_state": trim_info["businessState"],
                 "round": state["round"],
             }
 
         return {
             "messages": new_messages,
+            "business_state": trim_info["businessState"],
             "round": state["round"],
         }
 
@@ -537,6 +544,7 @@ class LangGraphAgent:
         warnings_list = list(state["warnings"])
         repeated_map = dict(state["repeated_calls"])
         calls_count = state["tool_calls_count"]
+        business_state = state.get("business_state") or state_from_messages(new_messages, source_run_id=ctx.run_id)
         approval_decisions: Dict[str, str] = {}
 
         # 先收集所有需要审批的 tool call，再执行任何有副作用的工具。
@@ -728,6 +736,10 @@ class LangGraphAgent:
                             evidence_list.append(ev_item)
                             evidence_map[eid] = raw_text
                             evidence_by_key[key] = ev_item
+                        business_state = update_from_tool(
+                            business_state, name, business, source_run_id=ctx.run_id,
+                            evidence_id=ev_item["evidenceId"],
+                        )
                         result_payload = {
                             "status": "OK", "mock": True, "notice": MOCK_NOTICE,
                             "fixtureVersion": ev_item["fixtureVersion"],
@@ -801,6 +813,7 @@ class LangGraphAgent:
 
         result = {
             "messages": new_messages,
+            "business_state": business_state,
             "evidence": evidence_list,
             "evidence_map": evidence_map,
             "warnings": warnings_list,

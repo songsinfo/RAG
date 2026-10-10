@@ -27,3 +27,9 @@
 2. 查 `qa_run.mode='RAG'` 且 `status IN ('QUEUED','RUNNING','WAITING_APPROVAL')` 的旧任务。未排空时不得移除旧执行分支。
 3. 回滚应用代码时必须继续保留新 run_source 列、TOOL 快照和可空文档列；不能直接反向 ALTER 丢失数据。已用统一 Agent 建立的记录需要按权限安全处理。
 4. 评测人工核验须分别记录真实模型标识、工具调用轨迹、提示版本、缓存 Token、耗时、费用和严格 Judge 结果。fake model 通过只证明代码调度，不证明真实工具选择准确率。
+
+## 2026-10-10 PR 审查修复（待最新 CI 校验）
+
+- 复核 P1：集中压缩前从显式用户参数及已执行的模拟工具中抽取有来源的对象状态；压缩保留当前完整 tool call 组，模型循环与工具节点通过 `AgentState.business_state` 传递状态，使用现有 LangGraph checkpoint 持久化。跨 run 历史初始化暂仍受 `_rag_history` 最近四轮/字符预算限制，**不宣称 T08 全量完成**。
+- 复核 P2：`normalize_provider_usage()` 在共用记账处识别 `input_token_details.cache_read`、顶层缓存字段及 `prompt_tokens_details.cached_tokens`；保留真实 0，缺失记 null；主模型与 fallback 共用。
+- 修复旧 `RETRIEVING` 阶段断言，验证 `AGENT_RUNTIME`、`AGENT_MODEL`、`AGENT_TOOL`、`RAG_SCOPE` 和 `RAG_FINAL_HITS` 及 Durable Job 状态；仍需以最新 CI 为准。
