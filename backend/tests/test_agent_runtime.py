@@ -148,3 +148,59 @@ def test_agent_uses_langgraph_native_checkpointer():
     LangGraphAgent._graph = None
     graph = LangGraphAgent._get_graph()
     assert isinstance(graph.checkpointer, JobCheckpointSaver)
+
+
+def test_compaction_preserves_explicit_referents_and_untrusted_source():
+    from app.qa.runtime import compact_messages
+    from app.qa.business_context import normalize_business_state
+    msg = [
+        {"role": "system", "content": "Fixed system"},
+        {"role": "user", "content": "Diagnose coupon for user U123, coupon C456"},
+        {"role": "assistant", "content": "long answer " * 170},
+        {"role": "user", "content": "Now check his subsidy for activity A1"},
+    ]
+    compressed, info = compact_messages(msg, max_tokens=800, source_run_id="prev-1")
+    assert info["trimmed"] and info["droppedMessages"] > 0
+    assert "U123" in str(compressed) and "A1" in str(compressed)
+    assert info["businessState"]["objects"]["user_id"]["value"] == "U123"
+    assert info["businessState"]["objects"]["activity_id"]["value"] == "A1"
+    assert compressed[0] == msg[0] and compressed[-1] == msg[-1]
+    assert all(m["role"] != "system" for m in compressed[1:])
+
+
+def test_compaction_user_switch_invalidates_old_dependent_objects():
+    from app.qa.business_context import state_from_messages
+    initial = [{"role": "user", "content": "user U123 coupon C456 activity A1"}]
+    state = state_from_messages(initial)
+    updated = state_from_messages([{"role": "user", "content": "user U789 activity A2"}], state)
+    assert updated["objects"]["user_id"]["value"] == "U789"
+    assert updated["objects"]["activity_id"]["value"] == "A2"
+    assert "coupon_id" not in updated["objects"]
+
+
+def test_compaction_no_progress_must_not_discard_active_tool_pair():
+    from app.qa.runtime import compact_messages
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "search_knowledge", "args": {"query": "x"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "z" * 5000},
+    ]
+    with pytest.raises(ApiException) as exc:
+        compact_messages(msgs, 800)
+    assert exc.value.code == "CONTEXT_LIMIT_EXCEEDED"
+
+
+@pytest.mark.parametrize("cache,expected", [
+    ({"input_tokens": 2000, "output_tokens": 100,
+      "input_token_details": {"cache_read": 1536}}, 1536),
+    ({"input_tokens": 2000, "output_tokens": 100,
+      "input_token_details": {"cache_read": 0}}, 0),
+    ({"input_tokens": 2000, "output_tokens": 100}, None),
+    ({"input_tokens": 2000, "output_tokens": 100,
+      "prompt_tokens_details": {"cached_tokens": 512}}, 512),
+])
+def test_agent_provider_cache_usage_normalization(cache, expected):
+    from app.qa.model_usage import normalize_provider_usage
+    assert normalize_provider_usage(cache)["cache_read_tokens"] == expected

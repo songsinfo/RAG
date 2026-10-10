@@ -16,6 +16,24 @@ def token_ceiling(payload):
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 256
 
 
+def normalize_provider_usage(usage):
+    """将 LangChain/LiteLLM 的用量形状归一化，保留 0 与未知的区别。"""
+    source = usage if isinstance(usage, dict) else {}
+    inner = source.get("input_token_details")
+    inner = inner if isinstance(inner, dict) else {}
+    # OpenAI-compatible API 也可能把 cached_tokens 放在 prompt_tokens_details。
+    details = source.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    candidates = [
+        source.get("cache_read_tokens"), source.get("cached_tokens"),
+        inner.get("cache_read"), inner.get("cached_tokens"), details.get("cached_tokens"),
+    ]
+    cache_read = next((n for n in candidates if type(n) is int and n >= 0), None)
+    normalized = dict(source)
+    normalized["cache_read_tokens"] = cache_read
+    return normalized
+
+
 def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
                    payload, max_output_tokens=0, usage_reader=None):
     from app.qa.model_gateway import ModelGateway
@@ -43,11 +61,11 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         result = fn()
         if getattr(result, "status_code", 200) >= 400:
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"模型网关返回状态码 {result.status_code}")
-        usage = usage_reader(result) if usage_reader else {}
+        usage = normalize_provider_usage(usage_reader(result) if usage_reader else {})
         reported = bool(usage and type(usage.get("input_tokens")) is int and type(usage.get("output_tokens")) is int
                         and usage["input_tokens"] >= 0 and usage["output_tokens"] >= 0)
         detail = {
-            "cacheReadTokens": usage.get("cache_read_tokens", usage.get("cached_tokens")),
+            "cacheReadTokens": usage["cache_read_tokens"],
             "inputTokensReported": usage.get("input_tokens") if reported else None,
             "model": alias, "durationMs": round((time.perf_counter() - started) * 1000, 2),
             "usageEstimator": "provider" if reported else "byte-ceiling",

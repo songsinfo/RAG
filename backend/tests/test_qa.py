@@ -296,7 +296,10 @@ def test_qa_run_lifecycle_and_evidence(client):
     assert len(events) >= 3
     stages = [e["stage"] for e in events]
     assert "ROUTED" in stages
-    assert "RETRIEVING" in stages
+    # 统一 Agent 有单独的运行/模型/工具事件；检索阶段属于 search_knowledge 子图。
+    for name in ("AGENT_RUNTIME", "AGENT_MODEL", "AGENT_TOOL", "RAG_SCOPE", "RAG_FINAL_HITS", "FINISHED"):
+        assert name in stages, f"missing {name}: {stages}"
+    assert stages.index("AGENT_MODEL") < stages.index("RAG_SCOPE") < stages.index("AGENT_TOOL")
     # 普通 RAG 实际经过 LangGraph 检索图，而非直接调用旧单体 Pipeline。
     for stage in (
         "RAG_SCOPE", "RAG_PREPARE_QUERY", "RAG_DENSE_RECALL",
@@ -307,9 +310,10 @@ def test_qa_run_lifecycle_and_evidence(client):
     stages_with_payload = {event["stage"]: event["payload"] for event in events}
     assert stages_with_payload["RAG_RRF_FUSION"]["hitCount"] >= len(run_data["evidence"])
     assert stages_with_payload["RAG_FINAL_HITS"]["hitCount"] == len(run_data["evidence"])
-    # 在线 RAG 继续无 QA_RUN job，避免用户提问等待 worker claim。
+    # 新在线问答都由 durable QA_RUN Job 调度，完成时 Job 必须收敛至终态。
     with app_db.get_db_connection() as conn:
-        assert conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first() is None
+        job = conn.execute(job_table.select().where(job_table.c.target_id == run_id)).first()
+        assert job is not None and job.status == "COMPLETED"
 
 
 @pytest.mark.parametrize("mode,evaluation_scope,execution_mode", [

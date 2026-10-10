@@ -19,6 +19,7 @@ from sqlalchemy import and_, func, select
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
+from app.qa.business_context import normalize_business_state, state_from_messages, state_message
 
 
 T = TypeVar("T")
@@ -140,42 +141,58 @@ def message_tokens(messages: List[Dict[str, Any]]) -> int:
     return max(approx, (len(raw.encode("utf-8")) + 1) // 2)
 
 
-def compact_messages(messages: List[Dict[str, Any]], max_tokens: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """仅在 85% 高水位时压缩完整对话组到约 60%；未触发时保持前缀原样不变。
+def compact_messages(
+    messages: List[Dict[str, Any]], max_tokens: int,
+    business_state: Optional[Dict[str, Any]] = None,
+    *, source_run_id: str = "",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """85% 触发、尝试压至 60%；压缩前提取显式对象和已执行工具来源。
 
-    最后一轮 user 及其 assistant/tool 组属于受保护消息，不拆分 tool_calls 和回复。
-    若保护内容超硬预算，fail closed，而不是静默抛弃当前问题。
+    未压缩时原有消息字节/次序完全不变；压缩时只移除完整交互组，
+    保留最新用户轮次、其 tool_calls 和所有对应 ToolMessage，不截断 JSON。
+    无空间保留受保护内容/必要状态时失败关闭。
     """
     original = message_tokens(messages)
-    high = int(max_tokens * .85)
-    low = int(max_tokens * .60)
-    if original <= high:
-        return list(messages), {"trimmed": False, "droppedMessages": 0, "estimatedTokens": original,
-                                "strategy": "stable-prefix-v1"}
+    state = state_from_messages(messages, business_state, source_run_id=source_run_id)
+    if original <= int(max_tokens * .85):
+        return list(messages), {
+            "trimmed": False, "droppedMessages": 0, "estimatedTokens": original,
+            "strategy": "stable-prefix-v2", "businessState": state,
+        }
+
     system = [m for m in messages if m.get("role") == "system"]
-    others = [m for m in messages if m.get("role") != "system"]
-    # 完整交互组以 user 为起点，包含后续 assistant/tool 直到下一条 user。
+    others = [m for m in messages if m.get("role") != "system" and m.get("kind") != "context_snapshot"]
     groups: List[List[Dict[str, Any]]] = []
-    for m in others:
-        if m.get("role") == "user" or not groups:
-            groups.append([m])
+    for msg in others:
+        if msg.get("role") == "user" or not groups:
+            groups.append([msg])
         else:
-            groups[-1].append(m)
+            groups[-1].append(msg)
     if not groups or groups[-1][0].get("role") != "user":
-        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "缺少当前问题，无法安全压缩")
-    # 保护最近一轮完整工具调用，不能在一次循环中丢失刚获取的证据。
+        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "缺少当前问题，不能安全压缩")
+
     keep = list(groups)
-    while len(keep) > 1 and message_tokens(system + [m for g in keep for m in g]) > low:
+    compacted = list(messages)
+    while len(keep) > 1:
+        retained = system + [state_message(state)] + [msg for group in keep for msg in group]
+        if message_tokens(retained) <= int(max_tokens * .60):
+            compacted = retained
+            break
         keep.pop(0)
-    compacted = system + [m for g in keep for m in g]
+    if compacted is messages or compacted == messages:
+        compacted = system + [state_message(state)] + [msg for group in keep for msg in group]
     tokens = message_tokens(compacted)
     if tokens > max_tokens:
-        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "当前问题和必要工具证据超过上下文限制，请缩小问题")
-    return compacted, {"trimmed": len(keep) < len(groups),
-                       "droppedMessages": len(messages) - len(compacted),
-                       "estimatedTokens": tokens, "beforeTokens": original,
-                       "strategy": "complete-turns-v1",
-                       "reason": "HIGH_WATERMARK" if len(keep) < len(groups) else "PROTECTED_CONTEXT" }
+        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "当前问题或必要的上下文对象超出硬限制，请缩小问题")
+    trimmed = len(keep) < len(groups) or any(m.get("kind") == "context_snapshot" for m in messages)
+    if not trimmed and original > max_tokens:
+        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "没有可安全删除的完整消息轮次")
+    return compacted, {
+        "trimmed": trimmed, "droppedMessages": max(0, len(messages) - len(compacted)),
+        "estimatedTokens": tokens, "beforeTokens": original,
+        "businessState": state, "strategy": "complete-turns-with-state-v2",
+        "reason": "HIGH_WATERMARK" if trimmed else "PROTECTED_CONTEXT",
+    }
 
 
 def get_run_usage(tenant_id: str, run_id: str) -> Dict[str, int]:
