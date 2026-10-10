@@ -40,3 +40,9 @@
 - 回归测试覆盖连续 `state_from_messages` / `compact_messages` 重放、跨 run 同名 E1、旧 checkpoint 重复引用及冲突来源。
 - 旧审计测试已迁移至统一 Agent 的 `ModelGateway.chat_tools()`，同时验证历史问题、当前问题均在模型消息内，以及模拟工具选择最新问题作为检索词。
 - 仍有待验收的跨 run 持久化上下文版本与旧路径排空；最新 Actions 是否全绿以 PR Checks 为准，不能用代码提交代替 CI 通过。
+
+## 2026-10-10 跨 run 持久化改造
+
+新增 `context_segment.context_payload/context_version/context_through_turn/context_boundary_turn/context_last_run_id` 及增量迁移文件 `20261010_segment_context_snapshot.sql`。新 Agent run 在初始化时优先读取经过租户、分段、用户归属与文档 ACL/build 复核的快照；成功终态与快照更新在同一数据库事务内提交，重复运行按 run_id 幂等。未压缩只追加消息、保留版本，压缩时增加版本、记录边界；旧 segment 首次回退到原授权历史。
+
+**上线限制**：快照仍只保存 user/assistant 的受限历史文本与显式业务对象/来源引用，不是共享的完整 LangGraph checkpoint；原 run 的 tool/evidenceId 不作为当前证据。旧 RAG 运行分支需先在目标环境完成队列清点，并保留对旧任务的可控兼容处理；未清点时不安全删除。此阶段仍为 Draft，必须等 CI 和专项验收结果。

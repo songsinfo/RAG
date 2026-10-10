@@ -32,6 +32,8 @@ def load_segment_context(conn, actor, segment_id: str, current_run_id: str) -> T
     if not snapshot or int(row.context_through_turn or 0) == 0:
         return [], {"version": 0, "businessState": None, "source": "LEGACY"}
     source_runs = snapshot.get("sourceRuns") or []
+    if len(source_runs) > 5000:
+        raise ApiException(409, "SOURCE_CHANGED", "历史来源数量超出安全限制")
     for rid in source_runs:
         if not isinstance(rid, str):
             raise ApiException(409, "SOURCE_CHANGED", "上下文来源格式无效")

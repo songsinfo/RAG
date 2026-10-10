@@ -811,7 +811,9 @@ class QaService:
                 conn.commit()
 
             # 历史不是直接从 conversation 文本拼出来，而是逐轮验证来源当前仍可读后再继承。
-            history = QaService._rag_history(actor, seg_id, run_id)
+            # Old REALTIME RAG still depends on legacy history. Unified Agent
+            # loads the persisted, ACL-checked segment context on first graph entry.
+            history = QaService._rag_history(actor, seg_id, run_id) if mode == "RAG" else []
 
             # 1. 先做轻量问题路由：非知识库问题不进入检索/模型主链，节省费用。
             decision = classify_question(question)

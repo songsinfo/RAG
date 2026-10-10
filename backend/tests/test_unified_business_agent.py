@@ -84,3 +84,88 @@ def test_unified_legacy_modes_execute_mock_tool_and_persist_evidence(client):
             assert e.json()["queryObjects"] == {"user_id": "u1", "coupon_id": "c1"}
     finally:
         ModelGateway._agent_mock_handler = None
+
+
+def test_unified_agent_segment_context_version_and_followup(client):
+    from app.db import get_db_connection
+    from app.models import context_segment_table
+    from sqlalchemy import select
+    csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
+    login = client.post("/api/v1/auth/login", json={
+        "tenantCode": "demo", "loginName": "admin", "password": "admin123"
+    }, headers={"X-CSRF-Token": csrf})
+    assert login.status_code == 200
+    csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
+    conv = client.post("/api/v1/conversations", json={"title": "context continuity"},
+                       headers={"X-CSRF-Token": csrf}).json()
+    seen = []
+
+    def model(messages):
+        seen.append(list(messages))
+        return {"role": "assistant", "content": json.dumps({
+            "status": "NO_EVIDENCE", "claims": [], "gaps": [], "conflicts": []
+        }), "tool_calls": []}
+
+    ModelGateway._agent_mock_handler = model
+    try:
+        for i, question in enumerate(["Milvus first question", "Milvus followup question"]):
+            resp = client.post(
+                f"/api/v1/conversations/{conv['conversationId']}/runs",
+                json={"question": question, "segmentId": conv["currentSegmentId"]},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"ctx-{i}"})
+            assert resp.status_code == 202, resp.text
+            run = client.get("/api/v1/runs/" + resp.json()["runId"]).json()
+            assert run["status"] in {"SUCCEEDED", "COMPLETED"}
+        assert any(
+            any(m.get("content") == "Milvus first question" for m in batch)
+            and any(m.get("content") == "Milvus followup question" for m in batch)
+            for batch in seen
+        )
+        with get_db_connection() as conn:
+            row = conn.execute(select(context_segment_table).where(
+                context_segment_table.c.id == conv["currentSegmentId"])).first()
+            assert row.context_through_turn == 2
+            assert row.context_version == 1  # message append did not rewrite version
+            assert len(row.context_payload["messages"]) == 4
+            assert len(row.context_payload["sourceRuns"]) == 2
+            assert row.context_last_run_id == resp.json()["runId"]
+    finally:
+        ModelGateway._agent_mock_handler = None
+
+
+def test_segment_context_replayed_run_does_not_append_again(client):
+    from app.db import get_db_connection
+    from app.models import context_segment_table
+    from app.qa.segment_context import append_completed_turn
+    from sqlalchemy import select
+    csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
+    assert client.post("/api/v1/auth/login", json={
+        "tenantCode": "demo", "loginName": "admin", "password": "admin123"
+    }, headers={"X-CSRF-Token": csrf}).status_code == 200
+    csrf = client.get("/api/v1/auth/csrf").json()["csrfToken"]
+    conv = client.post("/api/v1/conversations", json={"title": "idempotent"},
+                       headers={"X-CSRF-Token": csrf}).json()
+    ModelGateway._agent_mock_handler = lambda messages: {
+        "role": "assistant",
+        "content": json.dumps({"status": "NO_EVIDENCE", "claims": [], "gaps": [], "conflicts": []}),
+        "tool_calls": [],
+    }
+    try:
+        resp = client.post(
+            f"/api/v1/conversations/{conv['conversationId']}/runs",
+            json={"question": "Milvus context", "segmentId": conv["currentSegmentId"]},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": "context-once"})
+        assert resp.status_code == 202
+        run_id = resp.json()["runId"]
+        with get_db_connection() as conn:
+            first = conn.execute(select(context_segment_table).where(
+                context_segment_table.c.id == conv["currentSegmentId"])).first()
+            snapshot = dict(first.context_payload)
+            version = first.context_version
+            append_completed_turn(conn, "tenant-demo-1", run_id, {"answer": "ignored replay"})
+            again = conn.execute(select(context_segment_table).where(
+                context_segment_table.c.id == conv["currentSegmentId"])).first()
+            assert again.context_payload == snapshot
+            assert again.context_version == version
+    finally:
+        ModelGateway._agent_mock_handler = None
