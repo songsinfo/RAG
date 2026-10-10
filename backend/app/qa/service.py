@@ -553,8 +553,8 @@ class QaService:
             if active_run:
                 raise ApiException(409, "ACTIVE_RUN_EXISTS", "已有活动请求")
 
-            # 5. 先持久化 qa_run；Agent 和评估 RAG 需要同事务创建 durable job。
-            #    在线普通 RAG 无 job：不等待 MySQL 轮询；进程异常后由启动恢复标为 PROCESS_RESTARTED。
+            # 5. 所有新请求均先持久化 qa_run 并在同一事务创建 QA_RUN durable job。
+            #    只有历史 REALTIME 运行可能保留无 Job 的兼容执行语义。
             run_id = str(uuid.uuid4())
             max_turn = conn.execute(
                 select(qa_run_table.c.turn_no)
@@ -639,11 +639,11 @@ class QaService:
             "tenant_id": actor.tenant_id, "run_id": run_id,
             "execution_mode": "DURABLE" if durable else "REALTIME", "status": "QUEUED",
         }})
-        # 测试环境同步执行用于确定性单测；生产由路由即时调度在线 RAG，Worker 处理 Agent/评估 RAG。
+        # 测试环境同步执行用于确定性单测；生产的新问答统一由 QA_RUN Worker 调度。
         if is_test_env():
             QaService.execute_queued_run(actor, run_id)
 
-        # 在线 RAG 不等待 Job Worker：路由在响应后立刻启动执行；Agent/评估 RAG 仍等待 Worker claim。
+        # 旧 REALTIME 代码仅为历史运行保留；新请求固定返回 DURABLE，等待 Worker claim。
 
         return {
             "runId": run_id,
@@ -859,7 +859,7 @@ class QaService:
                 QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", agent_res.get("status", "COMPLETED"), agent_res)
                 return
 
-            # 2. 普通 RAG：先解析 segment 的 KB scope，再交给 RetrievalPipeline 做 ACL + 多路检索。
+            # 2. 历史普通 RAG 兼容分支：解析 segment KB scope 后调用 RagRetrievalGraph 检索；新请求不会进入这里。
             QaService._record_event(actor.tenant_id, run_id, "RETRIEVING", {"configId": config_id})
             with get_db_connection() as conn:
                 seg = conn.execute(
@@ -885,8 +885,8 @@ class QaService:
 
             # 读取历史后、发起新检索前再确认 inherited sources 仍可读。
             assert_run_sources_readable(actor, run_id)
-            # 普通 RAG 使用独立 LangGraph 检索 DAG；Agent/search API 保留原 Pipeline。
-            # 不使用 Checkpointer，不改变 REALTIME BackgroundTasks 的执行方式。
+            # 历史 RAG 与新 Agent 的 search_knowledge 均复用 RagRetrievalGraph；独立 Search API/纯检索评测仍走 Pipeline。
+            # 该内层检索图无 Checkpointer；新问答的持久化恢复由外层 Agent + QA_RUN Job 负责。
             from app.retrieval.rag_graph import RagRetrievalGraph
             retrieval = RagRetrievalGraph.retrieve(
                 actor=actor,

@@ -1,6 +1,6 @@
 # Agent 知识检索工具：LangGraph 检索 DAG
 
-**PR #14 开发分支**：新在线问答统一进入 Durable LangGraph Agent。模型需要检索时，`search_knowledge` 调用本文的 `RagRetrievalGraph.retrieve()`；`read_section` 可单独读取文档；四个模拟业务工具不需要强制知识检索。检索图不生成答案，只返回受 ACL 保护的证据。独立 `/search` 和纯检索评测保留 `RetrievalPipeline.retrieve()`。旧 RAG 在线执行分支仍为待排空旧任务保留，不是新请求入口。
+**当前 `main`（PR #14 已合并）**：新在线问答统一进入 Durable LangGraph Agent。模型需要检索时，`search_knowledge` 调用本文的 `RagRetrievalGraph.retrieve()`；`read_section` 可单独读取文档；四个模拟业务工具不需要强制知识检索。检索图不生成答案，只返回受 ACL 保护的证据。独立 `/search` 和纯检索评测保留 `RetrievalPipeline.retrieve()`。旧 RAG 在线执行分支仍为待排空旧任务保留，不是新请求入口。
 
 ## 编译后的 LangGraph 状态图（源码同步）
 

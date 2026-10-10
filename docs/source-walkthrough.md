@@ -2,11 +2,11 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-10-10，本导读同步 **PR #14 的统一业务 Agent 开发分支**；本 PR 尚为草稿，未合并 main，部分上下文持久化及上线收缩验收未完成。本文解释所在分支的源码行为；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-10，当前 `main`（合并提交 `2b40a9b`，包含已合并的 [PR #14](https://github.com/songsinfo/RAG/pull/14)）。统一业务 Agent 与版本化跨轮上下文快照已进入主分支；**合并不代表 UA-01～UA-12 全量生产验收通过**，尤其不代表真实业务系统接入或供应商 KV Cache 收益已实测。本文按当前 `main` 源码说明调用链；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
-阅读导航：[项目地图](#1-先认识项目再确定阅读顺序) → [贯穿示例](#2-用一个例子贯穿所有流程) → [启动与任务](#3-启动与入口请求和后台任务如何衔接) → [文档入库](#4-文档入库文件如何变成可以检索的内容) → [检索](#5-检索问题如何找到当前用户可用的证据) → [普通 RAG](#6-普通-rag证据如何变成用户看到的答案) → [Agent 与评估](#7-agent-与评估在普通-rag-主线上的扩展) → [失败排查](#8-第二遍阅读追踪权限状态和失败) → [测试跟读](#9-跑测试读源码一个可操作的学习路线)。
+阅读导航：[项目地图](#1-先认识项目再确定阅读顺序) → [贯穿示例](#2-用一个例子贯穿所有流程) → [启动与任务](#3-启动与入口请求和后台任务如何衔接) → [文档入库](#4-文档入库文件如何变成可以检索的内容) → [检索](#5-检索问题如何找到当前用户可用的证据) → [统一问答](#6-统一问答工具证据如何变成用户答案) → [Agent 与评估](#7-agent-与评估统一问答主线) → [失败排查](#8-第二遍阅读追踪权限状态和失败) → [测试跟读](#9-跑测试读源码一个可操作的学习路线)。
 
 ## 1. 先认识项目，再确定阅读顺序
 
@@ -17,6 +17,7 @@
 | Vue 前端 | 上传、提问、SSE 阶段进度与轮询兜底、查看引用 | [Chat.vue](../frontend/src/Chat.vue)、[Documents.vue](../frontend/src/Documents.vue) |
 | FastAPI | HTTP 路由、认证依赖、CSRF、错误响应 | [main.py](../backend/app/main.py) |
 | MySQL | 用户权限、文档版本、生效构建、任务和运行记录 | [models.py](../backend/app/models.py)、[db.py](../backend/app/db.py) |
+| 跨轮上下文 | 按 Segment 保存授权历史、结构化业务对象、来源依赖和压缩版本（不是模型 KV Cache） | [segment_context.py](../backend/app/qa/segment_context.py)、[business_context.py](../backend/app/qa/business_context.py) |
 | Worker | 从 MySQL 领取 INGEST/PURGE/EVALUATE/全部新问答的持久任务；旧 REALTIME RAG 仅作历史兼容 | [worker.py](../backend/app/runtime/worker.py) |
 | Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
@@ -79,6 +80,8 @@ flowchart TD
 | `evidence` | 某次问答登记的证据 | 分配运行内编号，例如 E1 |
 | `claim` | 模型给出的一条事实断言 | 必须关联本次 evidence |
 | `answer` | 程序根据 claims 渲染的展示文本 | 保持正文和引用的对应关系 |
+| `context_segment` | 一个会话范围内的持久化历史及业务对象状态 | 支持下一次新 run 按当前权限续接历史 |
+| `job.checkpoint` | 单次 `QA_RUN` 的 LangGraph 节点状态 | 支持当前 run 的暂停/崩溃恢复，而不是替代跨轮历史 |
 
 例如 `E1` 不是全局文档 ID，而是本次问答的证据编号。另一轮问答的 E1 可以指向完全不同的资料。
 
@@ -125,7 +128,7 @@ class Actor:
 
 ### 3.3 为什么请求返回了，任务还没完成
 
-文档入库、评估主任务及**所有新在线问答**均写 MySQL Job，由 Worker 执行；新问答先同事务写 `qa_run + QA_RUN Job`，HTTP 202 只表示提交，不表示已生成答案。HTTP 202 只表示请求已接收，均不意味着答案生成完成。
+文档入库、评估主任务及**所有新在线问答**均写 MySQL Job，由 Worker 执行；新问答先同事务写 `qa_run + QA_RUN Job`。HTTP 202 只表示请求已接收，不表示答案生成完成。旧 `REALTIME` 路径仅为历史未完成运行保留兼容代码。
 
 在 [worker.py](../backend/app/runtime/worker.py) 按下面顺序读：
 
@@ -242,7 +245,7 @@ child_chunks = [c for c in chunks if c.get("kind") == "CHILD"]
 
 **先区分入口**：新完整问答走 `LangGraphAgent`；Agent 选择 `search_knowledge` 才调用 [rag_graph.py](../backend/app/retrieval/rag_graph.py) 的 `RagRetrievalGraph.retrieve()`。独立 Search API 和纯检索评估仍调用 [pipeline.py](../backend/app/retrieval/pipeline.py) 的 `RetrievalPipeline.retrieve()`。旧 `mode=RAG` 在线代码暂保留供历史任务兼容，不再承接新请求。这些入口复用同一套 Milvus、RRF、Reranker、MMR、Parent、权限与来源工具。
 
-普通 RAG 检索图的实际节点顺序如下（Dense / BM25 并行完成，再汇入 RRF）：
+Agent 的 `search_knowledge` 检索工具图实际节点顺序如下（Dense / BM25 并行完成，再汇入 RRF）：
 
 ```text
 QaService._execute_run(mode=AGENT)
@@ -282,7 +285,7 @@ RetrievalPipeline.retrieve(actor, query, kb_ids, document_ids, config_id, run_id
   → 返回 hits / warnings / config / allowedBuildCount
 ```
 
-**图的执行边界**：内层检索图只返回证据，外层 Agent 负责模型、工具调用和最终回答，`QaService` 负责 Judge/提交。检索子图不启用 Checkpointer，即使外层 Agent 有 Durable Job，也不能从内部 `rrf_fusion` 或 `rerank` 节点恢复。RAG 评估仍走现有 `QA_RUN` Worker，但暂未获得检索图的节点级恢复能力。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+**图的执行边界**：内层检索图只返回证据，外层 Agent 负责模型、工具调用和最终回答，`QaService` 负责 Judge/提交。检索子图不启用 Checkpointer，即使外层 Agent 有 Durable Job，也不能从内部 `rrf_fusion` 或 `rerank` 节点恢复。新建完整问答评估仍走 `QA_RUN` Worker，但内层检索图没有节点级持久化恢复能力。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
 
 ### 5.2 权限过滤先于检索
 
@@ -301,7 +304,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 
 ### 5.3 BM25、Dense 和 Hybrid 在哪里分支
 
-无论普通 RAG 的 LangGraph 检索图，还是 Agent / Search API 的 `RetrievalPipeline.retrieve()`，都根据当前有效配置选择 BM25 / Dense 路线，调用 `MilvusHybridService.search()`；底层 `search()` 也支持直接 HYBRID 调用：
+无论 Agent `search_knowledge` 使用的 `RagRetrievalGraph`，还是独立 Search API / 纯检索评估使用的 `RetrievalPipeline.retrieve()`，都根据当前有效配置选择 BM25 / Dense 路线，调用 `MilvusHybridService.search()`；底层 `search()` 也支持直接 HYBRID 调用：
 
 | 模式 | 核心操作 | 阅读时关注 |
 | --- | --- | --- |
@@ -309,7 +312,7 @@ allowed_build_ids = [row["buildId"] for row in readable]
 | DENSE | 问题 embedding → dense 向量搜索 | 查询与索引维度一致 |
 | HYBRID | 两路检索，通过 RRF 融合 | 两路候选数量和融合排名 |
 
-普通 RAG 图通过并行 `dense_recall` / `bm25_recall` 节点取回排名列表，在 `rrf_fusion` 节点调用 `rrf_fuse()`；`RetrievalPipeline.retrieve()` 也沿用相同的应用层加权融合逻辑。底层 `MilvusHybridService.search(mode="HYBRID")` 也分别调用 `client.search()`，将 ORIGINAL / SUMMARY / QUESTION 等表示归一并按 canonical chunk 去重后再做 RRF；不再直接使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`，避免同一子块的不同表示重复投票。RRF 综合各路线里的名次，不直接混加两种不可比的原始分数。
+Agent 的检索工具图通过并行 `dense_recall` / `bm25_recall` 节点取回排名列表，在 `rrf_fusion` 节点调用 `rrf_fuse()`；`RetrievalPipeline.retrieve()` 也沿用相同的应用层加权融合逻辑。底层 `MilvusHybridService.search(mode="HYBRID")` 也分别调用 `client.search()`，将 ORIGINAL / SUMMARY / QUESTION 等表示归一并按 canonical chunk 去重后再做 RRF；不再直接使用 Milvus `hybrid_search(..., ranker=RRFRanker(...))`，避免同一子块的不同表示重复投票。RRF 综合各路线里的名次，不直接混加两种不可比的原始分数。
 
 测试环境另有内存检索和确定性 embedding 路径。它们适合验证过滤和执行逻辑，不能代表真实向量的语义质量，也不能用其表现估计生产 Milvus 性能。
 
@@ -332,11 +335,11 @@ text           = 后续用于上下文的文本
 
 两条检索编排入口均接入 Rewrite、HyDE、Multi-Query 和 MMR，但都由配置开关控制。Rewrite 还要求存在历史，并保留原问题与改写问题；Multi-Query 增加等价问法；HyDE 只贡献 Dense 路线，不把假想文本作为事实证据；MMR 在重排后、父块扩展前选择候选。开启策略不等于已证明效果更好，仍需固定其他条件做实验。
 
-**对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()` 校验普通 RAG 检索图各阶段事件与实时执行契约；[test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`、[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()` 校验仍被 Agent / Search API 等入口复用的原检索组件。
+**对应测试：** [test_qa.py](../backend/tests/test_qa.py) 的 `test_qa_run_lifecycle_and_evidence()` 校验统一 Agent 的 Durable Job、知识检索工具图各阶段事件与来源证据；[test_enterprise_retrieval.py](../backend/tests/test_enterprise_retrieval.py) 的 `test_config_driven_rerank_parent_expansion_and_provenance()`、[test_retrieval.py](../backend/tests/test_retrieval.py) 的 `test_hybrid_search_acl_and_rebuild()` 校验仍被 Agent / Search API 等入口复用的原检索组件。
 
 ## 6. 统一问答：工具证据如何变成用户答案
 
-**PR #14 的新运行路径**：
+**当前 `main` 的统一问答运行路径（PR #14 已合并）**：
 
 ```text
 Chat.vue::submit()（不再发送 mode）
@@ -359,7 +362,7 @@ Chat.vue::submit()（不再发送 mode）
 
 页面展示后端确定的“**模拟结果，未查询真实业务系统**”，并区分文档来源与工具来源。模型没有引用到真实取得的 Evidence 或引用偏移错误时，应失败关闭，而不是生成无依据答案。严格 Judge 判断本次证据是否支持断言，不证明演示业务结果真实。
 
-**历史/结果注意：**`qa_run` 保存执行状态，`result_json.status` 表示业务回答状态；`get_run()` 会合并这两种信息，因此同一响应的 `status` 不一定等于数据库运行状态。历史文档仍按权限复核；跨提问稳定前缀与上下文快照版本尚未完成，不能称为完整的跨 run KV cache 优化。
+**历史/结果注意：**`qa_run` 保存执行状态，`result_json.status` 表示业务回答状态；`get_run()` 会合并这两种信息，因此同一响应的 `status` 不一定等于数据库运行状态。已实现跨 run 的授权历史快照、结构化业务对象、压缩边界和版本记录；历史来源每次复用仍需 ACL/build 复核。这并非跨 run 共享 LangGraph checkpoint，也**不能**视为供应商 KV Cache 命中或成本收益已实测。
 
 ## 7. Agent 与评估：统一问答主线
 
@@ -393,9 +396,44 @@ builder.add_conditional_edges(
 builder.add_edge("tools", "model")
 ```
 
-`AgentState` 保存 messages、round、tool_calls_count、repeated_calls、evidence、evidence_map、warnings 和 final_answer。`AgentContext` 保存身份、run ID、配置、截止时间和回调。前者是循环中的变化状态，后者提供运行依赖。
+`AgentState` 保存 messages、`business_state`、round、tool_calls_count、repeated_calls、evidence、evidence_map、warnings 和 final_answer。`AgentContext` 保存身份、run ID、配置、截止时间和回调。前者是本次图执行的可恢复状态，后者是不可直接持久化的运行依赖；跨 run 的稳定记忆另由 `context_segment` 管理。
 
-### 7.2 六个工具与本例轨迹
+### 7.2 跨轮上下文与 Checkpointer：区分两种持久化
+
+不要将 `context_segment`、`AgentState` 和 `job.checkpoint` 当成同一份状态。它们有不同的生命周期：
+
+| 状态/存储 | 读写入口 | 边界与用途 |
+| --- | --- | --- |
+| `context_segment.context_payload` | [segment_context.py](../backend/app/qa/segment_context.py) 的 `load_segment_context()` / `append_completed_turn()` | **跨 run** 复用当前 Segment 的已授权历史文本、业务对象及来源依赖；不保存模型 KV |
+| `AgentState` | [agent.py](../backend/app/qa/agent.py) 的 `run()` / `_model_step()` / `_tools_step()` | **单次 run** 的消息、工具调用次数、证据、`business_state` 等图状态 |
+| `job.checkpoint["langgraph"]` | [job_checkpointer.py](../backend/app/qa/job_checkpointer.py) 的 `JobCheckpointSaver` | **单次 QA_RUN** 的 LangGraph checkpoint 与 pending writes；支持 interrupt/resume、Worker 失败后从图节点边界恢复 |
+
+**第一次执行新 run** 的主链：
+
+```text
+QaService.submit_run() → qa_run + QA_RUN job
+  → Worker → QaService._execute_run(mode=AGENT)
+  → LangGraphAgent.run()
+      → JobCheckpointSaver：先检查该 run 是否有可恢复 checkpoint
+      → 新 run：conversation_memory() → load_segment_context()
+          → 校验 tenant / owner / segment / lease / 历史 document ACL + active build
+          → 若无新格式快照，回退到 _rag_history() 读取受权旧历史
+      → 将历史 user/assistant 消息与 businessState 注入 AgentState
+      → model → tools → model（search_knowledge 可进入 RagRetrievalGraph）
+  → QaService._verify_answer()
+  → QaService._finalize_run()（成功终态事务）
+      → append_completed_turn()：同事务写入当前轮及新的 Segment 快照
+```
+
+`context_payload` 的关键字段是 `messages`（仅受限的 user/assistant 历史）、`businessState`（明确对象 ID、待澄清信息与有来源的模拟工具引用）、`sourceRuns`、`throughTurn` 和 `boundaryTurn`。对应数据库列还有 `context_version`、`context_through_turn`、`context_boundary_turn`、`context_last_run_id`。每完成一轮会推进 `throughTurn`；**普通追加不递增 `context_version`，只有发生压缩替换时才递增版本并更新边界**。快照长度达到阈值后按完整轮次保留近期消息，不把旧历史文本提升成系统指令。
+
+历史复用前，[context.py](../backend/app/qa/context.py) 的 `conversation_memory()` 优先读取快照；`load_segment_context()` 会验证来源属于同租户、同用户、同 Segment 的更早 run，逐项重新核对文档 ACL 与有效 Build，并登记 `run_dependency` / `run_source(purpose=HISTORY)`。一旦来源撤权或 Build 漂移，按 `SOURCE_CHANGED` 失败关闭；快照不是永久阅读授权。旧 run 的 `E1` 等 evidenceId 不会转成新 run 的有效证据。
+
+Worker/HITL **恢复当前 run** 时，优先从 `JobCheckpointSaver` 取回未完成节点及 `AgentState.business_state`，遵守 `lease_epoch` fencing，而不是把整个跨轮历史重新当成一次新的 Agent 运行。外层 Checkpointer 无法恢复无持久化 Checkpointer 的内层 `RagRetrievalGraph` 任意节点，也不保证外部模型/工具调用 exactly-once。
+
+原有数据库需要同时应用 [工具来源迁移](design/migrations/20261010_add_tool_run_sources.sql) 与 [跨轮快照迁移](design/migrations/20261010_segment_context_snapshot.sql)（按实际已应用迁移判断）。**这是一套应用层上下文持久化，不是供应商 KV Cache；真实缓存命中率、延迟与费用收益仍需实测。**
+
+### 7.3 六个工具与本例轨迹
 
 | 工具 | 实现路径 | 作用 |
 | --- | --- | --- |
@@ -420,7 +458,7 @@ builder.add_edge("tools", "model")
 
 搜索结果会去重，证据保存在状态中。工具消息发送压缩摘录，而完整原文仍可保存在 `evidence_map`；二者可能长度不同，不能把“系统存了完整证据”自动等同于“模型完整读过该证据”。
 
-### 7.3 为什么循环不会无限运行
+### 7.4 为什么循环不会无限运行
 
 阅读 [runtime.py](../backend/app/qa/runtime.py) 的 `AgentRuntimePolicy`、`assert_runtime_budget()`、`compact_messages()`、`retry_call()`。
 
@@ -428,7 +466,7 @@ builder.add_edge("tools", "model")
 
 需要审批的工具通过 LangGraph `interrupt()` 暂停；`JobCheckpointSaver` 将图状态持久化到任务相关存储。审批接口进入 `QaService.resolve_tool_approval()`，随后 `queue_resume()` 安排恢复。理解普通 model/tools 循环后，再读 [job_checkpointer.py](../backend/app/qa/job_checkpointer.py)，不必第一遍就深入 checkpoint 序列化。
 
-### 7.4 统一 Agent 的严格验证
+### 7.5 统一 Agent 的严格验证
 
 新运行由 `LangGraphAgent.run()` 产生结构化结果，随后由 [service.py](../backend/app/qa/service.py) 的 `_verify_answer()` 执行严格验证；旧 RAG 代码为历史兼容保留。默认标记 `verification=STRUCTURAL_ONLY`；只有 strict 开启且存在 claims，才额外调用 `judge-main` 做逐 Claim 支持性判定。无 claims 时不会调用严格裁判，也不会因此标为 `SUPPORTED`。
 
@@ -438,7 +476,7 @@ builder.add_edge("tools", "model")
 
 **对应测试：** [test_agent.py](../backend/tests/test_agent.py) 的 `test_agent_single_tool_search_and_answer()`、`test_agent_repeated_calls_termination()`；[test_agent_runtime.py](../backend/tests/test_agent_runtime.py) 的 `test_agent_hitl_checkpoint_and_resume()`。
 
-### 7.5 评估如何复用问答流程
+### 7.6 评估如何复用问答流程
 
 阅读 [evaluation/runner.py](../backend/app/evaluation/runner.py)：
 
@@ -469,7 +507,9 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 | 原始资料 | `document_table`、`document_version_table` | 文档状态、版本、active_build_id |
 | 解析索引 | `index_build_table`、`source_unit_table`、`chunk_table`、`chunk_span_table` | build、kind、parent_id、来源偏移 |
 | 后台执行 | `job_table` | kind、target_id、status、checkpoint、lease_epoch |
-| 问答 | `conversation_table`、`context_segment_table`、`qa_run_table` | owner、scope、question、result_json |
+| 问答 | `conversation_table`、`context_segment_table`、`qa_run_table` | owner、scope、question、result_json、turn_no |
+| 跨轮记忆 | `context_segment_table` | context_payload、context_version、context_through_turn、context_boundary_turn、context_last_run_id |
+| 节点恢复 | `job_table` | `checkpoint.langgraph`、lease_epoch（按单次 QA_RUN 保存） |
 | 溯源与调用 | `run_source_table`、`run_event_table`、`model_call_table` | 来源关联、阶段事件、调用用途和用量 |
 | 评估 | `eval_run_table`、`eval_result_table`、`eval_review_table` | manifest、单题结果、追加复核 |
 
@@ -490,7 +530,10 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 | 上传返回了但搜不到 | job 状态 → source_unit/chunk → build READY → active_build_id → ACL → 索引 |
 | 检索命中但答非所问 | hit.text → evidence → 模型 messages → claims → 金标准事实 |
 | 子块命中，引用却显示一大段 | `_expand_parents()`、matchedText、parentChunkId |
-| 新建问答没有继续执行 | `QA_RUN` Job → Worker / Lease → LangGraph checkpoint → Cancel / 模型服务 |
+| 新建问答没有继续执行 | `QA_RUN` Job → Worker / Lease → `job.checkpoint.langgraph` → Cancel / 模型服务 |
+| 追问没有继承上一轮对象 | `conversation_memory()` → `load_segment_context()` → `context_payload.businessState` → `AgentState.business_state` → 本轮显式 ID |
+| 下一轮因历史资料失效而失败 | `context_payload.sourceRuns` → `run_dependency` / HISTORY 来源 → ACL / active build → `SOURCE_CHANGED` |
+| 同一轮被重复追加或版本冲突 | `context_last_run_id` / `context_through_turn` → `append_completed_turn()` → `VERSION_CONFLICT` / lease fencing |
 | 旧 REALTIME RAG 运行未完成 | 核对旧 `qa_run.mode`、任务清点及历史恢复兼容代码，不能按 Agent 语义恢复 |
 | 数据库是 SUCCEEDED，接口是 PARTIAL | `result_json.status` 与 `get_run()` 的合并 |
 | 以前能读的答案现在隐藏 | `get_run()` → `_all_sources()` → `can_read_document()` |
@@ -543,7 +586,18 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 
 观察 `_model_step()` 返回的 tool_calls，接着看 `_tools_step()` 如何写入 evidence 并追加 tool 消息；再观察审批暂停与恢复。`test_e2e_full_user_and_admin_workflow()` 可用作学习用的客户端脚本，帮助串起认证、资料和问答接口。
 
-### 9.5 怎样判断自己已经读懂
+### 9.5 第四组：跨轮快照、恢复与权限
+
+仍在 backend 目录执行现有定向回归：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest tests/test_segment_context.py tests/test_unified_business_agent.py::test_unified_agent_segment_context_version_and_followup tests/test_unified_business_agent.py::test_segment_context_replayed_run_does_not_append_again tests/test_agent_runtime.py::test_agent_hitl_checkpoint_and_resume -q
+if ($LASTEXITCODE -ne 0) { throw '会话上下文或恢复测试失败' }
+```
+
+建议断点依次放在 `conversation_memory()`、`load_segment_context()`、`LangGraphAgent.run()`、`_finalize_run()`、`append_completed_turn()`。观察第 1/2 轮的 `context_through_turn` 变化、正常追加时不变的 `context_version`、压缩时更新的 `boundaryTurn`、`sourceRuns` 及 `job.checkpoint.langgraph`。补充测试撤权、换用户、重复回放和历史 `E1` 不能冒充当前证据；这些 SQLite/fake model 回归不能代替真实 MySQL 与模型联合验收。
+
+### 9.6 怎样判断自己已经读懂
 
 尝试不看文档回答这些问题，然后回到对应函数验证：
 
@@ -556,12 +610,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Agent 与系统流程测试失败' }
 7. Agent 是谁决定调用工具、谁真正执行工具？
 8. 单元测试通过能证明什么，不能证明什么？
 9. 评估里 100% 成功率为什么仍可能无法通过门禁？
+10. 跨轮 `context_segment` 快照和单次 `job.checkpoint.langgraph` 各什么时候读取、写入？为什么历史 `E1` 不能跨 run 直接复用？
 
-能沿着代码解释这九个问题，说明已经掌握项目主要过程；之后再深入删除传播、租约恢复、模型计费、复杂 ACL 和部署配置。
+能沿着代码解释这十个问题，说明已经掌握项目主要过程；之后再深入删除传播、租约恢复、模型计费、复杂 ACL 和部署配置。
 
 ## 10. 与现有文档如何配合
 
-推荐顺序是：[README 总览](../README.md) → 本源码导读 → [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
+推荐顺序是：[README 总览](../README.md) → 本源码导读 → [Agent 知识检索工具图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
 本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；统一 Agent 使用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。
 

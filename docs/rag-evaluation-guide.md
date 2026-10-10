@@ -6,7 +6,7 @@
 
 若要先理解上传、解析、检索、普通 RAG 和 Agent 如何串起来，请从[项目源码导读](source-walkthrough.md)开始，再回到本文学习评估。
 
-**历史评测核对基线：2026-10-08，`main` 的提交 `bc3d643`；统一 Agent 增量以 PR #14 开发分支为准，仍未完全验收。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
+**源码核对基线：2026-10-10，`main` 的合并提交 `2b40a9b`（PR #14 已合并）；真实模型、完整业务场景与评估门禁仍需独立验收。** 本文依据当前 v2 评估实现与测试编写，不是一次真实模型实验报告；示例题目、数字和阈值均不代表项目实测成绩。当前技术栈为 Python FastAPI、MySQL、Milvus 和 LiteLLM；旧设计中的 Java、Elasticsearch 描述不能直接当作当前部署说明。
 
 ## 目录
 
@@ -218,7 +218,7 @@ nDCG@K = DCG@K / IDCG@K
 
 当前 `_compute_retrieval_metrics()` 没有独立使用传入的 `evidence_list` 计算上下文覆盖。检索模式传入流水线 `hits`，RAG/AGENT 模式传入最终 QA `evidence`。虽然指标标注了 `FINAL_RANKED_CANONICAL`，仍应根据调用来源解释它，不能据此声称已经完成各阶段召回和上下文覆盖评估。
 
-**PR #13 历史检索图、PR #14 统一 Agent 的评估边界**：新完整问答（旧 `mode=RAG` 输入也规范化为 `AGENT`）在模型选择 `search_knowledge` 时通过 `RagRetrievalGraph` 执行检索节点；纯检索模式 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 仍使用 `RetrievalPipeline.retrieve()`。普通 RAG 检索节点新增 `RAG_DENSE_RECALL`、`RAG_BM25_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_CONTEXT_BUDGET` 等 `run_event`，**当前只记录阶段命中数量、耗时和开关，不保存完整有序候选列表，也不自动计算阶段级 Recall@5、NDCG@5 或 Context Coverage**。需在权限受控的评估执行中另行保存各阶段 canonical Chunk ID / Build ID 及排名，才能将阶段数据与 Gold fact groups 对齐计算归因指标。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
+**当前 Agent 知识检索图与评估边界**：新完整问答（旧 `mode=RAG` 输入也规范化为 `AGENT`）在模型选择 `search_knowledge` 时通过 `RagRetrievalGraph` 执行检索节点；纯检索模式 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 仍使用 `RetrievalPipeline.retrieve()`。普通 RAG 检索节点新增 `RAG_DENSE_RECALL`、`RAG_BM25_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_CONTEXT_BUDGET` 等 `run_event`，**当前只记录阶段命中数量、耗时和开关，不保存完整有序候选列表，也不自动计算阶段级 Recall@5、NDCG@5 或 Context Coverage**。需在权限受控的评估执行中另行保存各阶段 canonical Chunk ID / Build ID 及排名，才能将阶段数据与 Gold fact groups 对齐计算归因指标。详见 [普通 RAG LangGraph 检索图说明](rag-langgraph-retrieval.md)。
 
 ## 4. 回答质量怎么判断
 

@@ -2,7 +2,7 @@
 
 Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（供应商 API 密钥由网关独立持有）、Docling 独立解析服务，面向运营、产品和技术共用的企业级内部知识库。前端简洁，重点是细粒度权限控制、文档全生命周期、混合检索策略、可追溯事实断言回答、自动化评测与故障恢复。旧 Java/Spring Boot/Elasticsearch 基线可通过 Git 历史标签或提交记录定位。
 
-> **分支状态（2026-10-10）**：本文以下的统一业务 Agent 流程对应 [PR #14 的开发分支](https://github.com/songsinfo/RAG/pull/14)，**尚未合并 main，尚未满足 UA-01～UA-12 全量验收**。四个业务诊断工具均为固定模拟结果，没有调用 Java 或真实业务系统。实现进度、未完成项与回滚条件见[统一业务 Agent 实施状态](docs/delivery/unified-business-agent-implementation-status.md)。
+> **当前 main（2026-10-10）**：[PR #14](https://github.com/songsinfo/RAG/pull/14) 已合并（`2b40a9b`），统一 Agent、Durable QA 和跨轮版本化快照代码已进入主分支；**合并不等于 UA-01～UA-12 全量生产验收完成**。四个业务诊断工具仍为固定模拟结果，没有调用 Java 或真实业务系统；真实模型表现及缓存收益仍需实测。范围、剩余验收与回滚条件见[统一业务 Agent 实施状态](docs/delivery/unified-business-agent-implementation-status.md)。
 
 ## 系统架构与核心流程
 
@@ -86,7 +86,7 @@ flowchart TD
 
 ```
 
-### 统一业务 Agent 问答流程图（PR #14 开发分支）
+### 统一业务 Agent 问答流程图（当前 main）
 
 ```mermaid
 flowchart TD
@@ -127,7 +127,7 @@ flowchart TD
 
 **两类证据**：文档引用由 `documentId/buildId`、来源原文和 ACL 约束；`TOOL` 引用存储 `sourceType/toolName/sourceSnapshot`、查询对象、`queriedAt`、`fixtureVersion`、`mock`，不伪造文档链接。页面及回答通过后端字段提示“模拟结果，未查询真实业务系统”。这不意味着真实用户业务资格经过核验。上下文压缩与缓存可观测性尚不等于跨轮稳定 KV cache 已验收；详细状态见实施记录。
 
-## 企业化增强（PR #14 候选实现；以逐项测试结果为准）
+## 当前实现与验收边界（PR #14 已合并；仍需逐项验收）
 
 - **统一权限真源**：Search API、普通 RAG、Agent 检索统一使用 `get_readable_build_records()`，同时覆盖租户、用户状态、KB ACL、文档 ACL、用户组和 active build。
 - **TOCTOU 防护**：检索后、模型外发前再次核对当前权限与 `active_build_id`；权限撤销或版本切换时返回 `SOURCE_CHANGED`，不把失效来源发送给模型。
@@ -139,13 +139,14 @@ flowchart TD
 - **统一 Agent 问答通道**：新提问总是创建 `QA_RUN` Durable Job，前端移除 RAG / Agent 模式选择，保留 SSE、取消、追问与受权限控制的历史展示；旧 REALTIME 代码用于历史兼容，尚未完成清理。
 - **Durable Job Worker**：INGEST/PURGE/EVALUATE 和新建统一 Agent 问答使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
 - **对象存储**：Artifact Store 支持本地与 S3/MinIO，`RAG_ARTIFACT_STORE=s3` 即可切换。
-- **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文使用保守 Token 估算及高低水位完整对话组裁剪（未达到阈值保留前缀），不再采用 LangChain `trim_messages` 逐轮裁剪；跨问答的持久化稳定上下文尚未实现。
+- **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文使用保守 Token 估算及高低水位完整对话组裁剪（未达到阈值保留前缀），不再采用 LangChain `trim_messages` 逐轮裁剪；跨 run 的授权历史与结构化业务状态已在 `context_segment` 中版本化持久化（普通追加保留快照版本、压缩时更新版本与边界）；不等于共享完整 LangGraph checkpoint，也不代表供应商 KV Cache 已验证。
+- **跨轮持久化与恢复边界**：`qa/segment_context.py` 的快照保存已授权的 user/assistant 历史、业务对象和来源依赖；`JobCheckpointSaver` 仅在单次 `QA_RUN` 的 `job.checkpoint.langgraph` 中保存可恢复节点状态。历史证据 ID 不能直接跨 run 复用；已存在数据库需应用 `20261010_segment_context_snapshot.sql` 增量迁移。
 - **职责边界**：LangGraph 负责图状态和 HITL 恢复，项目实现上下文预算和消息组裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
 - **CI 基线**：GitHub Actions 执行 Python compile/pytest 与前端 type-check/test/build。
 
 ## 阅读顺序
 
-若目标是理解当前 Python 项目并阅读主要源码，先看[源码导读：从上传文件到回答与评估](docs/source-walkthrough.md)，再看[普通 RAG LangGraph 检索图说明](docs/rag-langgraph-retrieval.md)和[RAG 评估完整说明](docs/rag-evaluation-guide.md)。下面的 PRD 与技术设计用于理解需求和设计意图，其中部分仍描述旧 Java / Elasticsearch 方案，当前行为以源码及这两份导读的核对基线为准。
+若目标是理解当前 Python 项目并阅读主要源码，先看[源码导读：从上传文件到回答与评估](docs/source-walkthrough.md)，再看[Agent 知识检索工具图说明](docs/rag-langgraph-retrieval.md)和[RAG 评估完整说明](docs/rag-evaluation-guide.md)。下面的 PRD 与技术设计用于理解需求和设计意图，其中部分仍描述旧 Java / Elasticsearch 方案，当前行为以源码及这两份导读的核对基线为准。
 
 1. [当前范围与交付顺序](docs/00-project-assessment.md)
 2. [PRD-00 产品总览](docs/prd/PRD-00-product-overview.md)

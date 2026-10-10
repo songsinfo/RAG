@@ -1,8 +1,9 @@
-"""仅为普通 RAG 问答编排的 LangGraph 检索图。
+"""供统一 Agent 的 search_knowledge 及历史 RAG 兼容执行调用的 LangGraph 检索图。
 
-Agent/search API 仍使用原 RetrievalPipeline.retrieve()，共享底层 Milvus、
-RRF、Reranker、Parent Expansion 和 provenance 的现有实现。本图不接入
-Checkpointer：在线普通 RAG 仍是 REALTIME，不创建 QA_RUN Job。
+新建在线问答统一进入 DURABLE Agent/QA_RUN Job；Agent 的知识检索工具调用本图。
+独立 Search API 与纯检索评测仍走 RetrievalPipeline.retrieve()，共享底层 Milvus、
+RRF、Reranker、Parent Expansion 和 provenance。内层检索图不启用 Checkpointer；
+单次问答的持久化恢复由外层 Agent/QA_RUN 负责，不能恢复本图任意中间节点。
 """
 from __future__ import annotations
 
