@@ -850,6 +850,10 @@ class QaService:
                 )
                 QaService._verify_answer(actor, run_id, agent_res, strict_mode)
                 validate_output(agent_res.get("answer", ""))
+                QaService._record_event(actor.tenant_id, run_id, "ANSWER_VERIFIED", {
+                    "strictMode": strict_mode,
+                    "verification": agent_res.get("verification", "STRUCTURAL_ONLY"),
+                })
                 QaService._finalize_run(actor.tenant_id, run_id, "SUCCEEDED", "FINISHED", agent_res.get("status", "COMPLETED"), agent_res)
                 return
 
@@ -1180,6 +1184,32 @@ class QaService:
             return r and (r.status == "CANCELLED" or r.cancel_requested_at is not None)
 
     @staticmethod
+    def _insert_terminal_event(conn, tenant_id: str, run_id: str, now, status: str,
+                               terminal_reason: str, error_code=None) -> None:
+        """与 run/job 的终态同事务写入事件，避免 finalization 后 lease 消失而漏写。"""
+        sequence = conn.execute(
+            select(run_event_table.c.sequence_no)
+            .where(and_(
+                run_event_table.c.tenant_id == tenant_id,
+                run_event_table.c.run_id == run_id,
+            ))
+            .order_by(run_event_table.c.sequence_no.desc())
+            .limit(1)
+        ).scalar() or 0
+        conn.execute(run_event_table.insert().values(
+            tenant_id=tenant_id,
+            id=str(uuid.uuid4()),
+            run_id=run_id,
+            sequence_no=int(sequence) + 1,
+            stage="FINISHED",
+            duration_ms=0,
+            payload={"runStatus": status, "terminalReason": terminal_reason},
+            error_code=error_code,
+            created_at=now,
+            updated_at=now,
+        ))
+
+    @staticmethod
     def _finalize_run(
         tenant_id: str,
         run_id: str,
@@ -1221,7 +1251,7 @@ class QaService:
                     ))
                     .values(status="COMPLETED", stage="FINISHED", lease_until=None, updated_at=now)
                 )
-            conn.execute(
+            updated = conn.execute(
                 update(qa_run_table)
                 .where(and_(
                     qa_run_table.c.tenant_id == tenant_id,
@@ -1237,6 +1267,10 @@ class QaService:
                     updated_at=now,
                 )
             )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            QaService._insert_terminal_event(conn, tenant_id, run_id, now, status, terminal_reason)
             conn.commit()
             log_stage(logger, "run_finished", stage, tenant_id=tenant_id, run_id=run_id,
                       status=status, terminal_reason=terminal_reason)
@@ -1288,7 +1322,7 @@ class QaService:
                         updated_at=now,
                     )
                 )
-            conn.execute(
+            updated = conn.execute(
                 update(qa_run_table)
                 .where(and_(
                     qa_run_table.c.tenant_id == tenant_id,
@@ -1303,6 +1337,10 @@ class QaService:
                     updated_at=now,
                 )
             )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            QaService._insert_terminal_event(conn, tenant_id, run_id, now, "FAILED", error_code, error_code)
             conn.commit()
             return True
 

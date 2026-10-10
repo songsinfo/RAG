@@ -204,3 +204,63 @@ def test_compaction_no_progress_must_not_discard_active_tool_pair():
 def test_agent_provider_cache_usage_normalization(cache, expected):
     from app.qa.model_usage import normalize_provider_usage
     assert normalize_provider_usage(cache)["cache_read_tokens"] == expected
+
+
+
+@pytest.mark.parametrize("followup", [
+    "Why user cannot use this coupon?",
+    "Can the user apply the coupon?",
+    "Is another user eligible?",
+    "Why is this coupon unavailable?",
+])
+def test_plain_language_does_not_overwrite_confirmed_identifiers(followup):
+    from app.qa.business_context import state_from_messages
+    previous = state_from_messages([
+        {"role": "user", "content": "user U123 coupon C456"},
+    ])
+    after = state_from_messages([{"role": "user", "content": followup}], previous)
+    assert after["objects"]["user_id"]["value"] == "U123"
+    assert after["objects"]["coupon_id"]["value"] == "C456"
+    assert not after["pending"]
+
+
+def test_explicit_keyed_ids_accept_non_numeric_values_and_switch_user():
+    from app.qa.business_context import state_from_messages
+    previous = state_from_messages([{"role": "user", "content": "user U123 coupon C456"}])
+    after = state_from_messages([
+        {"role": "user", "content": "user_id=alice activity_id=autumn"},
+    ], previous)
+    assert after["objects"]["user_id"]["value"] == "alice"
+    assert after["objects"]["activity_id"]["value"] == "autumn"
+    assert "coupon_id" not in after["objects"]
+
+
+def test_empty_snapshot_is_not_injected_into_protected_tool_call():
+    from app.qa.runtime import message_tokens, compact_messages
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old question " * 100},
+        {"role": "assistant", "content": "old answer " * 100},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "search_knowledge", "args": {"query": "x"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": json.dumps({
+            "evidence": [{"evidenceId": "E1", "excerpt": "x" * 500}]
+        })},
+    ]
+    protected = messages[:1] + messages[3:]
+    assert message_tokens(protected) <= 450
+    compacted, info = compact_messages(messages, 450)
+    assert compacted == protected
+    assert info["trimmed"]
+    assert not any(m.get("kind") == "context_snapshot" for m in compacted)
+
+
+def test_compaction_rejects_ambiguous_business_ids_without_guessing():
+    from app.qa.business_context import state_from_messages
+    state = state_from_messages([{"role": "user", "content": "user U123 coupon C456"}])
+    changed = state_from_messages([
+        {"role": "user", "content": "user U321 and user U456"},
+    ], state)
+    assert "user_id" not in changed["objects"]
+    assert any("user_id" in p for p in changed["pending"])

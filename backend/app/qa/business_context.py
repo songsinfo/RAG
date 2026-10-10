@@ -17,13 +17,30 @@ LABELS = {
     "product_group_id": r"(?:product[_\s-]?group(?:[_\s-]?id)?|商品组(?:ID|id)?)",
     "activity_id": r"(?:activity(?:[_\s-]?id)?|活动(?:ID|id)?)",
 }
+# Natural-language noun + arbitrary word is NOT a reliable identifier.
+# Two accepted forms: explicit assignment ("user_id=alice"), or a visibly coded
+# identifier containing a digit ("user U123"). "user cannot" never becomes an ID.
+_ID_VALUE = r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})"
+_CODE_VALUE = r"([A-Za-z0-9_]*\d[A-Za-z0-9_.:-]{0,127})"
 PATTERNS = {
-    name: re.compile(
-        rf"(?<![A-Za-z0-9_]){label}\s*(?:[:：=#]\s*|\s+)([A-Za-z0-9][A-Za-z0-9_.:-]{{0,127}})(?![A-Za-z0-9_])",
-        flags=re.IGNORECASE,
+    name: (
+        re.compile(
+            rf"(?<![A-Za-z0-9_]){label}\s*[:：=#]\s*{_ID_VALUE}(?![A-Za-z0-9_])",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<![A-Za-z0-9_]){label}\s+{_CODE_VALUE}(?![A-Za-z0-9_])",
+            flags=re.IGNORECASE,
+        ),
     )
     for name, label in LABELS.items()
 }
+
+
+def has_business_context(state: Optional[Dict[str, Any]]) -> bool:
+    """An empty state costs no prompt tokens and must not force a snapshot."""
+    normalized = normalize_business_state(state)
+    return bool(normalized["objects"] or normalized["pending"] or normalized["evidenceRefs"])
 
 
 def empty_business_state() -> Dict[str, Any]:
@@ -59,8 +76,8 @@ def update_from_user(
     updated = normalize_business_state(state)
     if not isinstance(text, str):
         return updated
-    for field, pattern in PATTERNS.items():
-        matches = {m.group(1) for m in pattern.finditer(text)}
+    for field, patterns in PATTERNS.items():
+        matches = {m.group(1) for pattern in patterns for m in pattern.finditer(text)}
         if len(matches) > 1:
             updated["objects"].pop(field, None)  # 两个候选：歧义而非任选其一
             updated["pending"] = list(dict.fromkeys([*updated["pending"], f"请确认 {field}"]))[:8]

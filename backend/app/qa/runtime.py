@@ -19,7 +19,7 @@ from sqlalchemy import and_, func, select
 from app.db import get_db_connection
 from app.errors import ApiException
 from app.models import model_call_table
-from app.qa.business_context import normalize_business_state, state_from_messages, state_message
+from app.qa.business_context import has_business_context, state_from_messages, state_message
 
 
 T = TypeVar("T")
@@ -161,7 +161,9 @@ def compact_messages(
         }
 
     system = [m for m in messages if m.get("role") == "system"]
+    previous_snapshot = any(m.get("kind") == "context_snapshot" for m in messages)
     others = [m for m in messages if m.get("role") != "system" and m.get("kind") != "context_snapshot"]
+    # Do not split a user turn from assistant tool_calls and corresponding ToolMessages.
     groups: List[List[Dict[str, Any]]] = []
     for msg in others:
         if msg.get("role") == "user" or not groups:
@@ -172,25 +174,26 @@ def compact_messages(
         raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "缺少当前问题，不能安全压缩")
 
     keep = list(groups)
-    compacted = list(messages)
-    while len(keep) > 1:
-        retained = system + [state_message(state)] + [msg for group in keep for msg in group]
-        if message_tokens(retained) <= int(max_tokens * .60):
-            compacted = retained
+    # Add a snapshot only when it carries useful state AND older messages were
+    # actually discarded (or an earlier snapshot is being replaced).
+    # In particular, do not spend tokens on an empty snapshot.
+    while True:
+        dropped_groups = len(groups) - len(keep)
+        should_snapshot = has_business_context(state) and (dropped_groups > 0 or previous_snapshot)
+        snapshot = [state_message(state)] if should_snapshot else []
+        compacted = system + snapshot + [msg for group in keep for msg in group]
+        tokens = message_tokens(compacted)
+        if tokens <= int(max_tokens * .60) or len(keep) <= 1:
             break
         keep.pop(0)
-    if compacted is messages or compacted == messages:
-        compacted = system + [state_message(state)] + [msg for group in keep for msg in group]
-    tokens = message_tokens(compacted)
+
     if tokens > max_tokens:
         raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "当前问题或必要的上下文对象超出硬限制，请缩小问题")
-    trimmed = len(keep) < len(groups) or any(m.get("kind") == "context_snapshot" for m in messages)
-    if not trimmed and original > max_tokens:
-        raise ApiException(429, "CONTEXT_LIMIT_EXCEEDED", "没有可安全删除的完整消息轮次")
+    trimmed = compacted != messages
     return compacted, {
         "trimmed": trimmed, "droppedMessages": max(0, len(messages) - len(compacted)),
         "estimatedTokens": tokens, "beforeTokens": original,
-        "businessState": state, "strategy": "complete-turns-with-state-v2",
+        "businessState": state, "strategy": "complete-turns-with-state-v3",
         "reason": "HIGH_WATERMARK" if trimmed else "PROTECTED_CONTEXT",
     }
 

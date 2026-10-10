@@ -297,9 +297,12 @@ def test_qa_run_lifecycle_and_evidence(client):
     stages = [e["stage"] for e in events]
     assert "ROUTED" in stages
     # 统一 Agent 有单独的运行/模型/工具事件；检索阶段属于 search_knowledge 子图。
-    for name in ("AGENT_RUNTIME", "AGENT_MODEL", "AGENT_TOOL", "RAG_SCOPE", "RAG_FINAL_HITS", "FINISHED"):
+    for name in ("AGENT_RUNTIME", "AGENT_MODEL", "AGENT_TOOL", "RAG_SCOPE", "RAG_FINAL_HITS",
+                 "ANSWER_VERIFIED", "FINISHED"):
         assert name in stages, f"missing {name}: {stages}"
     assert stages.index("AGENT_MODEL") < stages.index("RAG_SCOPE") < stages.index("AGENT_TOOL")
+    assert stages.index("RAG_FINAL_HITS") < stages.index("ANSWER_VERIFIED") < stages.index("FINISHED")
+    assert stages.count("FINISHED") == 1
     # 普通 RAG 实际经过 LangGraph 检索图，而非直接调用旧单体 Pipeline。
     for stage in (
         "RAG_SCOPE", "RAG_PREPARE_QUERY", "RAG_DENSE_RECALL",
