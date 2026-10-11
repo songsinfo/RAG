@@ -10,6 +10,8 @@
 
 ## 阅读顺序
 
+**待实施（2026-10-12）**：[Langfuse 可观测性接入与评估设计借鉴 Spec](11-langfuse-observability-spec.md)与[实施 Tickets](../delivery/langfuse-observability-tickets.md)定义先接 Langfuse、保留自建评估、不引入 Ragas 的方案；当前仅完成文档，尚未接入或部署。
+
 1. [架构与技术选型](01-architecture.md)：系统如何运行、哪些组件承担哪些工作。
 2. [数据库与权限](02-data-and-access.md)：ER、字段、索引、授权与事务边界。
 3. [文档入库与生命周期](03-ingestion.md)：解析、分块、建索引、发布及删除状态机。
