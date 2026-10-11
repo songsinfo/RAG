@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -98,6 +99,50 @@ def identifier(kind: str, value: Any) -> Optional[str]:
                     hashlib.sha256).hexdigest()[:32]
 
 
+_SDK_ALLOWED = frozenset({
+    "langfuse.observation.type", "langfuse.observation.model.name",
+    "langfuse.observation.usage_details", "langfuse.observation.metadata",
+    "langfuse.internal.is_app_root", "langfuse.internal.as_root",
+    "langfuse.environment", "langfuse.release", "session.id",
+})
+
+
+def _safe_sdk_value(key: str, value: Any) -> bool:
+    if key == "langfuse.observation.type":
+        return value in {"generation", "embedding"}
+    if key == "langfuse.observation.model.name":
+        return bool(_safe_code(value))
+    if key == "langfuse.observation.usage_details":
+        try:
+            usage = json.loads(value) if isinstance(value, str) else value
+            return isinstance(usage, dict) and all(
+                k in {"input", "output", "cache_read_input_tokens"} and type(v) is int
+                and 0 <= v <= 100000000 for k, v in usage.items())
+        except (TypeError, ValueError):
+            return False
+    if key == "langfuse.observation.metadata":
+        try:
+            data = json.loads(value) if isinstance(value, str) else value
+            if not isinstance(data, dict) or set(data) - {
+                "purpose", "call", "status", "durationMs", "errorCode",
+                "costCurrency", "costStatus", "settledCny"}:
+                return False
+            return all(
+                (bool(_safe_code(v)) if k in {"purpose", "status", "errorCode", "costCurrency", "costStatus"}
+                 else bool(_HASH_RE.fullmatch(v)) if k == "call" and isinstance(v, str)
+                 else type(v) in {int, float} and 0 <= v < 1e12 if k in {"durationMs", "settledCny"}
+                 else False) for k, v in data.items())
+        except (TypeError, ValueError):
+            return False
+    if key in {"session.id"}:
+        return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
+    if key in {"langfuse.environment", "langfuse.release"}:
+        return bool(_safe_code(value))
+    if key in {"langfuse.internal.is_app_root", "langfuse.internal.as_root"}:
+        return type(value) is bool
+    return False
+
+
 def _export_span(span: Any) -> bool:
     """Strict scope + attributes/events allowlist, including SDK generation spans."""
     try:
@@ -105,17 +150,8 @@ def _export_span(span: Any) -> bool:
         if scope == "langfuse-sdk":
             if not str(span.name).startswith("model.") or span.events or getattr(span.status, "description", None):
                 return False
-            attrs = dict(span.attributes or {})
-            allowed = {
-                "langfuse.observation.type", "langfuse.observation.model.name",
-                "langfuse.observation.usage_details", "langfuse.internal.is_app_root",
-                "langfuse.internal.as_root", "session.id",
-                "langfuse.observation.metadata.purpose", "langfuse.observation.metadata.call",
-                "langfuse.observation.metadata.status", "langfuse.observation.metadata.durationMs",
-                "langfuse.observation.metadata.errorCode", "langfuse.observation.metadata.costCurrency",
-                "langfuse.observation.metadata.costStatus", "langfuse.observation.metadata.settledCny",
-            }
-            return all(key in allowed for key in attrs)
+            return all(key in _SDK_ALLOWED and _safe_sdk_value(key, value)
+                       for key, value in dict(span.attributes or {}).items())
         if scope != "rag.agent" or not str(span.name).startswith(("qa.", "agent.", "rag.")):
             return False
         attrs = dict(span.attributes or {})
@@ -142,22 +178,12 @@ def _mask_otel_spans(*, params):
 
     # These are the only SDK-managed attributes permitted on synthetic metadata
     # generations; remove all unknown SDK attributes, including freeform payloads.
-    sdk_allowed = {
-        "langfuse.observation.type", "langfuse.observation.model.name",
-        "langfuse.observation.usage_details",
-        "langfuse.internal.is_app_root", "langfuse.internal.as_root",
-        "langfuse.observation.metadata.purpose", "langfuse.observation.metadata.call",
-        "langfuse.observation.metadata.status", "langfuse.observation.metadata.durationMs",
-        "langfuse.observation.metadata.errorCode", "langfuse.observation.metadata.costCurrency",
-        "langfuse.observation.metadata.costStatus", "langfuse.observation.metadata.settledCny",
-        "session.id",
-    }
     patches = {}
     for ref, span in params.spans.items():
         attrs = span.attributes
         is_sdk = span.instrumentation_scope_name == "langfuse-sdk"
         if is_sdk:
-            to_delete = tuple(key for key in attrs if key not in sdk_allowed)
+            to_delete = tuple(key for key, value in attrs.items() if key not in _SDK_ALLOWED or not _safe_sdk_value(key, value))
         else:
             to_delete = tuple(key for key in attrs if key not in _SAFE_KEYS)
         if to_delete:
