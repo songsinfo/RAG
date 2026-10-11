@@ -29,6 +29,7 @@ def candidate_snapshot(stage: str, candidates: list[dict], *, limit: int,
         items.append({
             "rank": rank,
             "chunkId": hit.get("chunkId"),
+            "documentId": hit.get("documentId"),
             "buildId": hit.get("buildId"),
             "parentChunkId": hit.get("parentChunkId"),
             "sourceType": hit.get("sourceType", "DOCUMENT"),
@@ -120,7 +121,7 @@ def read_eval_diagnostics(actor, run_id: str) -> list[dict]:
             items = data.get("items") or []
             with get_db_connection() as conn:
                 assert_hits_still_readable(conn, persona, [
-                    {"documentId": None, "buildId": item.get("buildId"),
+                    {"documentId": item.get("documentId"), "buildId": item.get("buildId"),
                      "chunkId": item.get("chunkId")} for item in items])
             result.append(data)
         except Exception:
