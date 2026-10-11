@@ -125,3 +125,37 @@ def test_score_projection_retains_unknown_and_human_revisions():
         "p", "r", "correctness", "v2", "r1")
     assert score_id("p", "r", "correctness", "v2", "r1") != score_id(
         "p", "r", "correctness", "v2", "r2")
+
+
+def test_actual_sdk_generation_span_is_safe_and_parented(monkeypatch):
+    """Inspect SDK-generated OTel attributes, not only handcrafted fake spans."""
+    from langfuse import Langfuse
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import InMemorySpanExporter, SimpleSpanProcessor
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sdk = Langfuse(
+        public_key="pk-lf-test-123", secret_key="sk-lf-test-123",
+        base_url="http://127.0.0.1:1", tracer_provider=provider,
+        tracing_enabled=True, flush_at=1000, flush_interval=600,
+        should_export_span=telemetry._export_span,
+    )
+    with provider.get_tracer("rag.agent").start_as_current_span(
+        "qa.worker.attempt", record_exception=False
+    ) as root:
+        root.set_attribute("rag.export", True)
+        obs = sdk.start_observation(as_type="generation", name="model.answer",
+                                    model="chat-main", metadata={
+                                        "purpose": "ANSWER", "call": "b" * 32})
+        obs.update(usage_details={"input": 12, "output": 2})
+        obs.end()
+    spans = exporter.get_finished_spans()
+    assert len(spans) >= 2
+    assert any(s.name == "model.answer" for s in spans)
+    for span in spans:
+        if span.name == "model.answer":
+            assert span.context.trace_id == root.get_span_context().trace_id
+            assert telemetry._export_span(span), dict(span.attributes or {})
+            assert "confidential" not in str(span.attributes)
