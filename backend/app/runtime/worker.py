@@ -25,6 +25,7 @@ from app.knowledge.artifacts import read_artifact
 from app.models import app_user_table, deletion_record_table, job_table, qa_run_table
 from app.qa.runtime import is_retryable_job_code
 from app.logging_config import configure_logging, log_context
+from app.telemetry import configure_telemetry, observation_batch, shutdown_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class DurableJobWorker:
 
     def run_forever(self):
         """持续轮询；当前没有任务时按 poll_seconds 休眠，避免空转占 CPU。"""
+        configure_telemetry()
         logger.info("Durable worker started: %s", self.worker_id)
         while not self._stop.is_set():
             try:
@@ -71,7 +73,8 @@ class DurableJobWorker:
                          run_id=str(job["target_id"]) if job["kind"] == "QA_RUN" else None,
                          worker_id=self.worker_id, kind=job["kind"], lease_epoch=job["lease_epoch"],
                          attempt=int(job.get("attempt") or 0) + 1):
-            self._execute_claimed(job)
+            with observation_batch(job):
+                self._execute_claimed(job)
         return True
 
     def _execute_claimed(self, job):
@@ -356,7 +359,10 @@ class DurableJobWorker:
 
 def main():
     configure_logging()
-    DurableJobWorker().run_forever()
+    try:
+        DurableJobWorker().run_forever()
+    finally:
+        shutdown_telemetry(float(os.getenv("RAG_LANGFUSE_SHUTDOWN_TIMEOUT_SECONDS", "2")))
 
 
 if __name__ == "__main__":

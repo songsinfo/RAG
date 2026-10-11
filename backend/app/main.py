@@ -83,6 +83,8 @@ async def lifespan(app: FastAPI):
         worker.stop()
     for thread in worker_threads:
         thread.join(timeout=5)
+    from app.telemetry import shutdown_telemetry
+    shutdown_telemetry(float(__import__("os").getenv("RAG_LANGFUSE_SHUTDOWN_TIMEOUT_SECONDS", "2")))
 
 
 app = FastAPI(
