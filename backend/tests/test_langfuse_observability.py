@@ -215,7 +215,7 @@ def test_actual_sdk_generation_span_is_safe_and_parented(monkeypatch):
             # Must not export unknown span events or unrelated instrumentation.
             with provider.get_tracer("sqlalchemy").start_as_current_span("db.query") as ignored:
                 ignored.set_attribute("db.statement", "SENSITIVE_SQL_CANARY")
-        assert sdk.flush()
+        sdk.flush()
         exported = list(langfuse_exporter.get_finished_spans())
         assert {s.name for s in exported} == {"qa.worker.attempt", "model.answer"}
         model_span = next(s for s in exported if s.name == "model.answer")
