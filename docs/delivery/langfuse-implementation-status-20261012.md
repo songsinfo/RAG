@@ -12,9 +12,9 @@
 
 ## 未实现 / 未验证（不得视为满足 LF-AC01～10）
 
-- 尚未针对 SDK 4.16.0 运行安装后的兼容性/真实序列化载荷测试；现有实现不能证明 SDK 产生的内部 attributes、events 和资源字段完全符合白名单；生产环境不可直接开启。
-- 尚未完成 `rag_graph` 全阶段独立 span、并行 context 显式传播、受控评估的候选排名与真实消息区间快照（LF-T04）。
-- 尚未完成已存自动/人工评分的显式幂等同步（LF-T05），因此无 Langfuse 评分收件证据。
+- 依赖已在 pyproject.toml 与 CI 的 requirements.txt 同步锁定。已新增针对实际 SDK span 的测试，待最新 CI 结果；尚缺经过真正 Langfuse exporter 的最终 HTTP/OTLP 载荷抓取验证，生产环境不可直接开启。
+- 已增加 `rag_graph` 阶段 span 和带检索序号的候选快照；仅评估 QA run 允许生成私有 artifact，并由管理员经来源/快照复核后读取。仍缺并行 context 的专门压力测试、纯检索评测的同口径阶段快照及真正发送给模型的来源区间归因（LF-T04 尚未验收）。
+- 已新增显式 `POST /api/v1/admin/eval/runs/{id}/langfuse-scores`，对最终 QA trace 读取自动/人工评分，保留分类/数字、UNKNOWN 和人工 revision；仅返回 `ENQUEUED_NOT_CONFIRMED`，尚无实际服务收件及端到端幂等证据（LF-T05 尚未验收）。
 - `SYNTHETIC_EVAL` 内容模式禁止使用，当前仅实现元数据模式。
 - 未部署私有 Langfuse 服务及其 ClickHouse/Postgres/对象存储；缺服务器镜像版本、权限隔离、收件 trace 实例、负载与故障 P50/P95 对照（LF-T06）。
 - 未运行线上模型或调用付费供应商；不能声称兼容性、性能、安全隐私端到端验收已通过。
