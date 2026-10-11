@@ -312,10 +312,7 @@ def model_observation(purpose: str, alias: str, call_id: str) -> Iterator[Any]:
     try:
         yield observation
     finally:
-        try:
-            observation.end()  # no exception object or traceback handed to SDK
-        except Exception:
-            logger.warning("Langfuse generation end failed")
+        pass  # finished after provider usage is known by finish_model_observation
 
 
 def finish_model_observation(observation: Any, *, status: str, duration_ms: float,
@@ -347,6 +344,11 @@ def finish_model_observation(observation: Any, *, status: str, duration_ms: floa
         observation.update(**kwargs)
     except Exception:
         logger.warning("Langfuse generation update failed")
+    finally:
+        try:
+            observation.end()
+        except Exception:
+            logger.warning("Langfuse generation end failed")
 
 
 def shutdown_telemetry(timeout_seconds: float = 2.0) -> None:
