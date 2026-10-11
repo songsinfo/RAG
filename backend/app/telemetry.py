@@ -155,7 +155,7 @@ def _mask_otel_spans(*, params):
     patches = {}
     for ref, span in params.spans.items():
         attrs = span.attributes
-        is_sdk = span.instrumentation_scope and span.instrumentation_scope.name == "langfuse-sdk"
+        is_sdk = span.instrumentation_scope_name == "langfuse-sdk"
         if is_sdk:
             to_delete = tuple(key for key in attrs if key not in sdk_allowed)
         else:
