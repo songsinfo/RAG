@@ -18,7 +18,8 @@ def agent_span(name: str, attributes: Optional[Dict[str, Any]] = None) -> Iterat
             span.set_attribute("rag.export", export_current_span())
             yield span
     except ImportError:
-        yield None
+        # Only a missing tracing library should lead to an inert span.
+        raise
 
 
 def add_span_event(name: str, attributes: Optional[Dict[str, Any]] = None) -> None:

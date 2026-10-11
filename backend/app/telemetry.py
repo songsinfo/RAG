@@ -103,9 +103,19 @@ def _export_span(span: Any) -> bool:
     try:
         scope = span.instrumentation_scope.name
         if scope == "langfuse-sdk":
-            return (str(span.name).startswith("model.")
-                    and not span.events
-                    and not getattr(span.status, "description", None))
+            if not str(span.name).startswith("model.") or span.events or getattr(span.status, "description", None):
+                return False
+            attrs = dict(span.attributes or {})
+            allowed = {
+                "langfuse.observation.type", "langfuse.observation.model.name",
+                "langfuse.observation.usage_details", "langfuse.internal.is_app_root",
+                "langfuse.internal.as_root", "session.id",
+                "langfuse.observation.metadata.purpose", "langfuse.observation.metadata.call",
+                "langfuse.observation.metadata.status", "langfuse.observation.metadata.durationMs",
+                "langfuse.observation.metadata.errorCode", "langfuse.observation.metadata.costCurrency",
+                "langfuse.observation.metadata.costStatus", "langfuse.observation.metadata.settledCny",
+            }
+            return all(key in allowed for key in attrs)
         if scope != "rag.agent" or not str(span.name).startswith(("qa.", "agent.", "rag.")):
             return False
         attrs = dict(span.attributes or {})
@@ -130,13 +140,26 @@ def _mask_otel_spans(*, params):
     """
     from langfuse.types import MaskOtelSpansResult, OtelSpanPatch
 
+    # These are the only SDK-managed attributes permitted on synthetic metadata
+    # generations; remove all unknown SDK attributes, including freeform payloads.
+    sdk_allowed = {
+        "langfuse.observation.type", "langfuse.observation.model.name",
+        "langfuse.observation.usage_details",
+        "langfuse.internal.is_app_root", "langfuse.internal.as_root",
+        "langfuse.observation.metadata.purpose", "langfuse.observation.metadata.call",
+        "langfuse.observation.metadata.status", "langfuse.observation.metadata.durationMs",
+        "langfuse.observation.metadata.errorCode", "langfuse.observation.metadata.costCurrency",
+        "langfuse.observation.metadata.costStatus", "langfuse.observation.metadata.settledCny",
+        "session.id",
+    }
     patches = {}
-    sensitive_parts = ("input", "output", "prompt", "completion", "exception",
-                       "stack", "header", "body", "url", "question", "answer",
-                       "document", "message", "path", "content", "reason")
     for ref, span in params.spans.items():
-        to_delete = tuple(k for k in span.attributes if
-                          any(s in k.lower() for s in sensitive_parts))
+        attrs = span.attributes
+        is_sdk = span.instrumentation_scope and span.instrumentation_scope.name == "langfuse-sdk"
+        if is_sdk:
+            to_delete = tuple(key for key in attrs if key not in sdk_allowed)
+        else:
+            to_delete = tuple(key for key in attrs if key not in _SAFE_KEYS)
         if to_delete:
             patches[ref] = OtelSpanPatch(delete_attributes=to_delete)
     return MaskOtelSpansResult(span_patches=patches)
@@ -196,6 +219,12 @@ def configure_telemetry() -> None:
                 base_url=os.environ["LANGFUSE_BASE_URL"],
                 tracer_provider=provider,
                 sample_rate=1.0,  # batch-level sampling is decided before spans start
+                timeout=2,
+                flush_at=128,
+                flush_interval=1,
+                environment=os.getenv("RAG_ENVIRONMENT", "demo"),
+                release=os.getenv("RAG_COMMIT_SHA", "unknown"),
+                media_upload_thread_count=1,
                 should_export_span=_export_span,
                 mask_otel_spans=_mask_otel_spans,
             )
@@ -215,15 +244,19 @@ def active_batch() -> Optional[ObservationBatch]:
     return _batch_var.get()
 
 
+def configured_client():
+    return _client if _status == "ENABLED" and _enabled() else None
+
+
 def export_current_span() -> bool:
     batch = active_batch()
-    return bool(batch and batch.sampled and _client is not None)
+    return bool(batch and batch.sampled and configured_client() is not None)
 
 
 @contextmanager
 def observation_batch(job: dict[str, Any]) -> Iterator[Optional[ObservationBatch]]:
     """New physical OTel trace per claimed QA lease; never a span across HITL/restart."""
-    if job.get("kind") != "QA_RUN" or _client is None:
+    if job.get("kind") != "QA_RUN" or configured_client() is None:
         yield None
         return
     try:
@@ -353,16 +386,18 @@ def finish_model_observation(observation: Any, *, status: str, duration_ms: floa
 
 def shutdown_telemetry(timeout_seconds: float = 2.0) -> None:
     """Bound process exit; exporter failure must never block job completion."""
-    global _client, _configured, _status
+    global _client, _status
     with _lock:
         client, provider = _client, _provider
         _client = None
-        _configured = False
+        # The global OTel provider cannot be reset safely after shutdown.
+        # Repeated API lifespan calls therefore never append new processors.
     def close():
         try:
             if client:
                 client.flush()
             if provider:
+                provider.force_flush(timeout_millis=1000)
                 provider.shutdown()
         except Exception:
             logger.warning("Telemetry flush/shutdown failed")

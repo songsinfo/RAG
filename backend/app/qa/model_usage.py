@@ -61,6 +61,8 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         ModelGateway.assert_job_current(tenant_id, job_id)
         sent = True
         # One observation per actual attempt; retry/fallback invokes this function again.
+        # Errors from the model function itself must pass through unchanged.
+        # Exporter faults are caught inside the optional observation adapter.
         with model_observation(purpose, alias, call_id) as active:
             observation = active
             result = fn()
