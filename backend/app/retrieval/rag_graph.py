@@ -133,6 +133,10 @@ class RagRetrievalGraph:
                 if isinstance(result, dict):
                     hits = result.get("hits")
                     if isinstance(hits, list):
+                        from app.evaluation.diagnostics import capture_eval_stage
+                        capture_eval_stage(runtime.context, name, hits,
+                                           limit=max(1, getattr(state.get("cfg"), "fusion_top_k", 50)),
+                                           context=name in {"context_budget", "finalize_hits"})
                         from opentelemetry import trace
                         span = trace.get_current_span()
                         if span and span.is_recording():
