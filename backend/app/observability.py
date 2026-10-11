@@ -7,20 +7,9 @@ from app.telemetry import export_current_span, safe_attributes
 
 @contextmanager
 def agent_span(name: str, attributes: Optional[Dict[str, Any]] = None) -> Iterator[Any]:
-    try:
-        from opentelemetry import trace
-        tracer = trace.get_tracer("rag.agent")
-        # No exception recording: OTel's default auto-exception events leak exception text.
-        with tracer.start_as_current_span(name, record_exception=False,
-                                          set_status_on_exception=False) as span:
-            for key, val in safe_attributes(attributes).items():
-                span.set_attribute(key, val)
-            span.set_attribute("rag.export", export_current_span())
-            yield span
-    except ImportError:
-        # Only a missing tracing library should lead to an inert span.
-        raise
-
+    from app.telemetry import safe_span
+    with safe_span(name, {**safe_attributes(attributes), "rag.export": export_current_span()}) as span:
+        yield span
 
 def add_span_event(name: str, attributes: Optional[Dict[str, Any]] = None) -> None:
     if name not in {"guardrail.indirect_prompt_injection", "model.not_sent"}:

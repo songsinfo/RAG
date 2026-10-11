@@ -736,5 +736,6 @@ class ModelGateway:
                     )
                 )
                 conn.commit()
+            return budget
         except Exception:
             logger.exception("Failed to settle/persist model call %s", call_id)

@@ -59,6 +59,11 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
     try:
         ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
         ModelGateway.assert_job_current(tenant_id, job_id)
+        from app.evaluation.diagnostics import capture_model_context
+        if capture_model_context(tenant_id, run_id, call_id, purpose, payload):
+            # Private artifact I/O may take time; revalidate at the send boundary.
+            ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
+            ModelGateway.assert_job_current(tenant_id, job_id)
         sent = True
         # One observation per actual attempt; retry/fallback invokes this function again.
         # Errors from the model function itself must pass through unchanged.
@@ -80,7 +85,7 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         # 不把缺失的缓存字段当作 0；已返回且合法的 0 才是真实零命中。
         if not isinstance(detail["cacheReadTokens"], int) or detail["cacheReadTokens"] < 0:
             detail["cacheReadTokens"] = None
-        ModelGateway._record_call(
+        settlement = ModelGateway._record_call(
             tenant_id, call_id, run_id, purpose, "SUCCESS" if reported else "UNKNOWN",
             usage["input_tokens"] if reported else input_limit,
             usage["output_tokens"] if reported else output_limit, alias, job_id=job_id,
@@ -88,6 +93,7 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         )
         finish_model_observation(observation, status="SUCCESS" if reported else "UNKNOWN",
             duration_ms=(time.perf_counter() - started) * 1000,
+            settlement=settlement, usage_source="PROVIDER" if reported else "BYTE_CEILING",
             reported_usage={"input": usage["input_tokens"], "output": usage["output_tokens"],
                             **({"cache_read_input_tokens": usage["cache_read_tokens"]}
                                if usage["cache_read_tokens"] is not None else {})} if reported else None)

@@ -486,6 +486,15 @@ class EvaluationRunner:
                 try:
                     if len(turns) > 1:
                         raise ApiException(409, "MULTITURN_REQUIRES_QA", "多轮题不能仅执行第一轮检索")
+                    from app.evaluation.diagnostics import candidate_snapshot
+                    stage_snapshots = []
+
+                    def capture_stage(stage, candidates, limit, route_index=None):
+                        stage_snapshots.append(candidate_snapshot(
+                            stage, candidates, limit=limit, retrieval_index=1,
+                            context=stage in {"context_budget", "finalize_hits"}, route_index=route_index,
+                        ))
+
                     retrieval = RetrievalPipeline.retrieve(
                         actor=persona_actor,
                         query=question_text,
@@ -493,6 +502,7 @@ class EvaluationRunner:
                         config_id=eval_config_id,
                         run_id=None,
                         job_id=eval_job_id,
+                        diagnostic_fn=capture_stage,
                     )
                     hits = retrieval["hits"]
                     EvaluationCatalog.check_snapshot(actor, snapshot_id, check_current=True)
@@ -505,6 +515,7 @@ class EvaluationRunner:
                     metric["mode"] = mode
                     metric["configId"] = eval_config_id
                     metric["retrievalConfig"] = retrieval["config"]
+                    metric["retrievalDiagnostics"] = stage_snapshots
                     hit_val = metric.get("hit")
                     exp_status = expected_obj.get("status", "ANSWER")
                     # 对应拒答题，仅凭“检索是否命中”无法证明拒答正确，所以 taskSuccess 保持未知。

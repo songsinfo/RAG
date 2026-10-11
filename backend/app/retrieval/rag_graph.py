@@ -13,7 +13,7 @@ import functools
 import itertools
 from contextvars import copy_context
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -21,7 +21,6 @@ from langgraph.runtime import Runtime
 
 from app.db import get_db_connection
 from app.observability import agent_span
-from app.telemetry import safe_attributes
 from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, get_readable_build_records
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
@@ -48,6 +47,7 @@ class RagRetrievalContext:
     history: List[Dict[str, str]]
     record_event_fn: Optional[Callable[..., Any]]
     retrieval_index: int = 0
+    observation_context: Any = None
 
 
 class RagRetrievalState(TypedDict, total=False):
@@ -125,6 +125,12 @@ class RagRetrievalGraph:
     def _observe_stage(name, node):
         @functools.wraps(node)
         def observed(state, runtime):
+            context = runtime.context.observation_context
+            if context is not None:
+                return context.copy().run(in_context, state, runtime)
+            return in_context(state, runtime)
+
+        def in_context(state, runtime):
             idx = runtime.context.retrieval_index
             with agent_span("rag." + name, {"rag.retrieval_index": idx, "rag.stage": name}):
                 # LangGraph's parallel nodes run with their own captured context,
@@ -200,6 +206,7 @@ class RagRetrievalGraph:
             retrieval_index=next(cls._retrieval_indices),
         )
         with agent_span("rag.retrieve", {"rag.retrieval_index": ctx.retrieval_index}):
+            ctx = replace(ctx, observation_context=copy_context())
             state = cls._get_graph().invoke({}, context=ctx)
         return {
             "hits": state.get("hits", []),

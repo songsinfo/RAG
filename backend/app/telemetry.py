@@ -12,7 +12,7 @@ import os
 import re
 import secrets
 import threading
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
@@ -25,6 +25,31 @@ _client = None
 _status = "DISABLED"
 _pid = os.getpid()
 _batch_var: ContextVar[Optional["ObservationBatch"]] = ContextVar("rag_observation_batch", default=None)
+
+
+@contextmanager
+def safe_span(name, attributes=None, *, context=None):
+    """Catch tracing setup/cleanup faults without catching business exceptions."""
+    scope = None
+    span = None
+    try:
+        from opentelemetry import trace
+        scope = trace.get_tracer("rag.agent").start_as_current_span(
+            name, context=context, attributes=safe_attributes(attributes),
+            record_exception=False, set_status_on_exception=False,
+        )
+        span = scope.__enter__()
+    except Exception:
+        scope = None
+        logger.warning("telemetry_span_setup_failed")
+    try:
+        yield span
+    finally:
+        if scope is not None:
+            try:
+                scope.__exit__(None, None, None)
+            except Exception:
+                logger.warning("telemetry_span_cleanup_failed")
 
 _HASH_RE = re.compile(r"^[0-9a-f]{32}$")
 _CODE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.:/-]{0,63}$")
@@ -55,6 +80,7 @@ class ObservationBatch:
     job_attempt: int
     lease_epoch: int
     hmac_version: str
+    tenant_id: Optional[str] = None
 
 
 def _enabled() -> bool:
@@ -96,22 +122,24 @@ def safe_attributes(attributes: Optional[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def identifier(kind: str, value: Any) -> Optional[str]:
+def identifier(kind: str, value: Any, tenant_id: Optional[str] = None) -> Optional[str]:
     """Independent, versioned HMAC; never fall back to unkeyed or plaintext IDs."""
     key = os.getenv("RAG_LANGFUSE_ID_HMAC_KEY", "")
     version = os.getenv("RAG_LANGFUSE_HMAC_VERSION", "v1")
     env = os.getenv("RAG_ENVIRONMENT", "demo")
     if len(key.encode("utf-8")) < 32 or not all(_safe_code(x) for x in (kind, version, env)):
         return None
+    batch = active_batch()
+    namespace = tenant_id or (batch.tenant_id if batch else "") or ""
     return hmac.new(key.encode("utf-8"),
-                    (version + "|" + env + "|" + kind + "|" + str(value)).encode("utf-8"),
+                    (version + "|" + env + "|" + namespace + "|" + kind + "|" + str(value)).encode("utf-8"),
                     hashlib.sha256).hexdigest()[:32]
 
 
 # SDK 4.16.0 flattens dict metadata into individual OTel attributes.
 # Never accept a free-form metadata JSON blob or arbitrary SDK attributes.
 _SDK_METADATA_CODES = frozenset({
-    "purpose", "status", "errorCode", "costCurrency", "costStatus",
+    "purpose", "status", "errorCode", "costCurrency", "costStatus", "usageSource", "cacheStatus",
 })
 _SDK_METADATA_HASHES = frozenset({"call"})
 _SDK_METADATA_NUMBERS = frozenset({"durationMs", "settledCny"})
@@ -139,8 +167,8 @@ def _safe_sdk_value(key: str, value: Any) -> bool:
             if type(value) in {int, float}:
                 return 0 <= value < 1e12 and value == value
             return (isinstance(value, str)
-                    and re.fullmatch(r"(?:0|[1-9][0-9]{0,11})(?:[.][0-9]{1,6})?", value) is not None
-                    and float(value) < 1e12)
+                    and re.fullmatch(r"(?:0|[1-9][0-9]{0,11})(?:[.][0-9]+)?(?:e-[0-9]+)?", value) is not None
+                    and 0 <= float(value) < 1e12)
         return False
     if key == "langfuse.observation.type":
         return value in {"generation", "embedding"}
@@ -177,7 +205,11 @@ def _export_span(span: Any) -> bool:
         attrs = dict(span.attributes or {})
         if attrs.get("rag.export") is not True:
             return False
-        if len(safe_attributes(attrs)) != len(attrs) or getattr(span.status, "description", None):
+        project_attrs = {k: v for k, v in attrs.items() if k not in _SDK_ALLOWED}
+        sdk_attrs = {k: v for k, v in attrs.items() if k in _SDK_ALLOWED}
+        if (len(safe_attributes(project_attrs)) != len(project_attrs)
+                or not all(_safe_sdk_value(k, v) for k, v in sdk_attrs.items())
+                or getattr(span.status, "description", None)):
             return False
         for event in span.events or ():
             if event.name not in _ALLOWED_EVENTS:
@@ -205,7 +237,10 @@ def _mask_otel_spans(*, params):
         if is_sdk:
             to_delete = tuple(key for key, value in attrs.items() if key not in _SDK_ALLOWED or not _safe_sdk_value(key, value))
         else:
-            to_delete = tuple(key for key in attrs if key not in _SAFE_KEYS)
+            allowed = {**safe_attributes(attrs), **{
+                k: v for k, v in attrs.items() if k in _SDK_ALLOWED and _safe_sdk_value(k, v)
+            }}
+            to_delete = tuple(key for key in attrs if key not in allowed)
         if to_delete:
             patches[ref] = OtelSpanPatch(delete_attributes=to_delete)
     return MaskOtelSpansResult(span_patches=patches)
@@ -235,7 +270,7 @@ def configure_telemetry() -> None:
 
             provider = trace.get_tracer_provider()
             if not isinstance(provider, TracerProvider):
-                candidate = TracerProvider(resource=Resource.create({
+                candidate = TracerProvider(shutdown_on_exit=False, resource=Resource.create({
                     "service.name": os.getenv("OTEL_SERVICE_NAME", "rag-backend")
                 }))
                 trace.set_tracer_provider(candidate)
@@ -269,7 +304,7 @@ def configure_telemetry() -> None:
                 flush_at=128,
                 flush_interval=1,
                 environment=os.getenv("RAG_ENVIRONMENT", "demo"),
-                release=os.getenv("RAG_COMMIT_SHA", "unknown"),
+                release="git-" + os.getenv("RAG_COMMIT_SHA", "unknown"),
                 media_upload_thread_count=1,
                 should_export_span=_export_span,
                 mask_otel_spans=_mask_otel_spans,
@@ -302,7 +337,7 @@ def export_current_span() -> bool:
 @contextmanager
 def observation_batch(job: dict[str, Any]) -> Iterator[Optional[ObservationBatch]]:
     """New physical OTel trace per claimed QA lease; never a span across HITL/restart."""
-    if job.get("kind") != "QA_RUN" or configured_client() is None:
+    if job.get("kind") not in {"QA_RUN", "EVALUATE"} or configured_client() is None:
         yield None
         return
     try:
@@ -316,24 +351,21 @@ def observation_batch(job: dict[str, Any]) -> Iterator[Optional[ObservationBatch
     epoch = int(job.get("lease_epoch") or 0)
     target = _safe_code(os.getenv("RAG_LANGFUSE_TARGET_ID", "private")) or "private"
     version = _safe_code(os.getenv("RAG_LANGFUSE_HMAC_VERSION", "v1")) or "v1"
-    from opentelemetry import trace
-    tracer = trace.get_tracer("rag.agent")
+    from opentelemetry.context import Context
     # Disabled sample still has a LOCAL mapping event; no raw IDs are exported.
-    with tracer.start_as_current_span("qa.worker.attempt",
-                                      record_exception=False,
-                                      set_status_on_exception=False) as span:
-        span.set_attribute("rag.export", sampled)
-        for key, val in safe_attributes({
+    root_name = "qa.worker.attempt" if job["kind"] == "QA_RUN" else "agent.evaluation.attempt"
+    with safe_span(root_name, {
+            "rag.export": sampled,
             "rag.job_attempt": attempt, "rag.lease_epoch": epoch,
             "rag.environment": os.getenv("RAG_ENVIRONMENT", "demo"),
             "rag.hmac_version": version,
-            "rag.tenant_hmac": identifier("tenant", job.get("tenant_id")),
-            "rag.run_hmac": identifier("run", job.get("target_id")),
-            "rag.job_hmac": identifier("job", job.get("id")),
-        }).items():
-            span.set_attribute(key, val)
-        trace_id = format(span.get_span_context().trace_id, "032x") if span.is_recording() else None
-        batch = ObservationBatch(trace_id, bool(sampled and trace_id), target, attempt, epoch, version)
+            "rag.tenant_hmac": identifier("tenant", job.get("tenant_id"), job.get("tenant_id")),
+            "rag.run_hmac": identifier("run", job.get("target_id"), job.get("tenant_id")),
+            "rag.job_hmac": identifier("job", job.get("id"), job.get("tenant_id")),
+        }, context=Context()) as span:
+        trace_id = format(span.get_span_context().trace_id, "032x") if span and span.is_recording() else None
+        batch = ObservationBatch(trace_id, bool(sampled and trace_id), target, attempt, epoch, version,
+                                 job.get("tenant_id"))
         token = _batch_var.set(batch)
         try:
             yield batch
@@ -353,20 +385,31 @@ def qa_identity_scope(conversation_id: str, segment_id: str) -> Iterator[None]:
         "rag.conversation_hmac": identifier("conversation", conversation_id),
         "rag.segment_hmac": identifier("segment", segment_id),
     })
-    for key, val in attrs.items():
-        trace.get_current_span().set_attribute(key, val)
+    try:
+        for key, val in attrs.items():
+            trace.get_current_span().set_attribute(key, val)
+    except Exception:
+        logger.warning("Langfuse identity propagation unavailable")
     session_id = identifier("conversation", conversation_id)
     if session_id is None:
         yield
         return
+    scope = None
     try:
         from langfuse import propagate_attributes
         scope = propagate_attributes(session_id=session_id)
+        scope.__enter__()
     except Exception:
+        scope = None
         logger.warning("Langfuse session propagation unavailable")
-        scope = nullcontext()
-    with scope:
+    try:
         yield
+    finally:
+        if scope is not None:
+            try:
+                scope.__exit__(None, None, None)
+            except Exception:
+                logger.warning("Langfuse session cleanup unavailable")
 
 
 @contextmanager
@@ -397,12 +440,17 @@ def model_observation(purpose: str, alias: str, call_id: str) -> Iterator[Any]:
 def finish_model_observation(observation: Any, *, status: str, duration_ms: float,
                              reported_usage: Optional[dict] = None,
                              settlement: Optional[dict] = None,
+                             usage_source: str = "UNKNOWN",
                              error_code: Optional[str] = None) -> None:
     if observation is None:
         return
     try:
         metadata: dict[str, Any] = {"status": _safe_code(status) or "UNKNOWN",
-                                     "durationMs": round(max(0.0, duration_ms), 2)}
+                                     "durationMs": round(max(0.0, duration_ms), 2),
+                                     "usageSource": _safe_code(usage_source) or "UNKNOWN",
+                                     "cacheStatus": "REPORTED" if reported_usage and
+                                         "cache_read_input_tokens" in reported_usage else "UNKNOWN",
+                                     "costStatus": "UNKNOWN"}
         if error_code:
             metadata["errorCode"] = _safe_code(error_code) or "UNKNOWN"
         if settlement:
@@ -441,7 +489,8 @@ def shutdown_telemetry(timeout_seconds: float = 2.0) -> None:
     def close():
         try:
             if client:
-                client.flush()
+                # The SDK unregisters its blocking atexit hook before flushing.
+                client.shutdown()
             if provider:
                 provider.force_flush(timeout_millis=1000)
                 provider.shutdown()

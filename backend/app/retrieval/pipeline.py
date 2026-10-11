@@ -13,6 +13,7 @@
 都必须重新确认当前仍可读，避免“检索时可读、发送时已撤权”的 TOCTOU 问题。
 """
 import json
+import logging
 import math
 import struct
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,8 @@ from app.retrieval.ranking import rrf_fuse
 from app.retrieval.embedding import get_embeddings
 from app.qa.model_gateway import ModelGateway
 from app.errors import ApiException
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalPipeline:
@@ -47,7 +50,18 @@ class RetrievalPipeline:
         job_id: Optional[str] = None,
         limit_override: Optional[int] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        diagnostic_fn=None,
     ) -> Dict[str, Any]:
+        # Evaluation-only observer; exceptions cannot alter ranking or success.
+        def capture(stage, candidates, limit, route_index=None):
+            if diagnostic_fn is not None:
+                try:
+                    with get_db_connection() as conn:
+                        assert_hits_still_readable(conn, actor, candidates, kb_ids, document_ids)
+                    diagnostic_fn(stage, candidates, limit, route_index)
+                except Exception:
+                    logger.warning("eval_pipeline_diagnostic_skipped")
+
         # 所有后续阶段只使用已经归一化/校验过的 RetrievalConfig。
         cfg = load_retrieval_config(actor.tenant_id, config_id)
 
@@ -92,6 +106,7 @@ class RetrievalPipeline:
         }
         # “没有权限范围”是正常的空结果，不应该继续调用模型或向量服务。
         if not allowed_build_ids:
+            capture("scope", [], 0)
             return {
                 "hits": [],
                 "warnings": [],
@@ -122,7 +137,7 @@ class RetrievalPipeline:
         if use_sparse:
             # Hybrid 时 sparse 家族总权重占 0.5，再平均分给每个 query variant。
             sparse_weight = (0.5 if use_dense else 1.0) / max(1, len(query_variants))
-            for query_variant in query_variants:
+            for route_index, query_variant in enumerate(query_variants):
                 route = MilvusHybridService.search(
                     tenant_id=actor.tenant_id,
                     query=query_variant,
@@ -139,6 +154,7 @@ class RetrievalPipeline:
                     job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
+                capture("bm25_recall", route, cfg.sparse_top_k, route_index)
                 if route:
                     ranked_lists.append(route)
                     route_weights.append(sparse_weight)
@@ -149,7 +165,7 @@ class RetrievalPipeline:
             if hyde_text:
                 dense_queries.append(hyde_text)
             dense_weight = (0.5 if use_sparse else 1.0) / max(1, len(dense_queries))
-            for dense_query in dense_queries:
+            for route_index, dense_query in enumerate(dense_queries):
                 route = MilvusHybridService.search(
                     tenant_id=actor.tenant_id,
                     query=dense_query,
@@ -166,6 +182,7 @@ class RetrievalPipeline:
                     job_id=job_id,
                     num_candidates=cfg.num_candidates,
                 )
+                capture("dense_recall", route, cfg.dense_top_k, route_index)
                 if route:
                     ranked_lists.append(route)
                     route_weights.append(dense_weight)
@@ -182,6 +199,7 @@ class RetrievalPipeline:
                 rrf_k=cfg.rrf_k,
             )[:cfg.fusion_top_k]
 
+        capture("rrf_fusion", hits, cfg.fusion_top_k)
         # SUMMARY/QUESTION 等 representation 只用于匹配；真正给模型看的正文恢复成 ORIGINAL。
         hits = cls._hydrate_original_chunks(actor.tenant_id, hits)
 
@@ -191,6 +209,8 @@ class RetrievalPipeline:
         # 防止检索后 ACL 被撤销时仍把已失权文本发送给 reranker。
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, hits, kb_ids, document_ids)
+
+        capture("hydrate_and_acl", hits, cfg.fusion_top_k)
 
         if cfg.rerank_enabled and hits:
             hits, rerank_warnings = rerank_hits(
@@ -205,6 +225,7 @@ class RetrievalPipeline:
             )
             warnings.extend(rerank_warnings)
 
+        capture("rerank", hits, cfg.fusion_top_k)
         # MMR 放在 rerank 之后：先保证相关性，再从高质量候选里压低语义重复。
         if cfg.mmr_enabled and hits:
             hits = cls._mmr_select(
@@ -217,10 +238,12 @@ class RetrievalPipeline:
                 job_id=job_id,
             )
 
+        capture("mmr", hits, cfg.fusion_top_k)
         # Parent Expansion 最后做，避免大段 parent 文本影响前面的 rerank/MMR 排序。
         if cfg.parent_expansion_enabled and hits:
             hits = cls._expand_parents(actor.tenant_id, hits, cfg, warnings)
 
+        capture("parent_expansion", hits, cfg.fusion_top_k)
         # Parent 扩展可能让文本突然变大，所以必须在扩展后执行最终上下文预算。
         # parent expansion 完成后再应用 Java 基线的 context budget；预算针对最终送入模型的上下文，而不是原始 child。
         budgeted_hits: List[Dict[str, Any]] = []
@@ -249,6 +272,7 @@ class RetrievalPipeline:
             if len(budgeted_hits) >= cfg.final_top_k:
                 break
         hits = budgeted_hits
+        capture("context_budget", hits, cfg.final_top_k)
 
         # 排名已经稳定后再补 provenance，避免前面每个阶段都携带大块定位元数据。
         hits = cls._attach_provenance(actor.tenant_id, hits)
@@ -261,6 +285,7 @@ class RetrievalPipeline:
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, actor, hits, kb_ids, document_ids)
 
+        capture("finalize_hits", hits, final_limit)
         return {
             "hits": hits,
             "warnings": warnings,

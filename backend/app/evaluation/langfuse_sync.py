@@ -88,6 +88,9 @@ def sync_evaluation_scores(actor, eval_run_id: str):
     results = EvaluationRunner.results(actor, eval_run_id)
     sent = skipped = failed = 0
     for item in results:
+        if item.get("status") != "COMPLETED":
+            skipped += 1
+            continue
         qa_id = item.get("qaRunId")
         if not qa_id:
             skipped += 1
@@ -108,7 +111,9 @@ def sync_evaluation_scores(actor, eval_run_id: str):
                 skipped += 1
                 continue
             persona = Actor(actor.tenant_id, str(row.owner_id), False)
-            if QaService.get_run(persona, qa_id).get("visibility") == "HIDDEN":
+            detail = QaService.get_run(persona, qa_id)
+            if (detail.get("visibility") == "HIDDEN" or detail.get("status") not in
+                    {"COMPLETED", "PARTIAL", "CONFLICT", "NO_EVIDENCE", "SUCCEEDED"}):
                 skipped += 1
                 continue
             with get_db_connection() as conn:

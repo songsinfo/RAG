@@ -1,6 +1,6 @@
 # Langfuse 可观测性接入与评估设计借鉴 Spec
 
-状态：SPEC_READY，尚未实现、部署或执行 Langfuse 验收。日期：2026-10-12。
+状态：LF 首期已实现并通过私有合成验收；后续 EOBS 尚未实施。日期：2026-10-12。证据与边界见[实施记录](../delivery/langfuse-implementation-status-20261012.md)。
 代码核对基线：`main@7a83f72a0b71199ff8fbfbb4f63f2633c5139285`。
 实施清单：[Langfuse Tickets](../delivery/langfuse-observability-tickets.md)。
 
@@ -76,7 +76,7 @@ HMAC 密钥独立于业务/模型密钥，通过部署 secret 注入并版本化
 
 白名单清洗在发送前完成；清洗失败则丢弃该观测，不上传原数据、不影响业务调用。锁定版本的 SDK masking 用作补充防线；必须以实际导出载荷验证第三方 span 与异常字段，不能只检查 UI。参考：[Langfuse Masking](https://langfuse.com/docs/observability/features/masking)。
 
-隔离评估环境可显式开启 `SYNTHETIC_EVAL` 内容观测，前提为选定题集/语料经过合成数据确认，并通过当前 persona/ACL；仅凭 ENVIRONMENT 名称不足以授权。设置内容上限、截断标识与来源范围，拒绝含未确认来源的请求；不静默截断后标为完整记录。关闭后新记录立即恢复元数据模式。旧内容副本的保留/删除按实例策略处理，应用撤权不会自动撤销 Langfuse 内容。
+首期仅实现 `METADATA_ONLY`，不提供正文上传入口。未来增加 `SYNTHETIC_EVAL` 内容观测时，必须确认选定题集/语料为合成资料，并通过当前 persona/ACL；仅凭 ENVIRONMENT 名称不足以授权。需设置内容上限、截断标识与来源范围，拒绝未确认来源，不把截断记录标为完整。旧内容副本的保留/删除按实例策略处理，应用撤权不会自动撤销 Langfuse 内容。
 
 Langfuse 凭据仅在后端；首期不向普通用户暴露 trace 链接或建设浏览器代理。实例访问只授予维护人员，默认按部署环境分 project；不同租户的读者不能靠 metadata filter 实现隔离，需独立 project/实例并验证实际权限。未满足访问隔离的环境不能开启内容观测。
 
@@ -138,7 +138,7 @@ telemetry 为 best-effort，队列有界，网络超时、重试及关闭等待�
 
 ## 5. Testing Decisions
 
-实现验收编号如下；本次文档交付不将任何一项标为已通过。fake exporter 验证实际序列化 payload 与树结构；私有 Langfuse 使用合成数据做端到端收件检查；真实供应商调用与付费模型收益另列未实测。
+实现验收编号如下；通过状态及逐项证据见实施记录。fake exporter 验证实际序列化 payload 与树结构；私有 Langfuse 使用合成数据做端到端收件检查；真实供应商调用与付费模型收益另列未实测。
 
 | 编号 | Given / When / Then |
 | --- | --- |

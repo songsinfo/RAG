@@ -92,7 +92,7 @@ def test_sdk_json_metadata_and_usage_must_be_allowlisted():
 def test_candidate_snapshot_is_ordered_and_marks_truncation():
     from app.evaluation.diagnostics import candidate_snapshot
     candidates = [
-        {"chunkId": "a", "buildId": "b1", "documentId": "d1", 
+        {"chunkId": "a", "buildId": "b1", "documentId": "d1",
          "text": "SYNTHETIC_PRIVATE_CONTENT_NEVER_EXPORT",
          "sourceUnits": [{"unitId": "u1", "contextStart": 0, "contextEnd": 10,
                           "contextMapped": True, "location": {"page": 2}}]},
@@ -156,7 +156,7 @@ def test_dense_and_bm25_routes_are_captured_before_fusion(monkeypatch):
                          [hit["chunkId"] for hit in hits[:limit]]))
 
     monkeypatch.setattr(diagnostics, "capture_eval_stage", store)
-    runtime = SimpleNamespace(context=SimpleNamespace(retrieval_index=9))
+    runtime = SimpleNamespace(context=SimpleNamespace(retrieval_index=9, observation_context=None))
     cfg = SimpleNamespace(dense_top_k=5, sparse_top_k=5, fusion_top_k=2)
     state = {"cfg": cfg}
 
