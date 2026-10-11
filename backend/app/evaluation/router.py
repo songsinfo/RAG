@@ -164,3 +164,12 @@ def baseline_diff(
     actor: Actor = Depends(get_current_actor),
 ):
     return EvaluationRunner.compare_with_baseline(actor, id)
+
+@router.post("/runs/{id}/langfuse-scores")
+def sync_langfuse_scores(
+    id: str = Path(...),
+    actor: Actor = Depends(get_current_actor),
+):
+    """Opt-in administrator action; does not block normal Judge/review paths."""
+    from app.evaluation.langfuse_sync import sync_evaluation_scores
+    return sync_evaluation_scores(actor, id)
