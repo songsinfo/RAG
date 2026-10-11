@@ -61,7 +61,13 @@ def _enabled() -> bool:
     return os.getenv("RAG_LANGFUSE_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 
 
-def _safe_code(value: Any) -> Optional[str]:
+_SAFE_TOOLS = frozenset({
+    "search_knowledge", "read_section", "diagnose_coupon",
+    "get_final_price_rules", "diagnose_product_group", "diagnose_subsidy",
+})
+
+
+def _safe_code(value: Any) -> Optional[str>:
     if not isinstance(value, str):
         return None
     return value if _CODE_RE.fullmatch(value) else None
@@ -81,6 +87,9 @@ def safe_attributes(attributes: Optional[dict[str, Any]]) -> dict[str, Any]:
                 result[key] = value
         elif key in {"rag.export", "rag.enabled", "tool.mock"}:
             if type(value) is bool:
+                result[key] = value
+        elif key == "tool.name":
+            if value in _SAFE_TOOLS:
                 result[key] = value
         elif isinstance(value, str) and _safe_code(value):
             result[key] = value
