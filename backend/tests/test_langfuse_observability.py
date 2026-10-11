@@ -73,14 +73,15 @@ def test_sdk_json_metadata_and_usage_must_be_allowlisted():
     valid = {
         "langfuse.observation.type": "generation",
         "langfuse.observation.model.name": "chat-main",
-        "langfuse.observation.metadata": json.dumps({
-            "purpose": "AGENT", "call": "b"*32, "durationMs": 10.5}),
+        "langfuse.observation.metadata.purpose": "AGENT",
+        "langfuse.observation.metadata.call": "b"*32,
+        "langfuse.observation.metadata.durationMs": "10.5",
         "langfuse.observation.usage_details": json.dumps({
             "input": 31, "output": 0}),
     }
     assert telemetry._export_span(_span(name="model.agent", scope="langfuse-sdk", attrs=valid))
     for key, value in [
-        ("langfuse.observation.metadata", '{"prompt":"TOP_SECRET"}'),
+        ("langfuse.observation.metadata.prompt", "TOP_SECRET"),
         ("langfuse.observation.usage_details", '{"input":10,"raw_input":"SECRET"}'),
         ("langfuse.observation.input", "SENSITIVE_PROMPT"),
     ]:
@@ -91,7 +92,8 @@ def test_sdk_json_metadata_and_usage_must_be_allowlisted():
 def test_candidate_snapshot_is_ordered_and_marks_truncation():
     from app.evaluation.diagnostics import candidate_snapshot
     candidates = [
-        {"chunkId": "a", "buildId": "b1", "documentId": "d1",
+        {"chunkId": "a", "buildId": "b1", "documentId": "d1", 
+         "text": "SYNTHETIC_PRIVATE_CONTENT_NEVER_EXPORT",
          "sourceUnits": [{"unitId": "u1", "contextStart": 0, "contextEnd": 10,
                           "contextMapped": True, "location": {"page": 2}}]},
         {"chunkId": "c", "buildId": "b2", "documentId": "d2", "sourceUnits": []},
@@ -101,7 +103,9 @@ def test_candidate_snapshot_is_ordered_and_marks_truncation():
     assert snap["capturedCount"] == 1
     assert snap["items"][0]["rank"] == 1
     assert snap["items"][0]["chunkId"] == "a"
-    assert "text" not in str(snap)
+    assert "SYNTHETIC_PRIVATE_CONTENT_NEVER_EXPORT" not in str(snap)
+    assert all("text" not in item for item in snap["items"])
+    assert snap["items"][0]["sourceUnits"][0]["contextStart"] == 0
     assert candidate_snapshot("context_budget", candidates[:1], limit=1,
                               retrieval_index=7, context=True)["complete"]
 
@@ -127,35 +131,103 @@ def test_score_projection_retains_unknown_and_human_revisions():
         "p", "r", "correctness", "v2", "r2")
 
 
+def test_final_trace_mapping_never_falls_back_to_old_sampled_attempt():
+    from app.evaluation.langfuse_sync import _final_batch_trace_id
+    final_unsampled = SimpleNamespace(payload={
+        "traceId": None, "sampled": False, "targetInstance": "private",
+        "leaseEpoch": 2,
+    })
+    older_sampled = SimpleNamespace(payload={
+        "traceId": "a"*32, "sampled": True, "targetInstance": "private",
+        "leaseEpoch": 1,
+    })
+    assert _final_batch_trace_id([final_unsampled, older_sampled], "private") is None
+    assert _final_batch_trace_id([older_sampled], "private") == "a"*32
+    assert _final_batch_trace_id([older_sampled], "another-project") is None
+
+
+def test_dense_and_bm25_routes_are_captured_before_fusion(monkeypatch):
+    from app.retrieval.rag_graph import RagRetrievalGraph
+    import app.evaluation.diagnostics as diagnostics
+    captured = []
+
+    def store(ctx, stage, hits, limit, *, context=False, route_index=None):
+        captured.append((ctx.retrieval_index, stage, route_index,
+                         [hit["chunkId"] for hit in hits[:limit]]))
+
+    monkeypatch.setattr(diagnostics, "capture_eval_stage", store)
+    runtime = SimpleNamespace(context=SimpleNamespace(retrieval_index=9))
+    cfg = SimpleNamespace(dense_top_k=5, sparse_top_k=5, fusion_top_k=2)
+    state = {"cfg": cfg}
+
+    RagRetrievalGraph._observe_stage("dense_recall", lambda s, rt: {
+        "dense_routes": [
+            [{"chunkId": "gold"}, {"chunkId": "dense-2"}],
+            [{"chunkId": "dense-3"}],
+        ], "dense_weight": 0.5,
+    })(state, runtime)
+    RagRetrievalGraph._observe_stage("bm25_recall", lambda s, rt: {
+        "sparse_routes": [[{"chunkId": "bm25-gold"}]],
+        "sparse_weight": 0.5,
+    })(state, runtime)
+    RagRetrievalGraph._observe_stage("rrf_fusion", lambda s, rt: {
+        "hits": [{"chunkId": "rrf-only"}],
+    })(state, runtime)
+
+    assert (9, "dense_recall", 0, ["gold", "dense-2"]) in captured
+    assert (9, "dense_recall", 1, ["dense-3"]) in captured
+    assert (9, "bm25_recall", 0, ["bm25-gold"]) in captured
+    assert (9, "rrf_fusion", None, ["rrf-only"]) in captured
+    assert all("gold" not in chunks for _, stage, _, chunks in captured
+               if stage == "rrf_fusion")
+
+
 def test_actual_sdk_generation_span_is_safe_and_parented(monkeypatch):
-    """Inspect SDK-generated OTel attributes, not only handcrafted fake spans."""
+    """Verify the Langfuse processor/exporter, not just another OTel observer."""
     from langfuse import Langfuse
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import InMemorySpanExporter, SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
     provider = TracerProvider()
-    exporter = InMemorySpanExporter()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    langfuse_exporter = InMemorySpanExporter()
     sdk = Langfuse(
         public_key="pk-lf-test-123", secret_key="sk-lf-test-123",
         base_url="http://127.0.0.1:1", tracer_provider=provider,
+        span_exporter=langfuse_exporter,
         tracing_enabled=True, flush_at=1000, flush_interval=600,
         should_export_span=telemetry._export_span,
+        mask_otel_spans=telemetry._mask_otel_spans,
     )
-    with provider.get_tracer("rag.agent").start_as_current_span(
-        "qa.worker.attempt", record_exception=False
-    ) as root:
-        root.set_attribute("rag.export", True)
-        obs = sdk.start_observation(as_type="generation", name="model.answer",
-                                    model="chat-main", metadata={
-                                        "purpose": "ANSWER", "call": "b" * 32})
-        obs.update(usage_details={"input": 12, "output": 2})
-        obs.end()
-    spans = exporter.get_finished_spans()
-    assert len(spans) >= 2
-    assert any(s.name == "model.answer" for s in spans)
-    for span in spans:
-        if span.name == "model.answer":
-            assert span.context.trace_id == root.get_span_context().trace_id
-            assert telemetry._export_span(span), dict(span.attributes or {})
-            assert "confidential" not in str(span.attributes)
+    try:
+        with provider.get_tracer("rag.agent").start_as_current_span(
+            "qa.worker.attempt", record_exception=False
+        ) as root:
+            root.set_attribute("rag.export", True)
+            obs = sdk.start_observation(
+                as_type="generation", name="model.answer", model="chat-main",
+                metadata={"purpose": "ANSWER", "call": "b" * 32},
+            )
+            obs.update(
+                metadata={"status": "SUCCESS", "durationMs": 10.5},
+                usage_details={"input": 12, "output": 2},
+            )
+            obs.end()
+            # Must not export unknown span events or unrelated instrumentation.
+            with provider.get_tracer("sqlalchemy").start_as_current_span("db.query") as ignored:
+                ignored.set_attribute("db.statement", "SENSITIVE_SQL_CANARY")
+        assert sdk.flush()
+        exported = list(langfuse_exporter.get_finished_spans())
+        assert {s.name for s in exported} == {"qa.worker.attempt", "model.answer"}
+        model_span = next(s for s in exported if s.name == "model.answer")
+        assert model_span.context.trace_id == root.get_span_context().trace_id
+        assert model_span.parent.span_id == root.get_span_context().span_id
+        attrs = dict(model_span.attributes or {})
+        assert attrs["langfuse.observation.metadata.purpose"] == "ANSWER"
+        assert attrs["langfuse.observation.metadata.call"] == "b" * 32
+        assert attrs["langfuse.observation.metadata.status"] == "SUCCESS"
+        assert "langfuse.observation.usage_details" in attrs
+        serialized = str([(s.name, dict(s.attributes or {})) for s in exported])
+        assert "SENSITIVE_SQL_CANARY" not in serialized
+        assert "langfuse.observation.input" not in attrs
+    finally:
+        sdk.shutdown()

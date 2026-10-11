@@ -53,6 +53,22 @@ def _create_scores(result, reviews, trace_id, target, rubric_version):
                        "revision": str(review["id"])}
 
 
+def _final_batch_trace_id(batch_events, target: str):
+    """Only the latest recorded physical QA attempt can own the final answer.
+
+    Do not fall back to an older sampled attempt when the winning lease was
+    un-sampled, malformed, or mapped to another Langfuse project.
+    """
+    if not batch_events:
+        return None
+    final = batch_events[0].payload or {}
+    trace_id = final.get("traceId")
+    if (final.get("sampled") is True and final.get("targetInstance") == target
+            and isinstance(trace_id, str) and _TRACE_RE.fullmatch(trace_id)):
+        return trace_id
+    return None
+
+
 def sync_evaluation_scores(actor, eval_run_id: str):
     EvaluationCatalog.require_admin(actor)
     client = configured_client()
@@ -101,14 +117,10 @@ def sync_evaluation_scores(actor, eval_run_id: str):
                     run_event_table.c.run_id == qa_id,
                     run_event_table.c.stage == "OBSERVABILITY_TRACE",
                 )).order_by(run_event_table.c.sequence_no.desc())).fetchall()
-            usable = next((e.payload for e in batch_events if
-                           (e.payload or {}).get("sampled") is True and
-                           (e.payload or {}).get("targetInstance") == target and
-                           _TRACE_RE.fullmatch(str((e.payload or {}).get("traceId") or ""))), None)
-            if usable is None:
+            trace_id = _final_batch_trace_id(batch_events, target)
+            if trace_id is None:
                 skipped += 1
                 continue
-            trace_id = usable["traceId"]
             for score in _create_scores(item, item.get("reviews") or [], trace_id, target, rubric_version):
                 revision = score.pop("revision")
                 name = score["name"]

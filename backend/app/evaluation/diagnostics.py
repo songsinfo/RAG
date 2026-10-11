@@ -20,7 +20,8 @@ _SCHEMA_VERSION = 1
 
 
 def candidate_snapshot(stage: str, candidates: list[dict], *, limit: int,
-                       retrieval_index: int, context: bool = False) -> dict:
+                       retrieval_index: int, context: bool = False,
+                       route_index: int | None = None) -> dict:
     """Canonical stable order; missing offsets remain explicitly unknown."""
     selected = candidates[:max(0, limit)]
     items = []
@@ -41,13 +42,15 @@ def candidate_snapshot(stage: str, candidates: list[dict], *, limit: int,
             ],
         })
     return {"schemaVersion": _SCHEMA_VERSION, "stage": stage,
-            "retrievalIndex": retrieval_index, "candidateCount": len(candidates),
+            "retrievalIndex": retrieval_index, "routeIndex": route_index,
+            "candidateCount": len(candidates),
             "capturedCount": len(items), "complete": len(candidates) <= limit,
             "items": items, "contextState": "RETRIEVAL_OUTPUT" if context else "CANDIDATE_STAGE"}
 
 
 def capture_eval_stage(ctx: Any, stage: str, candidates: list[dict],
-                       limit: int, *, context: bool = False):
+                       limit: int, *, context: bool = False,
+                       route_index: int | None = None):
     """Best-effort side path: never mutates search ordering, ACL, or QA status."""
     if not ctx.run_id or not candidates:
         return
@@ -66,14 +69,15 @@ def capture_eval_stage(ctx: Any, stage: str, candidates: list[dict],
         with get_db_connection() as conn:
             assert_hits_still_readable(conn, ctx.actor, candidates)
         data = candidate_snapshot(stage, candidates, limit=limit,
-                                  retrieval_index=ctx.retrieval_index, context=context)
+                                  retrieval_index=ctx.retrieval_index, context=context,
+                                  route_index=route_index)
         encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         key, _, _ = save_artifact(ctx.actor.tenant_id, "eval-retrieval-diagnostic.json", encoded)
         # No source ID or text appears in run_event; just an opaque private artifact locator.
         if ctx.record_event_fn:
             ctx.record_event_fn(ctx.actor.tenant_id, ctx.run_id, "EVAL_DIAG_ARTIFACT", {
                 "schemaVersion": _SCHEMA_VERSION, "retrievalIndex": ctx.retrieval_index,
-                "stage": stage, "artifactKey": key,
+                "stage": stage, "routeIndex": route_index, "artifactKey": key,
                 "complete": data["complete"], "candidateCount": data["candidateCount"],
                 "capturedCount": data["capturedCount"]})
     except Exception:

@@ -131,16 +131,42 @@ class RagRetrievalGraph:
                 # rather than reusing a global trace or span across different runs.
                 result = node(state, runtime)
                 if isinstance(result, dict):
+                    from app.evaluation.diagnostics import capture_eval_stage
+                    from opentelemetry import trace
+
+                    span = trace.get_current_span()
+                    cfg = result.get("cfg") or state.get("cfg")
                     hits = result.get("hits")
                     if isinstance(hits, list):
-                        from app.evaluation.diagnostics import capture_eval_stage
-                        capture_eval_stage(runtime.context, name, hits,
-                                           limit=max(1, getattr(state.get("cfg"), "fusion_top_k", 50)),
-                                           context=name in {"context_budget", "finalize_hits"})
-                        from opentelemetry import trace
-                        span = trace.get_current_span()
+                        capture_eval_stage(
+                            runtime.context, name, hits,
+                            limit=max(1, getattr(cfg, "fusion_top_k", 50)),
+                            context=name in {"context_budget", "finalize_hits"},
+                        )
                         if span and span.is_recording():
                             span.set_attribute("rag.hit_count", len(hits))
+
+                    # Dense/BM25 nodes produce per-query ranked routes, NOT hits.
+                    # Capture before RRF so Gold dropped at fusion stays attributable.
+                    route_field = {
+                        "dense_recall": ("dense_routes", "dense_top_k"),
+                        "bm25_recall": ("sparse_routes", "sparse_top_k"),
+                    }.get(name)
+                    if route_field:
+                        routes = result.get(route_field[0]) or []
+                        count = 0
+                        for route_index, route_hits in enumerate(routes):
+                            if not isinstance(route_hits, list):
+                                continue
+                            count += len(route_hits)
+                            capture_eval_stage(
+                                runtime.context, name, route_hits,
+                                limit=max(1, getattr(cfg, route_field[1], 50)),
+                                route_index=route_index,
+                            )
+                        if span and span.is_recording():
+                            span.set_attribute("rag.hit_count", count)
+                            span.set_attribute("rag.route_count", len(routes))
                 return result
         return observed
 

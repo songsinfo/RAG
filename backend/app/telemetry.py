@@ -67,7 +67,7 @@ _SAFE_TOOLS = frozenset({
 })
 
 
-def _safe_code(value: Any) -> Optional[str>:
+def _safe_code(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
     return value if _CODE_RE.fullmatch(value) else None
@@ -108,15 +108,40 @@ def identifier(kind: str, value: Any) -> Optional[str]:
                     hashlib.sha256).hexdigest()[:32]
 
 
+# SDK 4.16.0 flattens dict metadata into individual OTel attributes.
+# Never accept a free-form metadata JSON blob or arbitrary SDK attributes.
+_SDK_METADATA_CODES = frozenset({
+    "purpose", "status", "errorCode", "costCurrency", "costStatus",
+})
+_SDK_METADATA_HASHES = frozenset({"call"})
+_SDK_METADATA_NUMBERS = frozenset({"durationMs", "settledCny"})
+_SDK_METADATA_PREFIX = "langfuse.observation.metadata."
 _SDK_ALLOWED = frozenset({
     "langfuse.observation.type", "langfuse.observation.model.name",
-    "langfuse.observation.usage_details", "langfuse.observation.metadata",
+    "langfuse.observation.usage_details",
     "langfuse.internal.is_app_root", "langfuse.internal.as_root",
     "langfuse.environment", "langfuse.release", "session.id",
-})
+}) | frozenset(
+    _SDK_METADATA_PREFIX + k for k in
+    (_SDK_METADATA_CODES | _SDK_METADATA_HASHES | _SDK_METADATA_NUMBERS)
+)
 
 
 def _safe_sdk_value(key: str, value: Any) -> bool:
+    if key.startswith(_SDK_METADATA_PREFIX):
+        name = key[len(_SDK_METADATA_PREFIX):]
+        if name in _SDK_METADATA_CODES:
+            return bool(_safe_code(value))
+        if name in _SDK_METADATA_HASHES:
+            return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
+        if name in _SDK_METADATA_NUMBERS:
+            # Langfuse serializes floats to JSON numeric strings on update().
+            if type(value) in {int, float}:
+                return 0 <= value < 1e12 and value == value
+            return (isinstance(value, str)
+                    and re.fullmatch(r"(?:0|[1-9][0-9]{0,11})(?:[.][0-9]{1,6})?", value) is not None
+                    and float(value) < 1e12)
+        return False
     if key == "langfuse.observation.type":
         return value in {"generation", "embedding"}
     if key == "langfuse.observation.model.name":
@@ -129,21 +154,7 @@ def _safe_sdk_value(key: str, value: Any) -> bool:
                 and 0 <= v <= 100000000 for k, v in usage.items())
         except (TypeError, ValueError):
             return False
-    if key == "langfuse.observation.metadata":
-        try:
-            data = json.loads(value) if isinstance(value, str) else value
-            if not isinstance(data, dict) or set(data) - {
-                "purpose", "call", "status", "durationMs", "errorCode",
-                "costCurrency", "costStatus", "settledCny"}:
-                return False
-            return all(
-                (bool(_safe_code(v)) if k in {"purpose", "status", "errorCode", "costCurrency", "costStatus"}
-                 else bool(_HASH_RE.fullmatch(v)) if k == "call" and isinstance(v, str)
-                 else type(v) in {int, float} and 0 <= v < 1e12 if k in {"durationMs", "settledCny"}
-                 else False) for k, v in data.items())
-        except (TypeError, ValueError):
-            return False
-    if key in {"session.id"}:
+    if key == "session.id":
         return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
     if key in {"langfuse.environment", "langfuse.release"}:
         return bool(_safe_code(value))
