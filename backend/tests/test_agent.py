@@ -39,6 +39,59 @@ def reset_agent_mock():
     ModelGateway._agent_mock_handler = None
 
 
+@pytest.mark.parametrize("question,query", [
+    ("我们是用什么车出去玩", "我们出去玩时乘坐的是什么车？"),
+    ("我们上周去哪玩、乘坐的是什么车？", "我们上周出去玩时乘坐的是什么车？"),
+])
+def test_agent_search_query_preserves_intent(client, monkeypatch, question, query):
+    from app.retrieval.rag_graph import RagRetrievalGraph
+
+    requests = []
+    searches = []
+    original_chat_tools = ModelGateway.chat_tools
+
+    def capture_request(**kwargs):
+        requests.append(kwargs)
+        return original_chat_tools(**kwargs)
+
+    def retrieve(**kwargs):
+        searches.append(kwargs["query"])
+        return {"hits": [], "warnings": []}
+
+    def model(messages):
+        if any(m.get("role") == "tool" for m in messages):
+            return {"role": "assistant", "content": json.dumps({
+                "status": "NO_EVIDENCE", "claims": [], "gaps": [], "conflicts": [],
+            }), "tool_calls": []}
+        return {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call-travel", "name": "search_knowledge", "args": {"query": query},
+        }]}
+
+    monkeypatch.setattr(ModelGateway, "chat_tools", capture_request)
+    monkeypatch.setattr(RagRetrievalGraph, "retrieve", retrieve)
+    ModelGateway._agent_mock_handler = model
+    csrf = get_auth_context(client)
+    conv = client.post("/api/v1/conversations", json={"title": "出游车辆查询"},
+                       headers={"X-CSRF-Token": csrf}).json()
+    resp = client.post(f"/api/v1/conversations/{conv['conversationId']}/runs",
+                       json={"question": question, "segmentId": conv["currentSegmentId"]},
+                       headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())})
+    assert resp.status_code == 202, resp.text
+    result = client.get("/api/v1/runs/" + resp.json()["runId"]).json()
+    assert result["terminalReason"] == "NO_EVIDENCE", result
+    assert searches == [query]
+    assert requests[0]["messages"][-1]["content"] == question
+    for request in requests:
+        prompt = request["messages"][0]["content"]
+        assert "完整、可独立理解的检索问题" in prompt
+        assert "不能只提取关键词" in prompt
+        tool = next(t["function"] for t in request["tools"]
+                    if t["function"]["name"] == "search_knowledge")
+        description = tool["parameters"]["properties"]["query"]["description"]
+        assert "人物、时间、事件、约束和待查询关系" in description
+        assert "不得编造" in description
+
+
 def test_agent_single_tool_search_and_answer(client):
     csrf = get_auth_context(client, "admin", "admin123")
     now = datetime.now(timezone.utc)
