@@ -2,7 +2,7 @@
 
 这份文档带你沿着真实数据流阅读当前 Python 实现。目标是读完后能解释：请求从哪里进入、主要函数按什么顺序调用、关键数据怎样变化、结果存在哪里，以及失败时应该检查哪一层。
 
-核对基线：2026-10-10，当前 `main`（合并提交 `2b40a9b`，包含已合并的 [PR #14](https://github.com/songsinfo/RAG/pull/14)）。统一业务 Agent 与版本化跨轮上下文快照已进入主分支；**合并不代表 UA-01～UA-12 全量生产验收通过**，尤其不代表真实业务系统接入或供应商 KV Cache 收益已实测。本文按当前 `main` 源码说明调用链；示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
+核对基线：2026-10-12，`main` @ `1e51437`（已包含 PR #14～#18 及最新 Agent 检索 query 语义修复）。本文按当前源码解释调用链；Langfuse 的正文采集需要显式开启，EOBS 已新增阶段事实覆盖与独立断言实验，但这些不等于生产级质量或性能验收。示例代码省略无关分支，不能直接当作可运行函数。教学数据用简短 ID 代替运行时 UUID，不代表真实实验结果。
 
 **阅读规则：当前行为以 `backend/app` 源码为准。** `docs/design` 是早期设计，其中仍含 Java、Spring、Elasticsearch 和尚未完全落地的能力，不应直接用来推断当前 Python 执行过程。
 
@@ -22,6 +22,8 @@
 | Docling | 所有支持格式统一解析并由 HybridChunker 生成语义块 | [parser.py](../backend/app/knowledge/parser.py) |
 | Milvus | 保存子块索引，完成 Dense/BM25/Hybrid 检索 | [milvus_service.py](../backend/app/retrieval/milvus_service.py) |
 | LiteLLM | 对接模型服务，提供 Chat、Embedding、Reranker 等别名 | [model_gateway.py](../backend/app/qa/model_gateway.py)、[embedding.py](../backend/app/retrieval/embedding.py) |
+| Langfuse（可选） | 按物理 Worker lease 关联 trace / generation / 检索 span；默认关闭，正文另需显式开启 | [telemetry.py](../backend/app/telemetry.py)、[model_usage.py](../backend/app/qa/model_usage.py) |
+| EOBS 诊断 | 将实际上下文、指标有效性、阶段 Gold 事实覆盖和独立断言实验与既有评分分开 | [evaluation/observability.py](../backend/app/evaluation/observability.py)、[evaluation/assertion_diagnostic.py](../backend/app/evaluation/assertion_diagnostic.py) |
 | LangGraph | 普通 RAG 的无 Checkpointer 检索 DAG；Agent 的 model/tools 循环和 Checkpointer 恢复是另一张图 | [rag_graph.py](../backend/app/retrieval/rag_graph.py)、[agent.py](../backend/app/qa/agent.py) |
 
 第一遍按第 2～7 节看成功主线。第二遍看第 8 节的权限、租约和失败分支。第三遍运行第 9 节的测试，观察变量。不要一开始从 `models.py` 第一行一路读到底；先遇到哪个对象，就回头找它对应的表。
@@ -448,13 +450,15 @@ Worker/HITL **恢复当前 run** 时，优先从 `JobCheckpointSaver` 取回未�
 
 ```text
 用户：订单重试前需要检查什么？
-模型：调用 search_knowledge(query="订单重试 检查事项")
+模型：调用 search_knowledge(query="订单重试前需要检查哪些事项？")
 程序：返回证据摘要与 E1 编号，追加 role=tool 消息
 模型：若证据已足够，输出三条 claims；否则继续搜索或 read_section
 程序：validate_claims 后返回 answer
 ```
 
 `tool_calls` 是模型提出的请求；工具真正执行、查权限、记录来源和限制预算由 Python 程序完成。模型不能因为输出一个工具名就直接绕过权限。
+
+**最新 Prompt 约束（`agent-v1.2`）**：[agent.py](../backend/app/qa/agent.py) 的 `SEARCH_QUERY_INSTRUCTION` 同时写入系统消息和 `search_knowledge.query` 的工具 Schema，要求保留检索目标中的人物、时间、事件、约束和待查询关系，避免只抽取孤立关键词；仅能用用户问题、可访问历史和已有证据补全指代，不能编造信息。这是模型行为约束，不能单凭合成回归宣称检索召回率已经提升。
 
 搜索结果会去重，证据保存在状态中。工具消息发送压缩摘录，而完整原文仍可保存在 `evidence_map`；二者可能长度不同，不能把“系统存了完整证据”自动等同于“模型完整读过该证据”。
 
@@ -494,6 +498,22 @@ estimate() → start() → 写 EVALUATE job 和全部 PENDING 结果
 对本例，金标准应有“幂等键、重试次数上限、补偿日志”三个事实组。只找到一组也可能 Hit@5=1；模型只答出一项不应算完整成功。`judgeMode=HUMAN` 默认保留待复核结果，LLM 模式才进行语义裁判。
 
 指标、API 示例、成功率分母、快照范围、多轮执行与最后一轮评分范围、门禁详见 [RAG 评估完整说明](rag-evaluation-guide.md)。这里优先理解它怎样调用已读过的问答服务，而不是另外实现一套独立 RAG。
+
+### 7.7 从模型外发到 Langfuse 诊断
+
+**先区分三个层次**：`run_event` 和 `model_call` 是业务数据库中的运行记录，`evaluation/diagnostics.py` 管理受权限约束的评估候选及实际上下文，Langfuse 则是可选、采样的外部诊断视图。它们不相互取代。
+
+`QaService.submit_run()` → `QA_RUN Job` → `runtime/worker.py` 的执行租约 → `telemetry.observation_batch`，建立本次物理 lease 的观测批次；HITL 恢复和新 lease 分别产生 trace。`LangGraphAgent.run()` 的外层图调用实际模型时，`qa/model_usage.py` 的 `invoke_tracked()` / `model_observation` 关联 generation、请求尝试、用量与预算；`RagRetrievalGraph._observe_stage()` 将 Dense / BM25 / RRF / Rerank / Context 等节点作为 span，并显式处理并行上下文；`_tools_step()` 可记录受控工具参数与结果。失败、重试与 fallback 不应被合并成一次虚构的模型请求。
+
+默认 `RAG_LANGFUSE_ENABLED=false`。启用后仍默认 `METADATA_ONLY`；显式开启 `RAG_LANGFUSE_DATA_MODE=CONTENT` 后，再由 `RAG_LANGFUSE_CAPTURE_MODEL`、`_RETRIEVAL`、`_TOOL`、`_QA` 分别决定对应正文输入输出。**关掉 TOOL 不代表 MODEL 消息里没有工具结果**；完全不发送正文应关闭总 CONTENT 模式。观测导出异常不应让业务重试模型或跳过预算/ACL；旧 trace 不会被开关自动清除。见[Langfuse 具体边界](delivery/langfuse-content-observability-20261012.md)和[后端启动说明](../backend/README.md#langfuse-可选观测与输入输出)。
+
+### 7.8 EOBS 阶段事实覆盖与独立断言实验
+
+评估的 `EvaluationRunner._update_result()` 使用 `evaluation/observability.py` 建立 `eobs-v1` 的私有 `judge.evaluationSample`、`metrics.metricDiagnostics` 与 `metrics.stageCoverage`，聚合时提供 `metricCoverage`。`evaluation/diagnostics.py` 在检索、融合、重排、Context 与 `MODEL_CONTEXT` 等边界记录候选/实际发送区间。`stageFactRecall` 将 Gold 事实组与授权文档的可定位区间对照，未知、无法映射、空 Gold 或计算不适用按对应状态呈现，而不是补零。
+
+注意这不是逐阶段排名型 Recall@5 / NDCG@5，也不是 Ragas 的语义 Context Recall；已有在线证据校验、原 correctness 和门禁保持原义。单独的 `evaluation/assertion_diagnostic.py` 通过管理员显式请求，检查 HUMAN_REVIEWED、预算、persona / ACL 和 lease，启动独立 EVALUATE Job，从**完整答案**提取断言后执行支持性检查，允许后续人工逐断言校准。结果标记 `OBSERVE_ONLY`，不回写原评分。合成资料与一次真实模型 pilot 的验收限制见[EOBS 实施记录](delivery/evaluation-observability-implementation-20261012.md)。
+
+**建议断点**：`runtime/worker.py` 的 QA 执行入口 → `telemetry.py` 的 `observation_batch` / `set_span_io` → `model_usage.py` 的 `invoke_tracked` → `rag_graph.py` 的 `_observe_stage` → `evaluation/runner.py` 的 `_update_result` → `evaluation/observability.py` 的 `stage_coverage`。回归测试从 `test_langfuse_observability.py`、`test_langfuse_content.py`、`test_evaluation_observability.py`、`test_assertion_diagnostic.py` 开始，合成测试不能替代生产联合压测。
 
 ## 8. 第二遍阅读：追踪权限、状态和失败
 
@@ -616,9 +636,9 @@ if ($LASTEXITCODE -ne 0) { throw '会话上下文或恢复测试失败' }
 
 ## 10. 与现有文档如何配合
 
-EOBS 后续从 `EvaluationRunner._update_result → evaluation/observability.py` 形成内部样本、状态描述和阶段覆盖，追加字段不改旧门禁。`assertion_diagnostic.py` 的显式管理员入口创建独立 EVALUATE job；Worker 只在 diagnosticType 匹配时执行两阶段断言实验，检查预算、HUMAN_REVIEWED、persona/ACL 和 lease，输出不覆盖原 correctness。真实供应商与一个已确认合成反例的 pilot 见[EOBS 记录](delivery/evaluation-observability-implementation-20261012.md)。
+EOBS 当前实现从 `EvaluationRunner._update_result → evaluation/observability.py` 形成内部样本、状态描述和阶段覆盖，追加字段不改旧门禁。`assertion_diagnostic.py` 的显式管理员入口创建独立 EVALUATE job；Worker 只在 diagnosticType 匹配时执行两阶段断言实验，检查预算、HUMAN_REVIEWED、persona/ACL 和 lease，输出不覆盖原 correctness。真实供应商与一个已确认合成反例的 pilot 见[EOBS 记录](delivery/evaluation-observability-implementation-20261012.md)。
 
-Langfuse 首期从 `runtime/worker.py → telemetry.observation_batch → QaService.execute_queued_run` 关联物理 lease；`qa/model_usage.py → model_observation` 只在真实外发时创建 generation。`retrieval/rag_graph.py` 显式传递并行 context；`evaluation/diagnostics.py` 保存阶段候选及实际外发区间，`evaluation/langfuse_sync.py` 显式同步已有分数。默认关闭且只上传元数据，私有制品及完整评估仍从应用受控入口读取。范围、合成收件与未实测部分见[实施记录](delivery/langfuse-implementation-status-20261012.md)。
+Langfuse 观测从 `runtime/worker.py → telemetry.observation_batch → QaService.execute_queued_run` 关联物理 lease；`qa/model_usage.py → model_observation` 只在真实外发时创建 generation。`retrieval/rag_graph.py` 显式传递并行 context；`evaluation/diagnostics.py` 保存阶段候选及实际外发区间，`evaluation/langfuse_sync.py` 显式同步已有分数。默认关闭，启用后默认为仅上传元数据；PR #18 已支持显式 CONTENT 正文采集（MODEL / RETRIEVAL / TOOL / QA），私有制品及完整评估仍从应用受控入口读取。范围、合成收件与未实测部分见[首期实施记录](delivery/langfuse-implementation-status-20261012.md)与[后续正文采集记录](delivery/langfuse-content-observability-20261012.md)。
 
 推荐顺序是：[README 总览](../README.md) → 本源码导读 → [Agent 知识检索工具图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
