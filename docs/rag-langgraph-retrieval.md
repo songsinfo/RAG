@@ -1,6 +1,6 @@
 # Agent 知识检索工具：LangGraph 检索 DAG
 
-**当前 `main`（PR #14 已合并）**：新在线问答统一进入 Durable LangGraph Agent。模型需要检索时，`search_knowledge` 调用本文的 `RagRetrievalGraph.retrieve()`；`read_section` 可单独读取文档；四个模拟业务工具不需要强制知识检索。检索图不生成答案，只返回受 ACL 保护的证据。独立 `/search` 和纯检索评测保留 `RetrievalPipeline.retrieve()`。旧 RAG 在线执行分支仍为待排空旧任务保留，不是新请求入口。
+**当前 `main`（2026-10-12，`1e51437`；PR #14～#18 已合并）**：新在线问答统一进入 Durable LangGraph Agent。模型需要检索时，`search_knowledge` 调用本文的 `RagRetrievalGraph.retrieve()`；`read_section` 可单独读取文档；四个模拟业务工具不需要强制知识检索。检索图不生成答案，只返回受 ACL 保护的证据。独立 `/search` 和纯检索评测保留 `RetrievalPipeline.retrieve()`。旧 RAG 在线执行分支仍为待排空旧任务保留，不是新请求入口。
 
 ## 编译后的 LangGraph 状态图（源码同步）
 
@@ -43,7 +43,8 @@ flowchart TD
 - 新增 `RAG_SCOPE`、`RAG_PREPARE_QUERY`、`RAG_BM25_RECALL`、`RAG_DENSE_RECALL`、`RAG_RRF_FUSION`、`RAG_RERANK`、`RAG_MMR`、`RAG_PARENT_EXPANSION`、`RAG_CONTEXT_BUDGET`、`RAG_FINAL_HITS` 等 `run_event`，只保存数量/耗时/配置标记，不保存未选中的正文。
 - 检索图不启用 Checkpointer，**不保证恢复其内部任意节点**；新问答由外层 Agent 的 Durable Job + checkpoint 保护节点边界，不能把两层恢复能力混为一谈。
 - Agent 的 `search_knowledge` 已接入本图；独立 Search API 与 `RETRIEVAL_ONLY` / `RETRIEVAL_PIPELINE` 仍使用原 Pipeline。评估完整 QA 的新运行规范化为 Agent；旧评估 manifest 保留原含义。
-- 当前只记录阶段计数和耗时，**尚未计算阶段级 Recall/NDCG**。真正做质量归因时，需要在权限受控的评估范围内保存各阶段有序的 canonical Chunk ID/Build ID，并和 Gold anchors 做比对。
+- **在线运行记录与评估诊断分离**：在线 `run_event` 主要记录阶段计数、耗时与配置标记；评估链路的 `evaluation/diagnostics.py` 可在授权范围保存阶段候选，并由 `evaluation/observability.py` 的 `stage_coverage()` 计算 `stageFactRecall`（Gold 事实组在该阶段候选/发送上下文中的可定位覆盖）。这**不是**每一阶段的排名型 Recall@5 / NDCG@5，也不等于语义答案正确率；未知来源和不完整区间不得当作零分。详见[评估指南的 EOBS 章节](rag-evaluation-guide.md)。
+- **Langfuse 可选诊断**：`RagRetrievalGraph._observe_stage()` 在节点边界记录可选 span，显式传递 Dense/BM25 并行上下文。默认只允许元数据观测；只有开启 `RAG_LANGFUSE_DATA_MODE=CONTENT` 和 `RAG_LANGFUSE_CAPTURE_RETRIEVAL` 后，才采集检索输入输出。它不是生成链路必需服务，也不能替代 MySQL 权限与预算记录。详见[源码导读](source-walkthrough.md#77-从模型外发到-langfuse-诊断)。
 
 代码：`backend/app/retrieval/rag_graph.py`；新调用入口：`backend/app/qa/agent.py::_tools_step()`；外层调度：`backend/app/qa/service.py`。
 

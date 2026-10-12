@@ -1,6 +1,6 @@
 # Langfuse 首期实施与合成验收（2026-10-12）
 
-本文件记录首次 PR #16 / 1bd20cb 的合成验收，对应 [Spec](../design/11-langfuse-observability-spec.md) 和 [Tickets](langfuse-observability-tickets.md)。LF-T01～06 已完成。后来 EOBS 与真实供应商联调已另行实施，见[后续记录](evaluation-observability-implementation-20261012.md)；本文件原先的未实测说明属于首期验收范围。默认关闭，仅支持 METADATA_ONLY，没有引入 Ragas或托管 Judge。
+本文件是 **PR #16 的历史首期验收快照**，不代表当前 `main` 仅支持元数据。PR #18 已增加可配置 MODEL / RETRIEVAL / TOOL / QA 正文采集，具体以[后续正文采集实施记录](langfuse-content-observability-20261012.md)为准。本文件记录首次 PR #16 / 1bd20cb 的合成验收，对应 [Spec](../design/11-langfuse-observability-spec.md) 和 [Tickets](langfuse-observability-tickets.md)。LF-T01～06 已完成。后来 EOBS 与真实供应商联调已另行实施，见[后续记录](evaluation-observability-implementation-20261012.md)；本文件原先的未实测说明属于首期验收范围。默认关闭，仅支持 METADATA_ONLY，没有引入 Ragas或托管 Judge。
 
 ## 实现范围
 
@@ -59,6 +59,6 @@ Windows 原生 Python 3.12，SQLite 内存数据库、合成模型响应、本�
 
 ## 使用与边界
 
-初始化、启动、验证与回滚见 [backend README](../../backend/README.md#langfuse-可选元数据观测)。验收只替换供应商响应，真实执行 Worker/权限/预算/Agent/检索/诊断/评分/SDK/网络和私有服务；没有调用付费模型或真实业务工具。生产 MySQL + Milvus + 供应商联合压测、保留期与访问成员由部署验收确定。
+初始化、启动、验证与回滚见 [backend README](../../backend/README.md#langfuse-可选观测与输入输出)。验收只替换供应商响应，真实执行 Worker/权限/预算/Agent/检索/诊断/评分/SDK/网络和私有服务；没有调用付费模型或真实业务工具。生产 MySQL + Milvus + 供应商联合压测、保留期与访问成员由部署验收确定。
 
-SYNTHETIC_EVAL 正文上传没有实现；设置 DATA_MODE 不会开启正文。完整历史及任意压缩内容无法恢复精确 provenance，保持未知；阶段覆盖指标和独立断言 Judge 仍属 EOBS 后续。停机可能丢观测，没有 outbox 或保证送达。Langfuse 采样统计不能替代 MySQL 完整报告、预算与门禁。
+**首期 PR #16 状态（已被 PR #18 扩展）**：当时 SYNTHETIC_EVAL 正文上传未实现，设置 DATA_MODE 不会开启正文；当前 `main` 已支持按类别显式开启正文采集。正文即使关闭也不会自动删除此前已收集的数据。完整历史及任意压缩内容无法恢复精确 provenance，保持未知；阶段覆盖指标和独立断言 Judge 当时属 EOBS 后续；现已在 PR #17 实现并保留独立验收边界，见[EOBS 实施记录](evaluation-observability-implementation-20261012.md)。停机可能丢观测，没有 outbox 或保证送达。Langfuse 采样统计不能替代 MySQL 完整报告、预算与门禁。
