@@ -69,6 +69,38 @@ Select-String -LiteralPath .runtime/demo/logs/backend.log -SimpleMatch '替换�
 
 ## 本地开发与运行
 
+### Langfuse 可选元数据观测
+
+默认关闭。开启后，QA 的每个 Worker lease 是一条独立 trace；恢复/HITL 重新创建，原始 run ID 与关联事件保留在应用数据库。只导出白名单元数据和 HMAC 标识，模型消息、正文、工具参数及诊断制品不上传。已有 MySQL 权限、预算、评估报告与门禁仍是权威。
+
+从仓库根目录启动独立合成实例（Docker Desktop Linux containers；PowerShell）：
+
+```powershell
+pwsh -File scripts/init_langfuse_local.ps1
+docker compose --env-file .local/langfuse-eval.env -f deploy/langfuse.compose.yml up -d
+```
+
+初始化脚本生成新的专用凭据到忽略的 `.local/langfuse-eval.env`，已有文件会拒绝覆盖。等 `http://127.0.0.1:3031/api/public/health` 返回 OK 后，可访问 `http://127.0.0.1:3031`；唯一初始维护用户是 `synthetic@localhost.invalid`，密码为该私有文件的 `LFD_USER_PASSWORD`。不允许公开注册，数据库等端口只在容器网络可见。安装后端 requirements 到 `backend/.venv` 后运行：
+
+```powershell
+pwsh -File scripts/check_langfuse_local.ps1
+pwsh -File scripts/check_langfuse_local.ps1 -Outage
+```
+
+验收运行在 child process，替换供应商响应为合成夹具，真实经过 Worker/预算/Agent/检索/SDK/私有服务；不调用付费模型。第一条检查收件、评分幂等、撤权、HITL 和 12 对开关性能，输出 `.local/langfuse-receipt.json`；第二条暂停该独立实例的 web/worker，检查业务完成及有界退出，输出 `.local/langfuse-outage.json`，finally 恢复服务。普通 CI 跳过此私有测试。合成验收不是生产供应商或 MySQL/Milvus 联合压测。
+
+应用 API 与独立 Worker 均需注入 `RAG_LANGFUSE_ENABLED=true`、`LANGFUSE_BASE_URL/PUBLIC_KEY/SECRET_KEY`、至少 32 bytes 的专用 `RAG_LANGFUSE_ID_HMAC_KEY`、`RAG_LANGFUSE_TARGET_ID`、采样率及环境名。凭据只能注入后端进程；用 `.env.example` 核对变量，不提交密钥。首期仅支持 METADATA_ONLY，设置其他 DATA_MODE 也不会打开正文上传。切换配置需重启相应进程。
+
+管理员可显式调用 `POST /api/v1/admin/eval/runs/{id}/langfuse-scores` 同步已有评分，计数为 SDK 入队，确认收件要查询目标实例。管理员经 `GET /api/v1/admin/eval/qa-runs/{id}/retrieval-diagnostics` 读取本地评估诊断，读取时仍检查实际 persona 和来源。实际上下文里的未知历史、歧义/转换区间不会被标为精确完整。
+
+回滚设置 `RAG_LANGFUSE_ENABLED=false` 并重启 API/Worker；停止可选实例：
+
+```powershell
+docker compose --env-file .local/langfuse-eval.env -f deploy/langfuse.compose.yml down
+```
+
+该命令保留独立 volumes 和旧数据。旧 Langfuse 数据不会随应用撤权或开关自动删除；生产保留期、访问成员与容量需另行配置。锁定镜像、逐项证据及已知限制见[首期实施记录](../docs/delivery/langfuse-implementation-status-20261012.md)。
+
 已有 MySQL 数据库若 `job.kind` 约束尚未允许 `QA_RUN`，需先应用
 `docs/design/migrations/20260921_add_qa_run_job_kind.sql`。已有数据库升级到 PR #14 后，需要备份并按实际迁移记录应用 `docs/design/migrations/20261010_add_tool_run_sources.sql` 与 `docs/design/migrations/20261010_segment_context_snapshot.sql`；新数据库使用当前 `schema.sql`。旧程序回滚时不得删除已保存的 TOOL 快照、Segment 上下文列，也不得恢复 source 列的非空约束。
 Embedding 批量由 `EMBEDDING_BATCH_SIZE` 控制，配置模板设为 20，以适配当前供应商上限。

@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import logging
 import threading
+import functools
+import itertools
+from contextvars import copy_context
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
 from app.db import get_db_connection
+from app.observability import agent_span
 from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, get_readable_build_records
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
@@ -42,6 +46,8 @@ class RagRetrievalContext:
     limit_override: Optional[int]
     history: List[Dict[str, str]]
     record_event_fn: Optional[Callable[..., Any]]
+    retrieval_index: int = 0
+    observation_context: Any = None
 
 
 class RagRetrievalState(TypedDict, total=False):
@@ -69,6 +75,7 @@ class RagRetrievalGraph:
 
     _graph = None
     _graph_lock = threading.Lock()
+    _retrieval_indices = itertools.count(1)
 
     @classmethod
     def _get_graph(cls):
@@ -79,18 +86,18 @@ class RagRetrievalGraph:
                 return cls._graph
 
             builder = StateGraph(RagRetrievalState, context_schema=RagRetrievalContext)
-            builder.add_node("resolve_scope", cls._resolve_scope)
-            builder.add_node("no_scope", cls._no_scope)
-            builder.add_node("prepare_query", cls._prepare_query)
-            builder.add_node("dense_recall", cls._dense_recall)
-            builder.add_node("bm25_recall", cls._bm25_recall)
-            builder.add_node("rrf_fusion", cls._rrf_fusion)
-            builder.add_node("hydrate_and_acl", cls._hydrate_and_acl)
-            builder.add_node("rerank", cls._rerank)
-            builder.add_node("mmr", cls._mmr)
-            builder.add_node("parent_expansion", cls._parent_expansion)
-            builder.add_node("context_budget", cls._context_budget)
-            builder.add_node("finalize_hits", cls._finalize_hits)
+            builder.add_node("resolve_scope", cls._observe_stage("scope", cls._resolve_scope))
+            builder.add_node("no_scope", cls._observe_stage("no_scope", cls._no_scope))
+            builder.add_node("prepare_query", cls._observe_stage("prepare_query", cls._prepare_query))
+            builder.add_node("dense_recall", cls._observe_stage("dense_recall", cls._dense_recall))
+            builder.add_node("bm25_recall", cls._observe_stage("bm25_recall", cls._bm25_recall))
+            builder.add_node("rrf_fusion", cls._observe_stage("rrf_fusion", cls._rrf_fusion))
+            builder.add_node("hydrate_and_acl", cls._observe_stage("hydrate_and_acl", cls._hydrate_and_acl))
+            builder.add_node("rerank", cls._observe_stage("rerank", cls._rerank))
+            builder.add_node("mmr", cls._observe_stage("mmr", cls._mmr))
+            builder.add_node("parent_expansion", cls._observe_stage("parent_expansion", cls._parent_expansion))
+            builder.add_node("context_budget", cls._observe_stage("context_budget", cls._context_budget))
+            builder.add_node("finalize_hits", cls._observe_stage("finalize_hits", cls._finalize_hits))
 
             builder.add_edge(START, "resolve_scope")
             builder.add_conditional_edges(
@@ -113,6 +120,61 @@ class RagRetrievalGraph:
 
             cls._graph = builder.compile()
             return cls._graph
+
+    @staticmethod
+    def _observe_stage(name, node):
+        @functools.wraps(node)
+        def observed(state, runtime):
+            context = runtime.context.observation_context
+            if context is not None:
+                return context.copy().run(in_context, state, runtime)
+            return in_context(state, runtime)
+
+        def in_context(state, runtime):
+            idx = runtime.context.retrieval_index
+            with agent_span("rag." + name, {"rag.retrieval_index": idx, "rag.stage": name}):
+                # LangGraph's parallel nodes run with their own captured context,
+                # rather than reusing a global trace or span across different runs.
+                result = node(state, runtime)
+                if isinstance(result, dict):
+                    from app.evaluation.diagnostics import capture_eval_stage
+                    from opentelemetry import trace
+
+                    span = trace.get_current_span()
+                    cfg = result.get("cfg") or state.get("cfg")
+                    hits = result.get("hits")
+                    if isinstance(hits, list):
+                        capture_eval_stage(
+                            runtime.context, name, hits,
+                            limit=max(1, getattr(cfg, "fusion_top_k", 50)),
+                            context=name in {"context_budget", "finalize_hits"},
+                        )
+                        if span and span.is_recording():
+                            span.set_attribute("rag.hit_count", len(hits))
+
+                    # Dense/BM25 nodes produce per-query ranked routes, NOT hits.
+                    # Capture before RRF so Gold dropped at fusion stays attributable.
+                    route_field = {
+                        "dense_recall": ("dense_routes", "dense_top_k"),
+                        "bm25_recall": ("sparse_routes", "sparse_top_k"),
+                    }.get(name)
+                    if route_field:
+                        routes = result.get(route_field[0]) or []
+                        count = 0
+                        for route_index, route_hits in enumerate(routes):
+                            if not isinstance(route_hits, list):
+                                continue
+                            count += len(route_hits)
+                            capture_eval_stage(
+                                runtime.context, name, route_hits,
+                                limit=max(1, getattr(cfg, route_field[1], 50)),
+                                route_index=route_index,
+                            )
+                        if span and span.is_recording():
+                            span.set_attribute("rag.hit_count", count)
+                            span.set_attribute("rag.route_count", len(routes))
+                return result
+        return observed
 
     @classmethod
     def retrieve(
@@ -141,8 +203,11 @@ class RagRetrievalGraph:
             limit_override=limit_override,
             history=list(history or []),
             record_event_fn=record_event_fn,
+            retrieval_index=next(cls._retrieval_indices),
         )
-        state = cls._get_graph().invoke({}, context=ctx)
+        with agent_span("rag.retrieve", {"rag.retrieval_index": ctx.retrieval_index}):
+            ctx = replace(ctx, observation_context=copy_context())
+            state = cls._get_graph().invoke({}, context=ctx)
         return {
             "hits": state.get("hits", []),
             "warnings": state.get("warnings", []),
@@ -160,7 +225,7 @@ class RagRetrievalGraph:
                 ctx.actor.tenant_id,
                 ctx.run_id,
                 stage,
-                {"hitCount": count, "durationMs": round(elapsed_ms, 2), **fields},
+                {"hitCount": count, "durationMs": round(elapsed_ms, 2), "retrievalIndex": ctx.retrieval_index, **fields},
             )
         except Exception:
             # 可观测性故障不能改变检索结果。

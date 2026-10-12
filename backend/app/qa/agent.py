@@ -615,7 +615,9 @@ class LangGraphAgent:
                     raise ApiException(409, "APPROVAL_REQUIRED", "工具调用等待人工审批")
 
             started = time.perf_counter()
-            with agent_span("agent.tool", {"tool.name": name, "tool.call_id": call_id}):
+            with agent_span("agent.tool", {"tool.name": name,
+                    "tool.category": "DOCUMENT" if name in {"search_knowledge", "read_section"} else "TOOL",
+                    "tool.mock": name not in {"search_knowledge", "read_section"}}):
                 try:
                     if name == "search_knowledge":
                         query = args.get("query")

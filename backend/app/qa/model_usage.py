@@ -7,6 +7,7 @@ import uuid
 from app.errors import ApiException
 from app.model_budget import BudgetService
 from app.qa.runtime import AgentRuntimePolicy, get_run_usage
+from app.telemetry import model_observation, finish_model_observation
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
                           run_id=run_id, job_id=job_id)
     sent = False
     started = time.perf_counter()
+    observation = None
     fields = {"tenant_id": tenant_id, "run_id": run_id, "job_id": job_id,
               "call_id": call_id, "purpose": purpose, "model_alias": alias}
     # Never include payloads: they contain questions, retrieved documents and prompts.
@@ -57,8 +59,18 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
     try:
         ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
         ModelGateway.assert_job_current(tenant_id, job_id)
+        from app.evaluation.diagnostics import capture_model_context
+        if capture_model_context(tenant_id, run_id, call_id, purpose, payload):
+            # Private artifact I/O may take time; revalidate at the send boundary.
+            ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
+            ModelGateway.assert_job_current(tenant_id, job_id)
         sent = True
-        result = fn()
+        # One observation per actual attempt; retry/fallback invokes this function again.
+        # Errors from the model function itself must pass through unchanged.
+        # Exporter faults are caught inside the optional observation adapter.
+        with model_observation(purpose, alias, call_id) as active:
+            observation = active
+            result = fn()
         if getattr(result, "status_code", 200) >= 400:
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"模型网关返回状态码 {result.status_code}")
         usage = normalize_provider_usage(usage_reader(result) if usage_reader else {})
@@ -73,12 +85,18 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         # 不把缺失的缓存字段当作 0；已返回且合法的 0 才是真实零命中。
         if not isinstance(detail["cacheReadTokens"], int) or detail["cacheReadTokens"] < 0:
             detail["cacheReadTokens"] = None
-        ModelGateway._record_call(
+        settlement = ModelGateway._record_call(
             tenant_id, call_id, run_id, purpose, "SUCCESS" if reported else "UNKNOWN",
             usage["input_tokens"] if reported else input_limit,
             usage["output_tokens"] if reported else output_limit, alias, job_id=job_id,
             usage_detail=detail,
         )
+        finish_model_observation(observation, status="SUCCESS" if reported else "UNKNOWN",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            settlement=settlement, usage_source="PROVIDER" if reported else "BYTE_CEILING",
+            reported_usage={"input": usage["input_tokens"], "output": usage["output_tokens"],
+                            **({"cache_read_input_tokens": usage["cache_read_tokens"]}
+                               if usage["cache_read_tokens"] is not None else {})} if reported else None)
         logger.info("model_call_finished", extra={"fields": {
             **{k: v for k, v in fields.items() if v is not None},
             "status": "SUCCESS" if reported else "UNKNOWN",
@@ -91,6 +109,9 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         ModelGateway._record_call(tenant_id, call_id, run_id, purpose,
             "FAILED" if sent else "NOT_SENT", input_limit if sent else 0,
             output_limit if sent else 0, alias, job_id=job_id)
+        finish_model_observation(observation, status="FAILED" if sent else "NOT_SENT",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            error_code=exc.code if isinstance(exc, ApiException) else type(exc).__name__)
         logger.exception("model_call_failed", extra={"fields": {
             **{k: v for k, v in fields.items() if v is not None},
             "status": "FAILED" if sent else "NOT_SENT",

@@ -616,6 +616,8 @@ if ($LASTEXITCODE -ne 0) { throw '会话上下文或恢复测试失败' }
 
 ## 10. 与现有文档如何配合
 
+Langfuse 首期从 `runtime/worker.py → telemetry.observation_batch → QaService.execute_queued_run` 关联物理 lease；`qa/model_usage.py → model_observation` 只在真实外发时创建 generation。`retrieval/rag_graph.py` 显式传递并行 context；`evaluation/diagnostics.py` 保存阶段候选及实际外发区间，`evaluation/langfuse_sync.py` 显式同步已有分数。默认关闭且只上传元数据，私有制品及完整评估仍从应用受控入口读取。范围、合成收件与未实测部分见[实施记录](delivery/langfuse-implementation-status-20261012.md)。
+
 推荐顺序是：[README 总览](../README.md) → 本源码导读 → [Agent 知识检索工具图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。
 
 本导读区分当前实现和验证范围：同步测试不等于真实依赖验收；统一 Agent 使用严格验证，但模型裁判不保证正确；越界引用被拒绝；高级检索策略按配置执行，其效果仍需实验；评测逐轮执行，但只评分最后一轮。阅读历史设计或报告时，应保留这些边界。

@@ -1,0 +1,63 @@
+{
+  "date": "2026-10-12",
+  "environment": "Windows native Python 3.12, SQLite in-memory, local private Langfuse",
+  "serviceVersion": "4.56.0",
+  "sdkVersion": "4.16.0",
+  "receipt": {
+    "traceId": "66a2f283fea7131c1dec0d7999137b99",
+    "modelCalls": 2,
+    "comparisonModelCalls": 54,
+    "receivedGenerations": 2,
+    "receivedScores": 4,
+    "duplicateSyncEnqueues": 4,
+    "stages": [
+      "MODEL_CONTEXT",
+      "context_budget",
+      "dense_recall",
+      "finalize_hits",
+      "hydrate_and_acl",
+      "mmr",
+      "parent_expansion",
+      "rerank",
+      "rrf_fusion",
+      "scope"
+    ],
+    "actualContextMapping": "EXACT",
+    "dataMode": "METADATA_ONLY",
+    "provider": "synthetic tracked fixture",
+    "scoreFailurePreservedMetrics": true,
+    "revokedPersonaSkipped": true,
+    "hitlDistinctBatches": 2,
+    "performance": {
+      "off": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 643.57,
+        "p95Ms": 765.65,
+        "maxPythonAllocatedBytes": 456763
+      },
+      "on": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 633.61,
+        "p95Ms": 788.7,
+        "maxPythonAllocatedBytes": 503474
+      }
+    }
+  },
+  "outage": {
+    "qaStatus": "COMPLETED",
+    "modelCalls": 2,
+    "shutdownSeconds": 0.214,
+    "telemetryStatus": "SHUTDOWN_TIMEOUT",
+    "fault": "web and worker stopped",
+    "provider": "synthetic tracked fixture"
+  },
+  "limitations": [
+    "Synthetic tracked provider, no paid model calls",
+    "comparisonModelCalls includes warm-up and HITL calls",
+    "Serial small sample, not production capacity or SLO proof",
+    "tracemalloc allocation peaks are not RSS",
+    "History provenance stays UNKNOWN, no content export"
+  ]
+}

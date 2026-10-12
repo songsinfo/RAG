@@ -50,6 +50,7 @@ from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
 from app.qa.execution import current_qa_execution, qa_execution_scope, qa_lease_is_current
+from app.telemetry import active_batch, qa_identity_scope
 from app.qa.context import assert_run_sources_readable, run_document_scope
 from app.retrieval.pipeline import RetrievalPipeline
 
@@ -705,6 +706,7 @@ class QaService:
                         conn.execute(delete(run_event_table).where(and_(
                             run_event_table.c.tenant_id == actor.tenant_id,
                             run_event_table.c.run_id == run_id,
+                            run_event_table.c.stage != "OBSERVABILITY_TRACE",
                         )))
                     conn.execute(
                         update(qa_run_table)
@@ -731,16 +733,30 @@ class QaService:
                 config_id = str(row.config_id or "cfg-enterprise-retrieval-v2")
                 conn.commit()
 
-            QaService._execute_run(
-                actor,
-                run_id,
-                conv_id,
-                seg_id,
-                question,
-                mode,
-                strict_mode,
-                config_id,
-            )
+            # Best-effort LOCAL mapping; this event is fenced by the current QA lease.
+            # Previous batches remain in history; a new lease never reuses their trace.
+            batch = active_batch()
+            if batch is not None:
+                QaService._record_event(actor.tenant_id, run_id, "OBSERVABILITY_TRACE", {
+                    "schemaVersion": 1,
+                    "traceId": batch.trace_id if batch.sampled else None,
+                    "sampled": batch.sampled,
+                    "targetInstance": batch.target,
+                    "jobAttempt": batch.job_attempt,
+                    "leaseEpoch": batch.lease_epoch,
+                    "hmacVersion": batch.hmac_version,
+                })
+            with qa_identity_scope(conv_id, seg_id):
+                QaService._execute_run(
+                    actor,
+                    run_id,
+                    conv_id,
+                    seg_id,
+                    question,
+                    mode,
+                    strict_mode,
+                    config_id,
+                )
 
     @staticmethod
     def _record_event(tenant_id: str, run_id: str, stage: str, payload: Optional[Dict[str, Any]] = None):

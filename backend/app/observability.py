@@ -1,33 +1,24 @@
+"""Only whitelisted scalar span metadata may be exported to Langfuse."""
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
 
-try:
-    from opentelemetry import trace
-    _tracer = trace.get_tracer("rag.agent")
-except Exception:
-    trace = None
-    _tracer = None
+from app.telemetry import export_current_span, safe_attributes
 
 
 @contextmanager
 def agent_span(name: str, attributes: Optional[Dict[str, Any]] = None) -> Iterator[Any]:
-    if _tracer is None:
-        yield None
-        return
-    with _tracer.start_as_current_span(name) as span:
-        for key, value in (attributes or {}).items():
-            if value is not None:
-                span.set_attribute(key, value)
-        try:
-            yield span
-        except Exception as exc:
-            span.record_exception(exc)
-            raise
-
+    from app.telemetry import safe_span
+    with safe_span(name, {**safe_attributes(attributes), "rag.export": export_current_span()}) as span:
+        yield span
 
 def add_span_event(name: str, attributes: Optional[Dict[str, Any]] = None) -> None:
-    if trace is None:
+    if name not in {"guardrail.indirect_prompt_injection", "model.not_sent"}:
         return
-    span = trace.get_current_span()
-    if span:
-        span.add_event(name, attributes=attributes or {})
+    try:
+        from opentelemetry import trace
+        span = trace.get_current_span()
+        if span is not None and span.is_recording():
+            span.add_event(name, attributes=safe_attributes(attributes))
+    except Exception:
+        # Span/event failures are never business failures.
+        return

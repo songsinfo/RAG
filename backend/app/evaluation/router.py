@@ -164,3 +164,21 @@ def baseline_diff(
     actor: Actor = Depends(get_current_actor),
 ):
     return EvaluationRunner.compare_with_baseline(actor, id)
+
+@router.post("/runs/{id}/langfuse-scores")
+def sync_langfuse_scores(
+    id: str = Path(...),
+    actor: Actor = Depends(get_current_actor),
+):
+    """Opt-in administrator action; does not block normal Judge/review paths."""
+    from app.evaluation.langfuse_sync import sync_evaluation_scores
+    return sync_evaluation_scores(actor, id)
+
+@router.get("/qa-runs/{id}/retrieval-diagnostics")
+def get_private_retrieval_diagnostics(
+    id: str = Path(...),
+    actor: Actor = Depends(get_current_actor),
+):
+    """Read protected retrieval artifact after persona and snapshot ACL checks."""
+    from app.evaluation.diagnostics import read_eval_diagnostics
+    return read_eval_diagnostics(actor, id)
