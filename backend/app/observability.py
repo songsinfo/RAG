@@ -1,4 +1,4 @@
-"""Only whitelisted scalar span metadata may be exported to Langfuse."""
+"""Whitelisted metadata spans; explicit optional content is added by telemetry."""
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
 

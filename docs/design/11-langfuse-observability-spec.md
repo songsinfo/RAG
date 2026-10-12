@@ -1,6 +1,6 @@
 # Langfuse 可观测性接入与评估设计借鉴 Spec
 
-状态：LF 首期已完成；EOBS-01/02 已实现，EOBS-03 入口及真实 pilot 已完成。日期：2026-10-12。首期见[LF 记录](../delivery/langfuse-implementation-status-20261012.md)，后续及真实联调见[EOBS 记录](../delivery/evaluation-observability-implementation-20261012.md)；不宣称充分校准或生产 SLO。
+状态：LF 首期已完成；EOBS-01/02 已实现，EOBS-03 入口及真实 pilot 已完成；追加可配置输入输出观测。日期：2026-10-12。首期见[LF 记录](../delivery/langfuse-implementation-status-20261012.md)，后续及真实联调见[EOBS 记录](../delivery/evaluation-observability-implementation-20261012.md)，正文模式见[配置与验收](../delivery/langfuse-content-observability-20261012.md)；不宣称充分校准或生产 SLO。
 代码核对基线：`main@7a83f72a0b71199ff8fbfbb4f63f2633c5139285`。
 实施清单：[Langfuse Tickets](../delivery/langfuse-observability-tickets.md)。
 
@@ -76,7 +76,7 @@ HMAC 密钥独立于业务/模型密钥，通过部署 secret 注入并版本化
 
 白名单清洗在发送前完成；清洗失败则丢弃该观测，不上传原数据、不影响业务调用。锁定版本的 SDK masking 用作补充防线；必须以实际导出载荷验证第三方 span 与异常字段，不能只检查 UI。参考：[Langfuse Masking](https://langfuse.com/docs/observability/features/masking)。
 
-首期仅实现 `METADATA_ONLY`，不提供正文上传入口。未来增加 `SYNTHETIC_EVAL` 内容观测时，必须确认选定题集/语料为合成资料，并通过当前 persona/ACL；仅凭 ENVIRONMENT 名称不足以授权。需设置内容上限、截断标识与来源范围，拒绝未确认来源，不把截断记录标为完整。旧内容副本的保留/删除按实例策略处理，应用撤权不会自动撤销 Langfuse 内容。
+首期仅实现 `METADATA_ONLY`。按用户后续明确要求，追加 `RAG_LANGFUSE_DATA_MODE=CONTENT` 及 `RAG_LANGFUSE_CAPTURE_MODEL/RETRIEVAL/TOOL/QA` 四类开关；默认总模式仍是 METADATA_ONLY。正文只由明确的调用/节点边界记录，保留当前 persona/ACL/job 检查，过滤运行依赖对象、HTTP headers、异常堆栈；一个 input/output 超过 1 MiB 时写明确省略标记，不截断后冒充完整。新增正文从原 OTLP exporter 排除，普通日志不新增正文。分类开关控制节点，不删除其他已开启节点输入中合法出现的相同内容。旧内容副本的保留/删除按实例策略处理，应用撤权不会自动撤销 Langfuse 内容。
 
 Langfuse 凭据仅在后端；首期不向普通用户暴露 trace 链接或建设浏览器代理。实例访问只授予维护人员，默认按部署环境分 project；不同租户的读者不能靠 metadata filter 实现隔离，需独立 project/实例并验证实际权限。未满足访问隔离的环境不能开启内容观测。
 
@@ -155,6 +155,8 @@ telemetry 为 best-effort，队列有界，网络超时、重试及关闭等待�
 | EOBS-AC01 | 旧结果缺上下文、单轮/多轮、DOCUMENT/TOOL、未知/失败均按新契约表达；既有 API、报告及门禁不变 |
 | EOBS-AC02 | 手算事实组/替代来源/重复片段/被裁区间样例匹配阶段指标；缺来源或上下文不完整时不出确定覆盖分 |
 | EOBS-AC03 | 独立正文断言提取试验包含生成 claims 漏提、错误拒答和冲突题；人工校准、误判、未知与新增成本完整记录，未校准不升级门禁 |
+| LF-IO01 | 默认/未知模式、分类关闭与未采样均不传对应正文；CONTENT 模式 SDK 与私有实例收件证明模型、检索、工具、QA 的实际输入输出可读 |
+| LF-IO02 | 超限/不可序列化/观测故障不改变调用结果；撤权不记录对应输出；普通 OTLP 保留元数据但无新增正文；模型调用次数及计费不因观测增加 |
 
 验证必须交付代码提交、依赖/镜像版本、脱敏载荷 fixture、定向测试、合成端到端 trace 示例及故障结果。上线前比较观测开关前后的相同合成工作负载，报告样本数、并发、P50/P95 和额外资源；具体可接受开销由部署 SLO 决定，不在未测量时宣称零开销。
 

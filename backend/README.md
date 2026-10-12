@@ -79,9 +79,9 @@ Select-String -LiteralPath .runtime/demo/logs/backend.log -SimpleMatch '替换�
 
 本次 30 条合成候选已获用户核对确认，一个真实漏提反例完成 pilot；没有充分校准或生产收益证明。[实施、API 与付费验收边界](../docs/delivery/evaluation-observability-implementation-20261012.md)包含完整证据及已发生失败，不将供应商账单未知当零。
 
-### Langfuse 可选元数据观测
+### Langfuse 可选观测与输入输出
 
-默认关闭。开启后，QA 的每个 Worker lease 是一条独立 trace；恢复/HITL 重新创建，原始 run ID 与关联事件保留在应用数据库。只导出白名单元数据和 HMAC 标识，模型消息、正文、工具参数及诊断制品不上传。已有 MySQL 权限、预算、评估报告与门禁仍是权威。
+默认关闭。开启后，QA 的每个 Worker lease 是一条独立 trace；恢复/HITL 重新创建，原始 run ID 与关联事件保留在应用数据库。默认 `METADATA_ONLY` 只导出白名单元数据和 HMAC 标识；显式 `CONTENT` 可记录模型消息、检索及工具输入输出。已有 MySQL 权限、预算、评估报告与门禁仍是权威。
 
 从仓库根目录启动独立合成实例（Docker Desktop Linux containers；PowerShell）：
 
@@ -94,12 +94,33 @@ docker compose --env-file .local/langfuse-eval.env -f deploy/langfuse.compose.ym
 
 ```powershell
 pwsh -File scripts/check_langfuse_local.ps1
+pwsh -File scripts/check_langfuse_local.ps1 -Content
 pwsh -File scripts/check_langfuse_local.ps1 -Outage
 ```
 
 验收运行在 child process，替换供应商响应为合成夹具，真实经过 Worker/预算/Agent/检索/SDK/私有服务；不调用付费模型。第一条检查收件、评分幂等、撤权、HITL 和 12 对开关性能，输出 `.local/langfuse-receipt.json`；第二条暂停该独立实例的 web/worker，检查业务完成及有界退出，输出 `.local/langfuse-outage.json`，finally 恢复服务。普通 CI 跳过此私有测试。合成验收不是生产供应商或 MySQL/Milvus 联合压测。
 
-应用 API 与独立 Worker 均需注入 `RAG_LANGFUSE_ENABLED=true`、`LANGFUSE_BASE_URL/PUBLIC_KEY/SECRET_KEY`、至少 32 bytes 的专用 `RAG_LANGFUSE_ID_HMAC_KEY`、`RAG_LANGFUSE_TARGET_ID`、采样率及环境名。凭据只能注入后端进程；用 `.env.example` 核对变量，不提交密钥。首期仅支持 METADATA_ONLY，设置其他 DATA_MODE 也不会打开正文上传。切换配置需重启相应进程。
+`-Content` 在子进程显式启用四类正文，验证实际服务收件，保存 `.local/langfuse-content-receipt.json`；其余模式仍只记录元数据。这些验收不修改日常启动配置，不调用付费模型。
+
+应用 API 与独立 Worker 均需注入 `RAG_LANGFUSE_ENABLED=true`、`LANGFUSE_BASE_URL/PUBLIC_KEY/SECRET_KEY`、至少 32 bytes 的专用 `RAG_LANGFUSE_ID_HMAC_KEY`、`RAG_LANGFUSE_TARGET_ID`、采样率及环境名。凭据只能注入后端进程；用 `.env.example` 核对变量，不提交密钥。切换配置需重启相应进程。
+
+日常使用正文模式，在启动后端的同一 PowerShell 中执行：
+
+```powershell
+& .\scripts\Import-Environment.ps1 -Path .\.local\langfuse-eval.env
+$env:RAG_LANGFUSE_DATA_MODE = 'CONTENT'
+$env:RAG_LANGFUSE_CAPTURE_MODEL = 'true'
+$env:RAG_LANGFUSE_CAPTURE_RETRIEVAL = 'true'
+$env:RAG_LANGFUSE_CAPTURE_TOOL = 'true'
+$env:RAG_LANGFUSE_CAPTURE_QA = 'true'
+& .\scripts\Start-Backend.ps1 -Environment demo
+```
+
+将任一分类改为 `false` 可关闭它的正文；`DATA_MODE=METADATA_ONLY` 关闭所有正文但保留元数据。四个分类在 CONTENT 下默认 true，未知 DATA_MODE 或分类值不启用正文；这些配置也可放入忽略的 `.runtime/demo.env`，独立 Worker 需同样配置。已开启分类可能在其他分类的输入中再次出现：例如关闭 TOOL 后，模型实际 messages 仍可能含工具结果；要彻底停传工具正文必须同时关闭 MODEL（检索正文亦可能进入 TOOL/MODEL/QA）。
+
+MODEL 保存调用边界的 messages/工具定义及返回文本/tool calls（含 Judge、重排等经过 tracked 入口的请求）；不是 HTTP headers 或服务端内部思考。RETRIEVAL 保存真实图阶段输入状态及输出候选/上下文，输出为该节点的更新字段而非伪造完整状态；TOOL 保存实际参数与返回给模型的结果，已裁剪 excerpt 仍按裁剪形态记录；QA 保存问题与最终可读取答案，`agent.run` 为校验前的 Agent 结果。权限检查失败时不记录对应正文，观测故障不改变业务流程。
+
+正文只进入选定的 Langfuse 实例，新增正文从原有通用 OTLP exporter 排除，不写入普通日志/运行事件。每个 input/output 上限 1 MiB；超限显示 `OMITTED_TOO_LARGE` 和字节数，不静默裁剪。旧 trace 不回填，失败节点未产出响应时 output 可为空；正文关掉后也不会删除此前数据。现有 Embedding 独立入口未新增向量正文记录。
 
 管理员可显式调用 `POST /api/v1/admin/eval/runs/{id}/langfuse-scores` 同步已有评分，计数为 SDK 入队，确认收件要查询目标实例。管理员经 `GET /api/v1/admin/eval/qa-runs/{id}/retrieval-diagnostics` 读取本地评估诊断，读取时仍检查实际 persona 和来源。实际上下文里的未知历史、歧义/转换区间不会被标为精确完整。
 

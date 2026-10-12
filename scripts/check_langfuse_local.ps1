@@ -1,4 +1,4 @@
-param([switch]$Outage)
+param([switch]$Outage, [switch]$Content)
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -16,6 +16,7 @@ Get-Content -LiteralPath $secretFile | ForEach-Object {
 }
 $env:RAG_LANGFUSE_PRIVATE_ACCEPTANCE = '1'
 $env:RAG_LANGFUSE_FAULT_ACCEPTANCE = if ($Outage) { '1' } else { '0' }
+$env:RAG_LANGFUSE_CONTENT_ACCEPTANCE = if ($Content) { '1' } else { '0' }
 Push-Location -LiteralPath $repositoryRoot
 try {
     if ($Outage) {

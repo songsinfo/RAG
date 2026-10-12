@@ -50,7 +50,7 @@ from app.qa.question_router import classify_question, Route
 from app.qa.claim_validator import validate_claims, INSTRUCTION
 from app.qa.model_gateway import ModelGateway
 from app.qa.execution import current_qa_execution, qa_execution_scope, qa_lease_is_current
-from app.telemetry import active_batch, qa_identity_scope
+from app.telemetry import active_batch, qa_identity_scope, content_enabled, export_current_span, set_span_io
 from app.qa.context import assert_run_sources_readable, run_document_scope
 from app.retrieval.pipeline import RetrievalPipeline
 
@@ -747,6 +747,7 @@ class QaService:
                     "hmacVersion": batch.hmac_version,
                 })
             with qa_identity_scope(conv_id, seg_id):
+                set_span_io("QA", input={"question": question, "mode": mode})
                 QaService._execute_run(
                     actor,
                     run_id,
@@ -757,6 +758,22 @@ class QaService:
                     strict_mode,
                     config_id,
                 )
+                if content_enabled("QA") and export_current_span():
+                    try:
+                        with get_db_connection() as conn:
+                            owner_status = conn.execute(select(app_user_table.c.status).where(and_(
+                                app_user_table.c.tenant_id == actor.tenant_id,
+                                app_user_table.c.id == actor.user_id))).scalar()
+                        if owner_status != "ACTIVE":
+                            raise ApiException(403, "PERSONA_UNAVAILABLE", "persona 已停用")
+                        assert_run_sources_readable(actor, run_id)
+                        detail = QaService.get_run(actor, run_id)
+                        if detail.get("visibility") == "VISIBLE":
+                            set_span_io("QA", output={key: detail[key] for key in
+                                ("status", "terminalReason", "answer", "claims", "conflicts", "evidence", "verification", "warnings")
+                                if key in detail})
+                    except Exception:
+                        logger.warning("qa_content_capture_skipped")
 
     @staticmethod
     def _record_event(tenant_id: str, run_id: str, stage: str, payload: Optional[Dict[str, Any]] = None):

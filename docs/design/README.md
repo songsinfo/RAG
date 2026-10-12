@@ -12,6 +12,8 @@
 
 **Langfuse 与 EOBS（2026-10-12）**：[Spec](11-langfuse-observability-spec.md)与[Tickets](../delivery/langfuse-observability-tickets.md)定义保留自建评估、不引入 Ragas 的方案；元数据观测和私有合成部署见[LF 记录](../delivery/langfuse-implementation-status-20261012.md)，EOBS 实现与真实模型 pilot 见[后续记录](../delivery/evaluation-observability-implementation-20261012.md)。
 
+追加[可配置正文观测](../delivery/langfuse-content-observability-20261012.md)：模型、检索、工具与问答输入输出按类别启闭，默认继续元数据模式。
+
 1. [架构与技术选型](01-architecture.md)：系统如何运行、哪些组件承担哪些工作。
 2. [数据库与权限](02-data-and-access.md)：ER、字段、索引、授权与事务边界。
 3. [文档入库与生命周期](03-ingestion.md)：解析、分块、建索引、发布及删除状态机。

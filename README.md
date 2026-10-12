@@ -167,6 +167,7 @@ flowchart TD
 17. [Langfuse 与后续自建评估增强 Tickets](docs/delivery/langfuse-observability-tickets.md)
 18. [Langfuse 首期实施与私有合成验收](docs/delivery/langfuse-implementation-status-20261012.md)
 19. [EOBS 评估增强、人工确认合成资料与真实模型联调](docs/delivery/evaluation-observability-implementation-20261012.md)
+20. [Langfuse 可配置模型、检索、工具与问答输入输出](docs/delivery/langfuse-content-observability-20261012.md)
 
 上述 PRD 按 to-spec 模板组织：问题、方案、用户故事、实现决定、测试决定、范围外事项及备注。它们综合已确认访谈，不代表已实现，也没有发布到外部 Issue Tracker。
 
