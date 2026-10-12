@@ -733,6 +733,14 @@ def test_snapshot_config_and_evaluation_run(eval_env):
     res_keys = {c["caseKey"] for c in cases_res}
     assert "smoke-qa-01" in res_keys
     assert "smoke-qa-02" in res_keys
+    answerable = next(c for c in cases_res if c['caseKey'] == 'smoke-qa-01')
+    assert answerable['judge']['evaluationSample']['contractVersion'] == 'eobs-v1'
+    assert answerable['judge']['evaluationSample']['actualContext']['status'] == 'UNKNOWN'
+    stages = answerable['metrics']['stageCoverage']
+    assert any(m['stage'] == 'bm25_recall' and m['status'] == 'OK'
+               and m['value'] == answerable['metrics']['recall'] for m in stages)
+    assert any(m['stage'] == 'finalize_hits' and m['status'] == 'OK' for m in stages)
+    assert metrics['metricCoverage']
 
     # 第 7 步：为结果添加人工 review，验证人工标签覆盖/补充自动 Judge 的机制。
     res_id = cases_res[0]["id"]

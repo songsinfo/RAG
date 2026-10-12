@@ -616,6 +616,8 @@ if ($LASTEXITCODE -ne 0) { throw '会话上下文或恢复测试失败' }
 
 ## 10. 与现有文档如何配合
 
+EOBS 后续从 `EvaluationRunner._update_result → evaluation/observability.py` 形成内部样本、状态描述和阶段覆盖，追加字段不改旧门禁。`assertion_diagnostic.py` 的显式管理员入口创建独立 EVALUATE job；Worker 只在 diagnosticType 匹配时执行两阶段断言实验，检查预算、HUMAN_REVIEWED、persona/ACL 和 lease，输出不覆盖原 correctness。真实供应商与一个已确认合成反例的 pilot 见[EOBS 记录](delivery/evaluation-observability-implementation-20261012.md)。
+
 Langfuse 首期从 `runtime/worker.py → telemetry.observation_batch → QaService.execute_queued_run` 关联物理 lease；`qa/model_usage.py → model_observation` 只在真实外发时创建 generation。`retrieval/rag_graph.py` 显式传递并行 context；`evaluation/diagnostics.py` 保存阶段候选及实际外发区间，`evaluation/langfuse_sync.py` 显式同步已有分数。默认关闭且只上传元数据，私有制品及完整评估仍从应用受控入口读取。范围、合成收件与未实测部分见[实施记录](delivery/langfuse-implementation-status-20261012.md)。
 
 推荐顺序是：[README 总览](../README.md) → 本源码导读 → [Agent 知识检索工具图说明](rag-langgraph-retrieval.md) → [评估完整说明](rag-evaluation-guide.md) → 按需查阅旧设计中的设计意图。

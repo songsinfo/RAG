@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "feat/langfuse-observability-20261012"]
 
 jobs:
   backend:

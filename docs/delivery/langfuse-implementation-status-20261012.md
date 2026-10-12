@@ -1,6 +1,6 @@
 # Langfuse 首期实施与合成验收（2026-10-12）
 
-对应 [Spec](../design/11-langfuse-observability-spec.md) 和 [Tickets](langfuse-observability-tickets.md)。LF-T01～06 已实现并通过本地合成验收；EOBS-01～03 保持后续任务。默认关闭，仅支持 METADATA_ONLY，没有引入 Ragas、托管 Judge 或额外在线模型调用。
+本文件记录首次 PR #16 / 1bd20cb 的合成验收，对应 [Spec](../design/11-langfuse-observability-spec.md) 和 [Tickets](langfuse-observability-tickets.md)。LF-T01～06 已完成。后来 EOBS 与真实供应商联调已另行实施，见[后续记录](evaluation-observability-implementation-20261012.md)；本文件原先的未实测说明属于首期验收范围。默认关闭，仅支持 METADATA_ONLY，没有引入 Ragas或托管 Judge。
 
 ## 实现范围
 

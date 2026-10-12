@@ -69,6 +69,16 @@ Select-String -LiteralPath .runtime/demo/logs/backend.log -SimpleMatch '替换�
 
 ## 本地开发与运行
 
+### EOBS 评估增强与独立断言实验
+
+评估结果增加私有 `judge.evaluationSample`（eobs-v1）、指标状态 `metrics.metricDiagnostics`、阶段覆盖 `metrics.stageCoverage`；聚合增加 `metricCoverage`。区分 canonical 候选、检索输出与实际发送的结构化文档区间；未知、失败和空 Gold 不补零。旧 correctness、成功率、v1/v2 Judge 与门禁保持原义。
+
+独立断言实验为显式管理员动作：`POST /api/v1/admin/eval/runs/{id}/assertion-diagnostics`，提交 resultIds、正数 maxCostCny 和 Idempotency-Key。仅 HUMAN_REVIEWED 且来源当前可读的完成问答可执行。独立 EVALUATE job 两阶段调用模型，第一阶段不接收原 claims；不默认增加在线模型调用，不改原评估结果。
+
+读取 `GET /api/v1/admin/eval/assertion-diagnostics/{jobId}`，逐断言人工标签通过对应 `/calibration` POST 提交，保留人工修订及真实比较分母。Judge 等待上限为 60 秒，调用 deadline 仍优先限制；超时用量保留未知。
+
+本次 30 条合成候选已获用户核对确认，一个真实漏提反例完成 pilot；没有充分校准或生产收益证明。[实施、API 与付费验收边界](../docs/delivery/evaluation-observability-implementation-20261012.md)包含完整证据及已发生失败，不将供应商账单未知当零。
+
 ### Langfuse 可选元数据观测
 
 默认关闭。开启后，QA 的每个 Worker lease 是一条独立 trace；恢复/HITL 重新创建，原始 run ID 与关联事件保留在应用数据库。只导出白名单元数据和 HMAC 标识，模型消息、正文、工具参数及诊断制品不上传。已有 MySQL 权限、预算、评估报告与门禁仍是权威。

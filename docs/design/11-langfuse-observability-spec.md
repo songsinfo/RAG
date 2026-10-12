@@ -1,6 +1,6 @@
 # Langfuse 可观测性接入与评估设计借鉴 Spec
 
-状态：LF 首期已实现并通过私有合成验收；后续 EOBS 尚未实施。日期：2026-10-12。证据与边界见[实施记录](../delivery/langfuse-implementation-status-20261012.md)。
+状态：LF 首期已完成；EOBS-01/02 已实现，EOBS-03 入口及真实 pilot 已完成。日期：2026-10-12。首期见[LF 记录](../delivery/langfuse-implementation-status-20261012.md)，后续及真实联调见[EOBS 记录](../delivery/evaluation-observability-implementation-20261012.md)；不宣称充分校准或生产 SLO。
 代码核对基线：`main@7a83f72a0b71199ff8fbfbb4f63f2633c5139285`。
 实施清单：[Langfuse Tickets](../delivery/langfuse-observability-tickets.md)。
 
@@ -138,7 +138,7 @@ telemetry 为 best-effort，队列有界，网络超时、重试及关闭等待�
 
 ## 5. Testing Decisions
 
-实现验收编号如下；通过状态及逐项证据见实施记录。fake exporter 验证实际序列化 payload 与树结构；私有 Langfuse 使用合成数据做端到端收件检查；真实供应商调用与付费模型收益另列未实测。
+实现验收编号如下；通过状态及逐项证据见实施记录。fake exporter 验证实际序列化 payload 与树结构；私有 Langfuse 使用合成数据做端到端收件检查；真实供应商合成联调见后续 EOBS 记录，付费模型质量收益仍未验证。
 
 | 编号 | Given / When / Then |
 | --- | --- |

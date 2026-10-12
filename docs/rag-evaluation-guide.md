@@ -636,6 +636,16 @@ Agent 可以决定检索什么、是否继续搜索、何时停止。多轮检�
 
 ## 13. 源码与文档阅读入口
 
+### EOBS 新增诊断字段与显式实验（2026-10-12）
+
+现有评分字段和门禁不变。`judge.evaluationSample` 保存 eobs-v1 的最终问题、真实授权历史、答案与实际上下文引用；旧数据缺消息快照时标 UNKNOWN，REDACTED 导出不带这个私有样本。`metricDiagnostics` 说明输入、版本、适用状态和分母，聚合 `metricCoverage` 分开显示已算、未知、不适用和错误。
+
+`stageCoverage` 使用 Gold 事实组计算阶段覆盖，替代来源命中任一即可、重复不加分、doc/version 必须匹配。实际上下文仅在 EXACT 的发送区间内匹配，parent expansion 与 child fallback 通过私有文本摘要确认；缺 provenance 不出确定分数。SENT_STRUCTURED_DOCUMENTS 不包含未知历史，不等于完整模型上下文覆盖或业务正确。
+
+独立正文断言入口是额外、手动、带预算的实验：要求 HUMAN_REVIEWED、当前 persona/来源有效，使用独立 EVALUATE job，从正文提取后再检查支持和原 claims 漏提。人工逐断言校准保留修订，未知不补满分；所有结果 OBSERVE_ONLY，不改变原 correctness。
+
+30 条合成校准资料已由当前对话用户确认；真实模型 pilot 只执行其中一个漏提反例，两条断言与已确认参考对齐。这个小样本不能证明总体 Judge 改善。版本、API、费用、真实联调失败及范围见[EOBS 实施记录](delivery/evaluation-observability-implementation-20261012.md)。
+
 以下链接指向仓库当前文件；具体行为可能随后续提交变化。
 
 | 文件 | 阅读重点 |

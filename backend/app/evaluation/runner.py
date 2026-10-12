@@ -833,6 +833,59 @@ class EvaluationRunner:
         error_code: Optional[str] = None,
         qa_run_id: Optional[str] = None,
     ):
+        # Optional diagnostic fields never change the existing scores or gate.
+        from app.evaluation.observability import build_sample, describe_metrics, stage_coverage
+        metrics, judge = dict(metrics), dict(judge)
+        case, manifest = {}, {}
+        try:
+            with get_db_connection() as conn:
+                row = conn.execute(select(eval_result_table, eval_case_table.c.case_key,
+                    eval_case_table.c.question_json, eval_case_table.c.expected_json,
+                    eval_case_table.c.persona_json, eval_run_table.c.manifest_json).select_from(
+                        eval_result_table.join(eval_case_table, and_(
+                            eval_case_table.c.tenant_id == eval_result_table.c.tenant_id,
+                            eval_case_table.c.id == eval_result_table.c.case_id)).join(eval_run_table, and_(
+                                eval_run_table.c.tenant_id == eval_result_table.c.tenant_id,
+                                eval_run_table.c.id == eval_result_table.c.eval_run_id))).where(and_(
+                    eval_result_table.c.tenant_id == actor.tenant_id,
+                    eval_result_table.c.id == result_id))).first()
+            if row:
+                case = {"caseKey": row.case_key, "question": obj(row.question_json),
+                        "expected": obj(row.expected_json), "persona": obj(row.persona_json)}
+                manifest = obj(row.manifest_json)
+                diagnostics = metrics.get("retrievalDiagnostics") or []
+                history, output = None, None
+                if qa_run_id:
+                    from app.evaluation.diagnostics import read_eval_diagnostics
+                    from app.qa.service import QaService
+                    diagnostics = read_eval_diagnostics(actor, qa_run_id)
+                    persona = EvaluationRunner._persona(actor, case)
+                    output = QaService.get_run(persona, qa_run_id)
+                    if output.get("visibility") == "HIDDEN":
+                        raise ApiException(403, "SOURCE_CHANGED", "评估来源已变化")
+                    history = EvaluationRunner._judge_conversation_context(
+                        persona, judge.get("qaRunIds") or [qa_run_id])
+                judge["evaluationSample"] = build_sample(case, manifest, result_id,
+                    int(row.repeat_no), output, history, diagnostics)
+                judge["evaluationSample"]["history"]["runIds"] = judge.get("qaRunIds") or ([qa_run_id] if qa_run_id else [])
+                ids = {item.get(field) for snapshot in diagnostics for item in snapshot.get("items", [])
+                       for field in ("chunkId", "parentChunkId", "contextChunkId") if item.get(field)}
+                with get_db_connection() as conn:
+                    canonical = conn.execute(select(chunk_table.c.id, chunk_table.c.build_id,
+                        chunk_table.c.text_content, index_build_table.c.document_id, index_build_table.c.version_id)
+                        .select_from(chunk_table.join(index_build_table, and_(
+                            chunk_table.c.tenant_id == index_build_table.c.tenant_id,
+                            chunk_table.c.build_id == index_build_table.c.id)))
+                        .where(and_(chunk_table.c.tenant_id == actor.tenant_id, chunk_table.c.id.in_(ids)))).all() if ids else []
+                chunks = {(str(r.build_id), str(r.id)): {"text": r.text_content,
+                    "documentId": str(r.document_id), "versionId": str(r.version_id)} for r in canonical}
+                metrics["stageCoverage"] = [stage_coverage(case["expected"], snapshot, chunks)
+                    for snapshot in diagnostics if snapshot.get("stage") and snapshot.get("purpose") != "JUDGE"]
+        except Exception:
+            logger.warning("evaluation_observability_unavailable")
+            judge["evaluationSample"] = {"contractVersion": "eobs-v1", "sampleId": result_id,
+                                         "contentStatus": "UNKNOWN", "errorCode": "DIAGNOSTIC_UNAVAILABLE"}
+        metrics["metricDiagnostics"] = describe_metrics(case, status_val, metrics, judge)
         now = datetime.now(timezone.utc)
         with get_db_connection() as conn:
             conn.execute(
@@ -1164,8 +1217,11 @@ class EvaluationRunner:
             },
         }
 
+        from app.evaluation.observability import metric_coverage
+        diagnostic_coverage = metric_coverage([obj(r.metrics_json) for r in rows])
         return {
             "planned": total,
+            "metricCoverage": diagnostic_coverage,
             "completed": completed,
             "failed": failed,
             "executionFailed": failed,
@@ -1305,6 +1361,27 @@ class EvaluationRunner:
                                 "reason": review.reason_text,
                             }
                 judge = item["judge"]
+                if judge.get("evaluationSample") and item.get("qaRunId"):
+                    # Newly stored full-history samples remain persona-authorized on read.
+                    try:
+                        from app.identity.deps import Actor as SampleActor
+                        from app.qa.service import QaService
+                        owner_id = conn.execute(select(qa_run_table.c.owner_id).where(and_(
+                            qa_run_table.c.tenant_id == actor.tenant_id,
+                            qa_run_table.c.id == item["qaRunId"]))).scalar()
+                        owner_status = conn.execute(select(app_user_table.c.status).where(and_(
+                            app_user_table.c.tenant_id == actor.tenant_id,
+                            app_user_table.c.id == owner_id))).scalar()
+                        if owner_status != "ACTIVE":
+                            raise ApiException(403, "PERSONA_UNAVAILABLE", "persona 已停用")
+                        persona = SampleActor(actor.tenant_id, str(owner_id), False)
+                        detail = QaService.get_run(persona, item["qaRunId"])
+                        if detail.get("visibility") == "HIDDEN":
+                            raise ApiException(403, "SOURCE_CHANGED", "来源已改变")
+                        EvaluationRunner._judge_conversation_context(persona, judge.get("qaRunIds") or [item["qaRunId"]])
+                    except Exception:
+                        judge["evaluationSample"] = {"contractVersion": "eobs-v1", "sampleId": item["id"],
+                            "contentStatus": "UNKNOWN", "errorCode": "SOURCE_UNAVAILABLE"}
                 auto_relevance = judge.get("answerRelevance") if isinstance(judge.get("answerRelevance"), dict) else None
                 automatic = {
                     "correctness": judge.get("correctness"),

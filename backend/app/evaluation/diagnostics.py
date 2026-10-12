@@ -4,6 +4,7 @@ Artifacts are not sent to Langfuse or regular logs; the event stores only the
 opaque storage key. All retrieval IDs are reauthorized before capture and read.
 """
 import json
+import hashlib
 import logging
 import os
 from typing import Any
@@ -33,6 +34,8 @@ def candidate_snapshot(stage: str, candidates: list[dict], *, limit: int,
             "documentId": hit.get("documentId"),
             "buildId": hit.get("buildId"),
             "indexEpoch": hit.get("indexEpoch"),
+            "textSha256": hashlib.sha256(hit["text"].encode("utf-8")).hexdigest()
+                if isinstance(hit.get("text"), str) else None,
             "parentChunkId": hit.get("parentChunkId"),
             "sourceType": hit.get("sourceType", "DOCUMENT"),
             "sourceUnits": [
@@ -43,6 +46,7 @@ def candidate_snapshot(stage: str, candidates: list[dict], *, limit: int,
             ],
         })
     return {"schemaVersion": _SCHEMA_VERSION, "stage": stage,
+            "k": limit,
             "retrievalIndex": retrieval_index, "routeIndex": route_index,
             "candidateCount": len(candidates),
             "capturedCount": len(items), "complete": len(candidates) <= limit,
