@@ -39,6 +39,10 @@ def test_worker_trace_and_repeated_scores_received(monkeypatch, eval_env):
     import app.qa.service as qa_service
     import app.evaluation.runner as runner
     from app.runtime.worker import DurableJobWorker
+    content = os.getenv('RAG_LANGFUSE_CONTENT_ACCEPTANCE') == '1'
+    monkeypatch.setenv('RAG_LANGFUSE_DATA_MODE', 'CONTENT' if content else 'METADATA_ONLY')
+    for category in ('MODEL', 'RETRIEVAL', 'TOOL', 'QA'):
+        monkeypatch.setenv('RAG_LANGFUSE_CAPTURE_' + category, 'true')
     provider = TracerProvider(shutdown_on_exit=False)
     sdk = Langfuse(tracer_provider=provider, timeout=2, flush_interval=1,
                    should_export_span=telemetry._export_span, mask_otel_spans=telemetry._mask_otel_spans)
@@ -77,6 +81,9 @@ def test_worker_trace_and_repeated_scores_received(monkeypatch, eval_env):
             reply = {'role': 'assistant', 'content': '', 'tool_calls': [{
                 'id': 'synthetic-search', 'name': 'search_knowledge',
                 'args': {'query': '知识库系统采用什么分块策略？', 'topK': 5}}]}
+            if content:
+                reply['tool_calls'].append({'id': 'synthetic-mock',
+                    'name': 'get_final_price_rules', 'args': {}})
         else:
             evidence = json.loads(tool_messages[-1]['content'])['evidence'][0]
             reply = {'role': 'assistant', 'tool_calls': [], 'content': json.dumps({
@@ -164,7 +171,25 @@ def test_worker_trace_and_repeated_scores_received(monkeypatch, eval_env):
         assert len(scores) == 4
         assert len({s.id for s in scores}) == 4
         generations = [o for o in observations if o.type == 'GENERATION']
-        assert len(generations) == 2 and all(g.input is None and g.output is None for g in generations)
+        assert len(generations) == 2
+        if content:
+            required = {'qa.worker.attempt', 'agent.run', 'agent.model', 'agent.tool',
+                        'rag.retrieve', 'rag.prepare_query', 'rag.bm25_recall',
+                        'rag.context_budget', 'rag.finalize_hits', 'model.agent'}
+            assert required.issubset({o.name for o in observations})
+            assert all(o.input is not None and o.output is not None for o in observations if o.name in required)
+            # This pinned server's observations API returns serialized JSON bodies.
+            def body(value):
+                return json.loads(value) if isinstance(value, str) else value
+            root = next(o for o in observations if o.name == 'qa.worker.attempt')
+            assert body(root.input)['question'] == detail['question'] and body(root.output)['answer'] == detail['answer']
+            retrieved = next(o for o in observations if o.name == 'rag.finalize_hits')
+            assert eval_env['quote'] in str(retrieved.output)
+            assert body(generations[0].input)['messages'] and body(generations[0].input)['tools']
+            assert any(o.name == 'agent.tool' and body(o.output).get('mock') is True
+                       for o in observations if o.output is not None)
+        else:
+            assert all(o.input is None and o.output is None for o in observations)
         assert 'SYNTHETIC_PRIVATE_REVIEW_CANARY' not in str([o.model_dump() for o in observations]) + str([s.model_dump() for s in scores])
         assert all(g.usage_details['input'] == 30 and g.usage_details['output'] == 10 for g in generations)
         # Provider SDK failure cannot modify authoritative evaluation data.
@@ -243,14 +268,17 @@ def test_worker_trace_and_repeated_scores_received(monkeypatch, eval_env):
                     'receivedScores': len(scores), 'duplicateSyncEnqueues': second['sent'],
                     'stages': sorted({d.get('stage') for d in diagnostics if d.get('stage')}),
                     'actualContextMapping': actual[0]['items'][0]['mappingStatus'],
-                    'dataMode': 'METADATA_ONLY', 'provider': 'synthetic tracked fixture',
+                    'dataMode': 'CONTENT' if content else 'METADATA_ONLY', 'provider': 'synthetic tracked fixture',
+                    'contentCategoriesVerified': ['MODEL', 'RETRIEVAL', 'TOOL', 'QA'] if content else [],
+                    'mockToolBodyVerified': content,
                     'scoreFailurePreservedMetrics': True, 'revokedPersonaSkipped': True,
                     'hitlDistinctBatches': len(approval_batches),
                     'performance': {mode: {'samples': len(values), 'concurrency': 1,
                         'p50Ms': round(EvaluationMetrics.percentile(values, .5), 2),
                         'p95Ms': round(EvaluationMetrics.percentile(values, .95), 2),
                         'maxPythonAllocatedBytes': max(peaks[mode])} for mode, values in measurements.items()}}
-        target = Path(__file__).resolve().parents[2] / '.local' / 'langfuse-receipt.json'
+        target = Path(__file__).resolve().parents[2] / '.local' / (
+            'langfuse-content-receipt.json' if content else 'langfuse-receipt.json')
         target.parent.mkdir(exist_ok=True)
         target.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
     finally:

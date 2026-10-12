@@ -7,7 +7,7 @@ import uuid
 from app.errors import ApiException
 from app.model_budget import BudgetService
 from app.qa.runtime import AgentRuntimePolicy, get_run_usage
-from app.telemetry import model_observation, finish_model_observation
+from app.telemetry import model_observation, finish_model_observation, content_enabled, model_response_content, set_model_io
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,15 @@ def invoke_tracked(fn, *, tenant_id, run_id=None, job_id=None, purpose, alias,
         # Exporter faults are caught inside the optional observation adapter.
         with model_observation(purpose, alias, call_id) as active:
             observation = active
+            set_model_io(active, input=payload)
             result = fn()
+            if active is not None and content_enabled("MODEL"):
+                try:
+                    ModelGateway.assert_run_sources_current(tenant_id, run_id, allow_eval_judge=purpose == "JUDGE")
+                    ModelGateway.assert_job_current(tenant_id, job_id)
+                    set_model_io(active, output=model_response_content(result))
+                except Exception:
+                    logger.warning("model_content_capture_skipped")
         if getattr(result, "status_code", 200) >= 400:
             raise ApiException(503, "MODEL_GATEWAY_UNAVAILABLE", f"模型网关返回状态码 {result.status_code}")
         usage = normalize_provider_usage(usage_reader(result) if usage_reader else {})

@@ -104,6 +104,8 @@ LF 首期证据及测试边界：[实施记录](langfuse-implementation-status-2
 
 ## 依赖与完成标准
 
+追加 LF-IO（2026-10-12）：按用户要求实现 MODEL/RETRIEVAL/TOOL/QA 可配置输入输出，默认仍关闭正文；记录、边界与 LF-IO01/02 验证见[正文观测实施记录](langfuse-content-observability-20261012.md)。不替换 LF 首期历史证据。
+
 真正阻塞：LF-T01 → LF-T02 → LF-T03/LF-T04/LF-T05；LF-T01～05 → LF-T06 整体验收。LF-T06 环境准备可从一开始进行。后续：EOBS-01 → EOBS-02/EOBS-03，且 LF-T04 → EOBS-02。LF-T03 → LF-T05 仅为推荐验证顺序。
 
 - [x] 首期 LF-T01～06 已实现，LF-AC01～10 有逐项合成证据。

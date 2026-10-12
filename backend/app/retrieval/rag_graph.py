@@ -21,6 +21,7 @@ from langgraph.runtime import Runtime
 
 from app.db import get_db_connection
 from app.observability import agent_span
+from app.telemetry import content_enabled, export_current_span, set_span_io
 from app.errors import ApiException
 from app.identity.deps import Actor, assert_hits_still_readable, get_readable_build_records
 from app.retrieval.config import RetrievalConfig, load_retrieval_config
@@ -132,10 +133,12 @@ class RagRetrievalGraph:
 
         def in_context(state, runtime):
             idx = runtime.context.retrieval_index
-            with agent_span("rag." + name, {"rag.retrieval_index": idx, "rag.stage": name}):
+            with agent_span("rag." + name, {"rag.retrieval_index": idx, "rag.stage": name}) as span:
                 # LangGraph's parallel nodes run with their own captured context,
                 # rather than reusing a global trace or span across different runs.
+                RagRetrievalGraph._capture_io(runtime.context, state, span, "input")
                 result = node(state, runtime)
+                RagRetrievalGraph._capture_io(runtime.context, result, span, "output")
                 if isinstance(result, dict):
                     from app.evaluation.diagnostics import capture_eval_stage
                     from opentelemetry import trace
@@ -176,6 +179,30 @@ class RagRetrievalGraph:
                 return result
         return observed
 
+    @staticmethod
+    def _capture_io(ctx, data, span, field):
+        if not content_enabled("RETRIEVAL") or not export_current_span():
+            return
+        try:
+            from app.qa.model_gateway import ModelGateway
+            ModelGateway.assert_run_sources_current(ctx.actor.tenant_id, ctx.run_id)
+            ModelGateway.assert_job_current(ctx.actor.tenant_id, ctx.job_id)
+            hits = list(data.get("hits") or [])
+            for key in ("dense_routes", "sparse_routes"):
+                hits.extend(hit for route in data.get(key, []) for hit in route)
+            with get_db_connection() as conn:
+                assert_hits_still_readable(conn, ctx.actor, hits, ctx.kb_ids,
+                    data.get("document_ids", ctx.document_ids))
+            snapshot = dict(data)
+            if snapshot.get("cfg") is not None:
+                snapshot["cfg"] = snapshot["cfg"].as_dict()
+            if field == "input":
+                snapshot = {"query": ctx.query, "history": ctx.history,
+                    "kbIds": ctx.kb_ids, "documentIds": ctx.document_ids, "state": snapshot}
+            set_span_io("RETRIEVAL", span=span, **{field: snapshot})
+        except Exception:
+            logger.warning("retrieval_content_capture_skipped")
+
     @classmethod
     def retrieve(
         cls,
@@ -205,19 +232,22 @@ class RagRetrievalGraph:
             record_event_fn=record_event_fn,
             retrieval_index=next(cls._retrieval_indices),
         )
-        with agent_span("rag.retrieve", {"rag.retrieval_index": ctx.retrieval_index}):
+        with agent_span("rag.retrieve", {"rag.retrieval_index": ctx.retrieval_index}) as span:
             ctx = replace(ctx, observation_context=copy_context())
+            cls._capture_io(ctx, {}, span, "input")
             state = cls._get_graph().invoke({}, context=ctx)
-        return {
-            "hits": state.get("hits", []),
-            "warnings": state.get("warnings", []),
-            "config": state["cfg"].as_dict(),
-            "allowedBuildCount": len(state["allowed_build_ids"]),
-        }
+            result = {
+                "hits": state.get("hits", []),
+                "warnings": state.get("warnings", []),
+                "config": state["cfg"].as_dict(),
+                "allowedBuildCount": len(state["allowed_build_ids"]),
+            }
+            cls._capture_io(ctx, result, span, "output")
+            return result
 
     @staticmethod
     def _record(ctx: RagRetrievalContext, stage: str, elapsed_ms: float, count: int, **fields) -> None:
-        """只落候选数量、参数和耗时，不在 Trace 中保存未入选的敏感正文。"""
+        """本地阶段事件只落数量、参数和耗时；可选正文由独立观测入口记录。"""
         if ctx.record_event_fn is None or not ctx.run_id:
             return
         try:

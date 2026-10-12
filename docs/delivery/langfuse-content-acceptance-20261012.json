@@ -1,0 +1,107 @@
+{
+  "date": "2026-10-12",
+  "baseCommit": "4a367d22de98f6a14ca2b11b38a08c95145254ac",
+  "sdkVersion": "4.16.0",
+  "privateServerVersion": "4.56.0",
+  "actualPaidModelCalls": 0,
+  "backendTestsPassed": 233,
+  "backendTestsSkipped": 3,
+  "historicalReviewTestsPassed": 32,
+  "content": {
+    "traceId": "48b464be036c30f7f006d9f58a62dc33",
+    "modelCalls": 2,
+    "comparisonModelCalls": 54,
+    "receivedGenerations": 2,
+    "receivedScores": 4,
+    "duplicateSyncEnqueues": 4,
+    "stages": [
+      "MODEL_CONTEXT",
+      "context_budget",
+      "dense_recall",
+      "finalize_hits",
+      "hydrate_and_acl",
+      "mmr",
+      "parent_expansion",
+      "rerank",
+      "rrf_fusion",
+      "scope"
+    ],
+    "actualContextMapping": "EXACT",
+    "dataMode": "CONTENT",
+    "provider": "synthetic tracked fixture",
+    "contentCategoriesVerified": [
+      "MODEL",
+      "RETRIEVAL",
+      "TOOL",
+      "QA"
+    ],
+    "mockToolBodyVerified": true,
+    "scoreFailurePreservedMetrics": true,
+    "revokedPersonaSkipped": true,
+    "hitlDistinctBatches": 2,
+    "performance": {
+      "off": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 746.99,
+        "p95Ms": 834.66,
+        "maxPythonAllocatedBytes": 504580
+      },
+      "on": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 1143.68,
+        "p95Ms": 1406.58,
+        "maxPythonAllocatedBytes": 717357
+      }
+    }
+  },
+  "metadataOnly": {
+    "traceId": "1893d2b0a98bc7bd23e0878029449580",
+    "modelCalls": 2,
+    "comparisonModelCalls": 54,
+    "receivedGenerations": 2,
+    "receivedScores": 4,
+    "duplicateSyncEnqueues": 4,
+    "stages": [
+      "MODEL_CONTEXT",
+      "context_budget",
+      "dense_recall",
+      "finalize_hits",
+      "hydrate_and_acl",
+      "mmr",
+      "parent_expansion",
+      "rerank",
+      "rrf_fusion",
+      "scope"
+    ],
+    "actualContextMapping": "EXACT",
+    "dataMode": "METADATA_ONLY",
+    "provider": "synthetic tracked fixture",
+    "scoreFailurePreservedMetrics": true,
+    "revokedPersonaSkipped": true,
+    "hitlDistinctBatches": 2,
+    "performance": {
+      "off": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 670.09,
+        "p95Ms": 1031.07,
+        "maxPythonAllocatedBytes": 457018
+      },
+      "on": {
+        "samples": 12,
+        "concurrency": 1,
+        "p50Ms": 670.97,
+        "p95Ms": 853.03,
+        "maxPythonAllocatedBytes": 546351
+      }
+    }
+  },
+  "limitations": [
+    "Authored synthetic provider fixtures, no production load claim",
+    "Category switches control nodes; other enabled node messages can contain the same content",
+    "Each input/output has a 1 MiB limit with explicit omission marker",
+    "Existing traces are not backfilled; disabling does not delete previous content"
+  ]
+}

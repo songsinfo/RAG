@@ -35,6 +35,7 @@ from app.models import (
     source_unit_table,
 )
 from app.observability import add_span_event, agent_span
+from app.telemetry import content_enabled, export_current_span, set_span_io
 from app.qa.job_checkpointer import JobCheckpointSaver
 from app.qa.execution import current_qa_execution, qa_lease_is_current
 from app.qa.context import conversation_memory, assert_run_sources_readable, run_document_scope
@@ -297,7 +298,8 @@ class LangGraphAgent:
         with agent_span(
             "agent.run",
             {"run.id": run_id, "tenant.id": actor.tenant_id, "agent.prompt_version": AGENT_PROMPT_VERSION},
-        ):
+        ) as span:
+            set_span_io("QA", span=span, input={"question": question})
             final_state = graph.invoke(
                 graph_input,
                 context=context,
@@ -309,6 +311,13 @@ class LangGraphAgent:
                 # 对 HITL 和 worker 崩溃恢复都比异步落盘更安全。
                 durability="sync",
             )
+            if content_enabled("QA") and export_current_span():
+                try:
+                    ModelGateway.assert_run_sources_current(actor.tenant_id, run_id)
+                    set_span_io("QA", span=span, output=final_state.get("final_answer") or
+                        {"status": "INTERRUPTED_OR_INCOMPLETE"})
+                except Exception:
+                    logger.warning("agent_content_capture_skipped")
 
         snapshot = graph.get_state(graph_config)
         # 图暂停不等于失败；把 interrupt 暴露给上层，由人工审批接口后续 resume。
@@ -494,7 +503,8 @@ class LangGraphAgent:
             assert_hits_still_readable(conn, actor, [ev for ev in state["evidence"] if ev.get("sourceType") != "TOOL"])
         assert_run_sources_readable(actor, ctx.run_id)
 
-        with agent_span("agent.model", {"agent.round": state["round"] + 1}):
+        with agent_span("agent.model", {"agent.round": state["round"] + 1}) as span:
+            set_span_io("MODEL", span=span, input={"messages": messages, "tools": AGENT_TOOLS})
             reply = ModelGateway.chat_tools(
                 tenant_id=actor.tenant_id,
                 run_id=ctx.run_id,
@@ -504,6 +514,12 @@ class LangGraphAgent:
                 max_tokens=1200,
                 deadline_epoch=ctx.deadline_epoch,
             )
+            if content_enabled("MODEL") and export_current_span():
+                try:
+                    ModelGateway.assert_run_sources_current(actor.tenant_id, ctx.run_id)
+                    set_span_io("MODEL", span=span, output=reply)
+                except Exception:
+                    logger.warning("agent_model_content_capture_skipped")
 
         new_messages = list(messages)
         new_messages.append(reply)
@@ -603,6 +619,8 @@ class LangGraphAgent:
                 decision = approval_decisions.get(call_id)
                 if decision == "REJECT":
                     result_payload = {"status": "REJECTED", "code": "TOOL_REJECTED"}
+                    with agent_span("agent.tool", {"tool.name": name}) as span:
+                        set_span_io("TOOL", span=span, input={"name": name, "args": args}, output=result_payload)
                     new_messages.append(
                         {
                             "role": "tool",
@@ -617,7 +635,8 @@ class LangGraphAgent:
             started = time.perf_counter()
             with agent_span("agent.tool", {"tool.name": name,
                     "tool.category": "DOCUMENT" if name in {"search_knowledge", "read_section"} else "TOOL",
-                    "tool.mock": name not in {"search_knowledge", "read_section"}}):
+                    "tool.mock": name not in {"search_knowledge", "read_section"}}) as span:
+                set_span_io("TOOL", span=span, input={"name": name, "args": args})
                 try:
                     if name == "search_knowledge":
                         query = args.get("query")
@@ -802,6 +821,13 @@ class LangGraphAgent:
                         result_payload = {"status": "ERROR", "code": exc.code}
                     else:
                         raise
+
+                if content_enabled("TOOL") and export_current_span():
+                    try:
+                        ModelGateway.assert_run_sources_current(actor.tenant_id, ctx.run_id)
+                        set_span_io("TOOL", span=span, output=result_payload)
+                    except Exception:
+                        logger.warning("tool_content_capture_skipped")
 
             duration_ms = int((time.perf_counter() - started) * 1000)
             ctx.record_event_fn(

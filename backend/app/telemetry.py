@@ -1,6 +1,6 @@
-"""Opt-in, metadata-only Langfuse diagnostics sharing the application's OTel provider.
+"""Opt-in Langfuse diagnostics sharing the application's OTel provider.
 
-No content or business identifiers leave this module. MySQL remains authoritative.
+Content requires explicit global and category switches. MySQL remains authoritative.
 """
 from __future__ import annotations
 
@@ -25,6 +25,98 @@ _client = None
 _status = "DISABLED"
 _pid = os.getpid()
 _batch_var: ContextVar[Optional["ObservationBatch"]] = ContextVar("rag_observation_batch", default=None)
+_UNSET = object()
+_IO_KEYS = frozenset({"langfuse.observation.input", "langfuse.observation.output"})
+_IO_MAX_BYTES = 1024 * 1024
+
+
+def content_enabled(category: str) -> bool:
+    return (category in {"MODEL", "RETRIEVAL", "TOOL", "QA"}
+            and os.getenv("RAG_LANGFUSE_DATA_MODE", "METADATA_ONLY").strip().upper() == "CONTENT"
+            and os.getenv("RAG_LANGFUSE_CAPTURE_" + category, "true").strip().lower() in {"1", "true", "yes"})
+
+
+def _content_category(name):
+    if name.startswith("model.") or name == "agent.model":
+        return "MODEL"
+    if name.startswith("rag."):
+        return "RETRIEVAL"
+    if name == "agent.tool":
+        return "TOOL"
+    if name in {"qa.worker.attempt", "agent.run"}:
+        return "QA"
+    return ""
+
+
+def _content_json(value):
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    size = len(encoded.encode("utf-8"))
+    if size > _IO_MAX_BYTES:
+        return json.dumps({"captureStatus": "OMITTED_TOO_LARGE", "originalBytes": size,
+                           "limitBytes": _IO_MAX_BYTES})
+    return encoded
+
+
+def set_span_io(category, *, span=None, input=_UNSET, output=_UNSET):
+    """Only explicit content fields; never inspect runtime objects or log bodies."""
+    if not content_enabled(category) or not export_current_span():
+        return
+    try:
+        from opentelemetry import trace
+        span = span if span is not None else trace.get_current_span()
+        if span is None or not span.is_recording() or _content_category(span.name) != category:
+            return
+        for field, value in (("input", input), ("output", output)):
+            if value is not _UNSET:
+                span.set_attribute("langfuse.observation." + field, _content_json(value))
+    except Exception:
+        logger.warning("telemetry_content_capture_failed")
+
+
+def model_response_content(result):
+    """Response body only, excluding HTTP headers and provider metadata."""
+    try:
+        if isinstance(result, (dict, list, str)):
+            return result
+        if hasattr(result, "content"):
+            return {"content": result.content, "tool_calls": getattr(result, "tool_calls", []),
+                    "invalid_tool_calls": getattr(result, "invalid_tool_calls", [])}
+        if callable(getattr(result, "json", None)):
+            return result.json()
+    except Exception:
+        pass
+    return {"captureStatus": "UNSUPPORTED_RESPONSE_TYPE"}
+
+
+def set_model_io(observation, *, input=_UNSET, output=_UNSET):
+    if observation is None or not content_enabled("MODEL") or not export_current_span():
+        return
+    try:
+        observation.update(**{key: json.loads(_content_json(value))
+            for key, value in (("input", input), ("output", output)) if value is not _UNSET})
+    except Exception:
+        logger.warning("telemetry_model_content_capture_failed")
+
+
+class _MetadataOnlyExporter:
+    """Keep optional Langfuse bodies out of the pre-existing OTLP destination."""
+    def __init__(self, exporter):
+        self.exporter = exporter
+
+    def export(self, spans):
+        from opentelemetry.sdk.trace import ReadableSpan
+        cleaned = [ReadableSpan(name=s.name, context=s.context, parent=s.parent,
+            resource=s.resource, attributes={k: v for k, v in s.attributes.items() if k not in _IO_KEYS},
+            events=s.events, links=s.links, kind=s.kind, status=s.status,
+            start_time=s.start_time, end_time=s.end_time, instrumentation_scope=s.instrumentation_scope)
+            for s in spans]
+        return self.exporter.export(cleaned)
+
+    def shutdown(self):
+        return self.exporter.shutdown()
+
+    def force_flush(self, timeout_millis=30000):
+        return self.exporter.force_flush(timeout_millis)
 
 
 @contextmanager
@@ -155,7 +247,15 @@ _SDK_ALLOWED = frozenset({
 )
 
 
-def _safe_sdk_value(key: str, value: Any) -> bool:
+def _safe_sdk_value(key: str, value: Any, span_name: str = "") -> bool:
+    if key in _IO_KEYS:
+        if not content_enabled(_content_category(span_name)) or not isinstance(value, str):
+            return False
+        try:
+            json.loads(value)
+            return len(value.encode("utf-8")) <= _IO_MAX_BYTES
+        except (ValueError, TypeError):
+            return False
     if key.startswith(_SDK_METADATA_PREFIX):
         name = key[len(_SDK_METADATA_PREFIX):]
         if name in _SDK_METADATA_CODES:
@@ -198,17 +298,17 @@ def _export_span(span: Any) -> bool:
         if scope == "langfuse-sdk":
             if not str(span.name).startswith("model.") or span.events or getattr(span.status, "description", None):
                 return False
-            return all(key in _SDK_ALLOWED and _safe_sdk_value(key, value)
+            return all(key in (_SDK_ALLOWED | _IO_KEYS) and _safe_sdk_value(key, value, span.name)
                        for key, value in dict(span.attributes or {}).items())
         if scope != "rag.agent" or not str(span.name).startswith(("qa.", "agent.", "rag.")):
             return False
         attrs = dict(span.attributes or {})
         if attrs.get("rag.export") is not True:
             return False
-        project_attrs = {k: v for k, v in attrs.items() if k not in _SDK_ALLOWED}
-        sdk_attrs = {k: v for k, v in attrs.items() if k in _SDK_ALLOWED}
+        project_attrs = {k: v for k, v in attrs.items() if k not in (_SDK_ALLOWED | _IO_KEYS)}
+        sdk_attrs = {k: v for k, v in attrs.items() if k in (_SDK_ALLOWED | _IO_KEYS)}
         if (len(safe_attributes(project_attrs)) != len(project_attrs)
-                or not all(_safe_sdk_value(k, v) for k, v in sdk_attrs.items())
+                or not all(_safe_sdk_value(k, v, span.name) for k, v in sdk_attrs.items())
                 or getattr(span.status, "description", None)):
             return False
         for event in span.events or ():
@@ -228,17 +328,17 @@ def _mask_otel_spans(*, params):
     """
     from langfuse.types import MaskOtelSpansResult, OtelSpanPatch
 
-    # These are the only SDK-managed attributes permitted on synthetic metadata
-    # generations; remove all unknown SDK attributes, including freeform payloads.
+    # Named content fields have a separate opt-in policy; arbitrary metadata,
+    # third-party payload attributes and exception data remain excluded.
     patches = {}
     for ref, span in params.spans.items():
         attrs = span.attributes
         is_sdk = span.instrumentation_scope_name == "langfuse-sdk"
         if is_sdk:
-            to_delete = tuple(key for key, value in attrs.items() if key not in _SDK_ALLOWED or not _safe_sdk_value(key, value))
+            to_delete = tuple(key for key, value in attrs.items() if key not in (_SDK_ALLOWED | _IO_KEYS) or not _safe_sdk_value(key, value, span.name))
         else:
             allowed = {**safe_attributes(attrs), **{
-                k: v for k, v in attrs.items() if k in _SDK_ALLOWED and _safe_sdk_value(k, v)
+                k: v for k, v in attrs.items() if k in (_SDK_ALLOWED | _IO_KEYS) and _safe_sdk_value(k, v, span.name)
             }}
             to_delete = tuple(key for key in attrs if key not in allowed)
         if to_delete:
@@ -282,7 +382,7 @@ def configure_telemetry() -> None:
             if endpoint:
                 exporter = OTLPSpanExporter(endpoint=endpoint.rstrip("/") + "/v1/traces", timeout=2)
                 provider.add_span_processor(BatchSpanProcessor(
-                    exporter, max_queue_size=512, max_export_batch_size=128,
+                    _MetadataOnlyExporter(exporter), max_queue_size=512, max_export_batch_size=128,
                     schedule_delay_millis=1000, export_timeout_millis=2000))
             if not lf_requested:
                 _status = "OTLP_ONLY"
@@ -310,7 +410,7 @@ def configure_telemetry() -> None:
                 mask_otel_spans=_mask_otel_spans,
             )
             _status = "ENABLED"
-            logger.info("Langfuse metadata-only tracing enabled")
+            logger.info("Langfuse tracing enabled")
         except Exception:
             _client = None
             _status = "INIT_FAILED"
