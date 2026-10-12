@@ -2,7 +2,7 @@
 
 Python FastAPI 主业务、Milvus 向量与混合检索、LiteLLM AI Gateway（供应商 API 密钥由网关独立持有）、Docling 独立解析服务，面向运营、产品和技术共用的企业级内部知识库。前端简洁，重点是细粒度权限控制、文档全生命周期、混合检索策略、可追溯事实断言回答、自动化评测与故障恢复。旧 Java/Spring Boot/Elasticsearch 基线可通过 Git 历史标签或提交记录定位。
 
-> **当前 main（2026-10-10）**：[PR #14](https://github.com/songsinfo/RAG/pull/14) 已合并（`2b40a9b`），统一 Agent、Durable QA 和跨轮版本化快照代码已进入主分支；**合并不等于 UA-01～UA-12 全量生产验收完成**。四个业务诊断工具仍为固定模拟结果，没有调用 Java 或真实业务系统；真实模型表现及缓存收益仍需实测。范围、剩余验收与回滚条件见[统一业务 Agent 实施状态](docs/delivery/unified-business-agent-implementation-status.md)。
+> **核对基线（2026-10-12，`main` @ `1e51437`）**：PR #14 的统一业务 Agent、Durable QA 和跨轮上下文已进入主分支；此后 PR #16 引入默认关闭的 Langfuse 元数据观测，PR #17 引入 EOBS 阶段事实覆盖与独立断言实验，PR #18 增加显式开启的模型 / 检索 / 工具 / 问答正文采集。最新提交将 Agent Prompt 默认版本提升为 `agent-v1.2`，要求知识检索保留完整问题语义。**合并或合成验收不等于生产环境联合压测、充分业务 Gold 校准或真实业务系统接入已完成**；四个业务诊断工具仍返回固定模拟结果。见[统一 Agent 实施状态](docs/delivery/unified-business-agent-implementation-status.md)、[EOBS 实施记录](docs/delivery/evaluation-observability-implementation-20261012.md)和[Langfuse 正文采集说明](docs/delivery/langfuse-content-observability-20261012.md)。
 
 ## 系统架构与核心流程
 
@@ -21,9 +21,10 @@ flowchart LR
         PARSER[Docling Adapter<br/>Hybrid Chunks → Parent-Child + Provenance]
         RET[retrieval<br/>Agent 的 LangGraph 检索工具图<br/>共享 Dense / BM25 / RRF / Reranker / Parent]
         QA[qa<br/>统一 LangGraph Agent / Claim Validation / 模拟业务工具]
-        EVAL[evaluation<br/>题集 / 指标 / 消融实验]
+        EVAL[evaluation<br/>题集 / EOBS 阶段事实覆盖 / 独立断言实验]
         MODEL[ModelGateway<br/>LangChain OpenAI Client]
         EMB[embedding.py<br/>Embedding Client]
+        OBS[telemetry / OTel<br/>可选观测与数据采集控制]
     end
 
     API --> AUTH
@@ -38,7 +39,11 @@ flowchart LR
     EVAL --> MYSQL
 
     KB --> FS[(Local / S3 / MinIO<br/>私有文件制品)]
-    KB --> JOB[Durable Job Worker<br/>Lease + Retry + Recovery]
+    KB -->|INGEST / PURGE| JOB[Durable Job Worker<br/>Lease + Retry + Recovery]
+    QA -->|QA_RUN| JOB
+    EVAL -->|EVALUATE| JOB
+    JOB -->|执行 QA_RUN| QA
+    JOB -->|执行 EVALUATE| EVAL
     JOB --> PARSER
     PARSER --> MYSQL
     PARSER --> RET
@@ -50,6 +55,11 @@ flowchart LR
     QA --> RET
     QA --> MODEL
     MODEL --> LITELLM
+    QA --> OBS
+    RET --> OBS
+    MODEL --> OBS
+    EVAL --> OBS
+    OBS -.->|启用后异步导出| LANGFUSE[Langfuse 私有可选服务<br/>Trace / Generation / Span]
     EVAL --> QA
 
     LITELLM --> PROVIDER[模型供应商<br/>Chat / Embedding / Judge]
@@ -62,6 +72,8 @@ flowchart LR
 ```
 
 架构中的关键约束：**MySQL 是权限与生效 Build 的权威来源**，Milvus 只保存可重建的检索索引；每次检索先从 MySQL 计算当前用户可读的 `active_build_id`，再把这些 Build ID 作为 Milvus 过滤条件，从源头避免越权召回。模型供应商密钥由 LiteLLM 独立持有，业务后端只调用内部模型别名。
+
+**观测与质量分工**：`run_event`、`model_call`、评估结果、权限和预算仍以业务数据库为准；Langfuse 为可选诊断视图，不参与在线问答的强依赖路径。EOBS 的阶段事实覆盖在评估范围内计算，不能把它等同于生产请求的逐阶段 Recall@5 或 NDCG@5。
 
 ### 文档入库流程图
 
@@ -127,14 +139,20 @@ flowchart TD
 
 **两类证据**：文档引用由 `documentId/buildId`、来源原文和 ACL 约束；`TOOL` 引用存储 `sourceType/toolName/sourceSnapshot`、查询对象、`queriedAt`、`fixtureVersion`、`mock`，不伪造文档链接。页面及回答通过后端字段提示“模拟结果，未查询真实业务系统”。这不意味着真实用户业务资格经过核验。上下文压缩与缓存可观测性尚不等于跨轮稳定 KV cache 已验收；详细状态见实施记录。
 
-## 当前实现与验收边界（PR #14 已合并；仍需逐项验收）
+### Langfuse 观测与 EOBS 诊断（当前 `main`）
+
+- **Langfuse（PR #16、#18）**：`backend/app/telemetry.py` 将 QA_RUN Worker 的物理租约关联到可选 trace，并关联真实模型外发、检索图节点和工具执行。默认 `RAG_LANGFUSE_ENABLED=false`；启用后默认 `RAG_LANGFUSE_DATA_MODE=METADATA_ONLY`。只有显式切换 `CONTENT` 并按 `RAG_LANGFUSE_CAPTURE_MODEL/RETRIEVAL/TOOL/QA` 分类控制时才采集相应正文。单独关闭工具正文不保证其文本不会出现在已开启的模型消息中；完全停止正文采集需关闭内容模式。观测故障不应阻断业务，旧 trace 也不会随开关自动删除。部署、隐私和容量边界见[后端 README](backend/README.md#langfuse-可选观测与输入输出)。
+- **EOBS（PR #17）**：评估结果保存 `judge.evaluationSample`、`metrics.metricDiagnostics`、`metrics.stageCoverage`，聚合提供 `metricCoverage`。`stageFactRecall` 基于 Gold 事实组、阶段候选及实际发送的可定位文档区间计算；未知、缺失或不适用不补零。它与现有 Recall@5 / NDCG@5、语义 Judge 和线上 Claim 校验分别属于不同契约。
+- **独立断言实验**：管理员对人工复核的评估题显式提供预算，另启 EVALUATE Job，从完整答案提取断言并检查支持情况，支持人工校准；采用 `OBSERVE_ONLY`，不改写现有 correctness 或质量门禁。没有接入 Ragas，也不代表已完成充分业务 Gold 校准。
+
+## 当前实现与验收边界（截至 2026-10-12）
 
 - **统一权限真源**：Search API、普通 RAG、Agent 检索统一使用 `get_readable_build_records()`，同时覆盖租户、用户状态、KB ACL、文档 ACL、用户组和 active build。
 - **TOCTOU 防护**：检索后、模型外发前再次核对当前权限与 `active_build_id`；权限撤销或版本切换时返回 `SOURCE_CHANGED`，不把失效来源发送给模型。
 - **完整 Evidence Provenance**：Milvus Hit 返回真实 `kbId/documentId/versionId/buildId/chunkId`，并关联 `source_unit/location`；不再用 `allowed_build_ids[0]` 猜测来源。
 - **配置驱动 Retrieval**：Dense/Sparse 候选数、RRF、Reranker、Parent Expansion、Final Top-K 均由版本化 Retrieval Config 控制。
 - **Reranker + Parent Expansion**：Child Chunk 用于高精度召回，Reranker 精排后可扩展到 Parent Context，兼顾召回精度和生成上下文完整性。
-- **Agent 复用 LangGraph 检索图**：Dense/BM25 并行、RRF 汇合、Reranker / MMR / Parent / 上下文预算独立节点；每阶段 `run_event` 记录候选数量与耗时，**尚未**保存完整候选排名或计算阶段级 Recall@5 / NDCG@5。Agent 依旧使用独立的 model/tools 图。
+- **Agent 复用 LangGraph 检索图**：Dense/BM25 并行、RRF 汇合、Reranker / MMR / Parent / 上下文预算独立节点；在线 `run_event` 主要记录阶段数量与耗时。评估链路通过 `evaluation/diagnostics.py` 在受控范围捕获阶段候选并计算 `stageFactRecall`；**不等于**已为各阶段实现排名型 Recall@5 / NDCG@5。Agent 依旧使用独立的 model/tools 图。
 - **统一 Docling + HybridChunker 入库**：Markdown、TXT、PDF、DOCX、Office 等所有支持格式统一调用 Docling `/v1/chunk/hybrid/file`；Docling 负责解析与 HybridChunker 子块切分，后端通过 `adapt_docling_hybrid_chunks()` 组织 Parent-Child 结构，并保留 Heading、Page、Doc Item、Location 等 provenance。默认 Child 上限为 400 tokens、Parent 上限为 1200 tokens，均可通过构建配置或环境变量调整。
 - **统一 Agent 问答通道**：新提问总是创建 `QA_RUN` Durable Job，前端移除 RAG / Agent 模式选择，保留 SSE、取消、追问与受权限控制的历史展示；旧 REALTIME 代码用于历史兼容，尚未完成清理。
 - **Durable Job Worker**：INGEST/PURGE/EVALUATE 和新建统一 Agent 问答使用 MySQL Job + Lease/Retry/Recovery；支持内嵌 Worker，也可执行 `python -m app.runtime.worker` 独立扩容。
@@ -142,6 +160,8 @@ flowchart TD
 - **Agent Runtime 原生化**：Agent 继续使用低层 `StateGraph` 保留 ACL / Evidence / Durable Job 等企业定制能力，但状态持久化与恢复切换到 LangGraph `Checkpointer + interrupt + Command(resume=...)`，上下文使用保守 Token 估算及高低水位完整对话组裁剪（未达到阈值保留前缀），不再采用 LangChain `trim_messages` 逐轮裁剪；跨 run 的授权历史与结构化业务状态已在 `context_segment` 中版本化持久化（普通追加保留快照版本、压缩时更新版本与边界）；不等于共享完整 LangGraph checkpoint，也不代表供应商 KV Cache 已验证。
 - **跨轮持久化与恢复边界**：`qa/segment_context.py` 的快照保存已授权的 user/assistant 历史、业务对象和来源依赖；`JobCheckpointSaver` 仅在单次 `QA_RUN` 的 `job.checkpoint.langgraph` 中保存可恢复节点状态。历史证据 ID 不能直接跨 run 复用；已存在数据库需应用 `20261010_segment_context_snapshot.sql` 增量迁移。
 - **职责边界**：LangGraph 负责图状态和 HITL 恢复，项目实现上下文预算和消息组裁剪；项目继续负责租户 ACL、Evidence Provenance、Durable Worker、运行预算、审计、评测和 Observability。
+- **Agent 检索问题语义**：`agent-v1.2` 要求 `search_knowledge.query` 使用可独立理解的完整问题，保留人物、时间、事件、约束和待查询关系，禁止编造未知事实；这是 Prompt 和工具 Schema 约束，不等于已测得真实检索质量收益。
+- **观测与阶段评估**：Langfuse trace / generation 是可选、采样和分租约的数据；MySQL 仍是预算、权限、运行和评估的权威来源。EOBS 新增诊断与独立实验，不自动替换原指标和门禁。
 - **CI 基线**：GitHub Actions 执行 Python compile/pytest 与前端 type-check/test/build。
 
 ## 阅读顺序
@@ -171,13 +191,13 @@ flowchart TD
 
 上述 PRD 按 to-spec 模板组织：问题、方案、用户故事、实现决定、测试决定、范围外事项及备注。它们综合已确认访谈，不代表已实现，也没有发布到外部 Issue Tracker。
 
-## 当前确定的边界
+## 范围约束与历史约定
 
 - 内部系统、本地账号、固定维护管理员；文档级读权限由后端执行。
 - 支持 Markdown/TXT、DOCX、PDF、FAQ、Wiki 导出文件及附件；扫描 OCR、图片描述和表格结构提取纳入范围。
 - 全部约定策略均需实现并对照评测，不要求每次请求全部启用。
 - 先使用模拟/确认脱敏资料；不自动导入或向在线模型发送公司正文。
-- 先完成 PRD，再做技术设计，最后分阶段编码。代码全部由开发代理实现，并解释实际调用链和失败案例。
+- 早期按 PRD → 技术设计 → 编码推进；当前实现范围和验收状态应以 `main` 源码、测试与逐项实施记录为准，不应从早期设计稿推导已完成功能。
 
 ## 详细技术设计
 
@@ -189,10 +209,11 @@ flowchart TD
 
 当前已有 README、范围文档、PRD、技术设计、后端、前端、部署脚本和评测框架：
 
-- docs/design：详细技术设计。
-- docs/decisions：取舍与技术决策。
-- docs/learning/sources、concepts、practice：来源笔记、概念笔记、实际问题与验证。
-- docs/delivery：部署、验收、演示和真实项目成果。
+- docs/prd：早期需求和验收目标。
+- docs/design：详细技术设计，其中 01～09 含历史 Java / ES 基线。
+- docs/source-walkthrough.md、docs/rag-langgraph-retrieval.md、docs/rag-evaluation-guide.md：当前源码、检索图与评估导读。
+- docs/reviews：审查结论与回归资料。
+- docs/delivery：部署、验收、演示与阶段性实施记录。
 - backend、frontend：Python FastAPI 后端和功能页面。
 - datasets、experiments：授权样本、题集、策略配置和脱敏报告。
 - deploy：部署与初始化资料。
