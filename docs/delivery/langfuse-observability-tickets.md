@@ -1,7 +1,8 @@
 # Langfuse 接入与自建评估增强 Tickets
 
-状态：LF-T01～06 已实现并完成本地私有合成验收；EOBS-01～03 尚未实施。日期：2026-10-12。
-完成证据及测试边界：[实施记录](langfuse-implementation-status-20261012.md)。真实供应商、生产部署与生产负载未验收。
+状态：LF-T01～06 已完成；EOBS-01/02 已实现，EOBS-03 显式实验/校准入口及真实小样本 pilot 已完成，尚未充分校准。日期：2026-10-12。
+EOBS 与真实模型证据：[后续实施记录](evaluation-observability-implementation-20261012.md)。
+LF 首期证据及测试边界：[实施记录](langfuse-implementation-status-20261012.md)。后续已完成真实供应商合成联调；生产部署与生产负载未验收。
 唯一验收依据：[Spec](../design/11-langfuse-observability-spec.md)，基线 `main@7a83f72`。
 按 `to-tickets` 拆解；本文件为仓库任务清单，没有创建外部工单。
 
@@ -67,6 +68,8 @@
 
 ## EOBS-01：统一自建评估样本与指标解释契约（后续）
 
+状态：IMPLEMENTED。版本 eobs-v1；真实历史与实际上下文区分、未知/失败分母、读取撤权和旧指标兼容已验证。
+
 - 优先级：P2；blocked-by：无；不阻塞 LF 首期。
 - 来源/目标：Spec §4.7；EOBS-AC01。
 - 实现范围与上下文：`evaluation/runner.py`、`metrics.py`、相关内部样本映射和报告可选字段；保留 v1/v2 rubric 及当前 API。只借鉴 Ragas 设计，不新增依赖或通用指标注册平台。
@@ -77,6 +80,8 @@
 
 ## EOBS-02：计算阶段事实组覆盖与实际上下文覆盖（后续）
 
+状态：IMPLEMENTED。stageCoverage、parent/child 文本对齐和真实发送区间覆盖已实现，手算及实际报告回归通过。
+
 - 优先级：P2；blocked-by：EOBS-01、LF-T04；不阻塞 LF 首期。
 - 来源/目标：Spec §4.5、4.7；EOBS-AC02。
 - 实现范围与上下文：`evaluation/metrics.py`、`runner.py`、阶段诊断快照和可选报告展示；复用现有 Gold evidenceGroups 和来源匹配。
@@ -86,6 +91,8 @@
 - 风险：source unit/quote 与真实发送区间无法准确匹配时不计算确定分数；高覆盖也不证明答案正确。
 
 ## EOBS-03：试验独立正文断言提取与人工校准（后续）
+
+状态：IMPLEMENTED_WITH_PILOT。显式预算/任务/两阶段实验、人工修订与校准统计已实现；30 条合成资料获用户确认，一个真实漏提反例完成两断言对照。未全量执行 30 条，不宣称生产 Judge 改善或充分校准。
 
 - 优先级：P2；blocked-by：EOBS-01；不依赖 Langfuse，不阻塞 LF 首期。
 - 来源/目标：Spec §4.7；EOBS-AC03。
@@ -103,5 +110,5 @@
 - [x] 关闭/故障/隐私/恢复/租约、未知费用、采样与人工修订反例通过。
 - [x] 私有实例已锁版本与访问策略；默认元数据模式；没有公司正文或业务凭据进入提交/观测。
 - [x] MySQL 权限、预算、质量与历史评估仍是权威；未启用托管 Judge 或 Ragas。
-- [x] 后续 EOBS-01～03 尚未实施；不宣称新指标已可用。
+- [x] EOBS-01/02 已实现；EOBS-03 入口、已确认合成数据和真实 pilot 完成；未充分校准，不升级门禁。
 - [x] 文档、真实 exporter 载荷、私有合成收件分别有证据；真实模型质量明确未实测。

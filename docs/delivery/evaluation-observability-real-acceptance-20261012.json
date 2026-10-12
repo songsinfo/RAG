@@ -1,0 +1,116 @@
+{
+  "date": "2026-10-12",
+  "userAuthorizedTotalCapCny": 5,
+  "knownLocalLedgerCny": 1.7188,
+  "conservativeReservedUpperCny": 4.4618,
+  "confirmedSyntheticGoldCases": 30,
+  "realCalibrationCases": 1,
+  "providerAcceptance": {
+    "qaStatus": "COMPLETED",
+    "judgeParsed": true,
+    "judgeRubricVersion": "full-answer-and-relevance-v2",
+    "confirmationBasis": "third paid run reached rubric assertion after successful QA and parser; remaining receipt checks are read-only",
+    "agentTraceId": "a54ff115c608011016dad755f7690b74",
+    "judgeTraceId": "ebdc3e0e53f02436d0e657a3ba36d607",
+    "receivedAgentGenerations": 2,
+    "receivedJudgeGenerations": 1,
+    "latestRunLocalLedgerCny": 0.8475,
+    "allAttemptsKnownLedgerCny": 1.577,
+    "unknownPriorReservationUpperCny": 2.743,
+    "allAttemptsBudgetUpperCny": 4.32,
+    "maxTotalBudgetCny": 5,
+    "modelCallsAllAttempts": 9,
+    "usage": [
+      {
+        "input": 1392,
+        "output": 103,
+        "total": 1495
+      },
+      {
+        "input": 1225,
+        "output": 41,
+        "total": 1266
+      },
+      {
+        "input": 956,
+        "output": 2307,
+        "cache_read_input_tokens": 0,
+        "total": 3263
+      }
+    ],
+    "failures": [
+      "first: model citation out of bounds",
+      "second: Judge 30s timeout",
+      "third: incorrect fixture rubric shorthand, corrected"
+    ],
+    "limitations": [
+      "acceptance rates are conservative local ceilings, supplier invoice not checked",
+      "SQLite/BM25 synthetic corpus; not production MySQL/Milvus load",
+      "metadata-only Langfuse"
+    ]
+  },
+  "assertionPilot": {
+    "caseKey": "eobs-omitted_error-1",
+    "dataOrigin": "USER_CONFIRMED_AUTHORED_SYNTHETIC",
+    "providerResponses": "REAL",
+    "maxBudgetCny": 0.68,
+    "status": "COMPLETED",
+    "diagnosis": {
+      "version": "independent-assertions-v1",
+      "policy": "OBSERVE_ONLY",
+      "status": "OK",
+      "assertions": [
+        {
+          "text": "订单满100元减10元",
+          "start": 0,
+          "end": 11
+        },
+        {
+          "text": "所有用户都可叠加其他优惠",
+          "start": 12,
+          "end": 24
+        }
+      ],
+      "verdicts": [
+        {
+          "index": 0,
+          "support": "SUPPORTED",
+          "represented": "PRESENT"
+        },
+        {
+          "index": 1,
+          "support": "UNSUPPORTED",
+          "represented": "MISSING"
+        }
+      ],
+      "denominator": 2,
+      "supported": 1,
+      "unknown": 0,
+      "faithfulness": 0.5,
+      "missingFromGeneratedClaims": [
+        1
+      ]
+    },
+    "calibration": {
+      "version": "independent-assertions-v1",
+      "status": "PAIRED_LABELS_AVAILABLE",
+      "policy": "OBSERVE_ONLY",
+      "assertions": 2,
+      "humanLabeled": 2,
+      "compared": 2,
+      "unknown": 0,
+      "coverage": 1.0,
+      "agreement": 1.0,
+      "falseSupported": 0,
+      "humanUnsupported": 1,
+      "falseSupportedRate": 0.0
+    },
+    "limitations": [
+      "one authored counterexample, not production calibration or proven quality improvement",
+      "unaligned assertions have no human label; supplier invoice not checked"
+    ],
+    "modelCalls": 2,
+    "localLedgerCny": 0.1418,
+    "unknownReservedCny": 0
+  }
+}

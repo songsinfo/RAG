@@ -231,7 +231,11 @@ class DurableJobWorker:
             admin=bool(user.is_admin),
             security_epoch=0,
         )
-        EvaluationRunner._execute_run(actor, str(job["target_id"]))
+        if (job.get("checkpoint") or {}).get("diagnosticType") == "independent-assertions-v1":
+            from app.evaluation.assertion_diagnostic import execute_diagnostic
+            execute_diagnostic(actor, job)
+        else:
+            EvaluationRunner._execute_run(actor, str(job["target_id"]))
 
     def _run_qa(self, job: Dict[str, Any]):
         """执行排队中的 QA run，并把 job_id / lease_epoch 传到底层用于防旧 worker 写回。"""

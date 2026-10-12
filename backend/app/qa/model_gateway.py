@@ -207,8 +207,8 @@ class ModelGateway:
                     else:
                         lc_messages.append(AIMessage(content=content))
 
-                # 回答包含检索上下文，等待时间与 LiteLLM 的 60 秒配置对齐。
-                timeout_seconds = 60.0 if purpose == "ANSWER" else 30.0
+                # 回答和 Judge 包含完整上下文，等待时间与 LiteLLM 的 60 秒配置对齐。
+                timeout_seconds = 60.0 if purpose in {"ANSWER", "JUDGE"} else 30.0
                 # 单次请求超时不能突破 Agent 的整体 deadline；取两者更小值。
                 if deadline_epoch is not None:
                     timeout_seconds = max(1.0, min(timeout_seconds, deadline_epoch - time.time()))

@@ -174,6 +174,26 @@ def sync_langfuse_scores(
     from app.evaluation.langfuse_sync import sync_evaluation_scores
     return sync_evaluation_scores(actor, id)
 
+
+@router.post("/runs/{id}/assertion-diagnostics", status_code=status.HTTP_202_ACCEPTED)
+def start_assertion_diagnostic(body: Dict[str, Any], id: str = Path(...),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    actor: Actor = Depends(get_current_actor)):
+    from app.evaluation.assertion_diagnostic import start_diagnostic
+    return start_diagnostic(actor, id, body, idempotency_key)
+
+
+@router.get("/assertion-diagnostics/{jobId}")
+def assertion_diagnostic(jobId: str = Path(...), actor: Actor = Depends(get_current_actor)):
+    from app.evaluation.assertion_diagnostic import get_diagnostic
+    return get_diagnostic(actor, jobId)
+
+
+@router.post("/assertion-diagnostics/{jobId}/calibration")
+def assertion_calibration(body: Dict[str, Any], jobId: str = Path(...), actor: Actor = Depends(get_current_actor)):
+    from app.evaluation.assertion_diagnostic import calibrate_diagnostic
+    return calibrate_diagnostic(actor, jobId, body)
+
 @router.get("/qa-runs/{id}/retrieval-diagnostics")
 def get_private_retrieval_diagnostics(
     id: str = Path(...),

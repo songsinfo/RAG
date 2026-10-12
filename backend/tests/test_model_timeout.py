@@ -8,7 +8,8 @@ from app.qa.model_gateway import ModelGateway
 
 
 @pytest.mark.parametrize("remaining", [None, 10])
-def test_answer_waits_for_slow_model_without_exceeding_agent_deadline(monkeypatch, remaining):
+@pytest.mark.parametrize("purpose", ["ANSWER", "JUDGE"])
+def test_answer_and_judge_wait_for_slow_model_without_exceeding_deadline(monkeypatch, remaining, purpose):
     import app.qa.model_gateway as gateway
 
     monkeypatch.setenv("LITELLM_BASE_URL", "http://model.test")
@@ -29,7 +30,7 @@ def test_answer_waits_for_slow_model_without_exceeding_agent_deadline(monkeypatc
     monkeypatch.setattr(gateway, "get_chat_model", fake_model)
     monkeypatch.setattr(gateway, "invoke_tracked", lambda fn, **kwargs: fn())
     assert ModelGateway.chat(
-        "tenant-demo-1", None, "ANSWER", [{"role": "user", "content": "问题"}],
+        "tenant-demo-1", None, purpose, [{"role": "user", "content": "问题"}],
         deadline_epoch=deadline,
     ) == "回答"
 

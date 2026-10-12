@@ -10,7 +10,7 @@
 
 ## 阅读顺序
 
-**Langfuse 首期（2026-10-12）**：[Spec](11-langfuse-observability-spec.md)与[Tickets](../delivery/langfuse-observability-tickets.md)定义保留自建评估、不引入 Ragas 的方案；元数据观测和私有合成部署已完成，验收证据与边界见[实施记录](../delivery/langfuse-implementation-status-20261012.md)。EOBS 后续增强尚未实施。
+**Langfuse 与 EOBS（2026-10-12）**：[Spec](11-langfuse-observability-spec.md)与[Tickets](../delivery/langfuse-observability-tickets.md)定义保留自建评估、不引入 Ragas 的方案；元数据观测和私有合成部署见[LF 记录](../delivery/langfuse-implementation-status-20261012.md)，EOBS 实现与真实模型 pilot 见[后续记录](../delivery/evaluation-observability-implementation-20261012.md)。
 
 1. [架构与技术选型](01-architecture.md)：系统如何运行、哪些组件承担哪些工作。
 2. [数据库与权限](02-data-and-access.md)：ER、字段、索引、授权与事务边界。
